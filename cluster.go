@@ -3,12 +3,14 @@ package valkey
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"math/rand"
 	"net"
 	"strconv"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/valkey-io/valkey-go/internal/cmds"
@@ -668,6 +670,14 @@ retry:
 	if err != nil {
 		return NewErrorResult(err)
 	}
+	cmdName, cmdArg := "", ""
+	if cs := cmd.Commands(); len(cs) > 0 {
+		cmdName = cs[0]
+		if len(cs) > 1 {
+			cmdArg = cs[1]
+		}
+	}
+	fmt.Printf("📡 [ROUTER] Cmd: %s %s -> Target Node: %s (Slot: %d)\n", cmdName, cmdArg, cc.Addr(), cmd.Slot())
 	resp = cc.Do(ctx, cmd)
 	if resp.NonValkeyError() == errConnExpired {
 		goto retry
@@ -680,6 +690,7 @@ process:
 			return resp
 		}
 		ncc := c.redirectOrNew(addr, cc, cmd.Slot(), mode)
+		fmt.Printf("↪️  [REDIRECT-MOVED] Cmd: %s %s -> Redirected from %s to New Node: %s (Slot: %d)\n", cmdName, cmdArg, cc.Addr(), ncc.Addr(), cmd.Slot())
 	recover1:
 		resp = ncc.Do(ctx, cmd)
 		if resp.NonValkeyError() == errConnExpired {
@@ -701,9 +712,11 @@ process:
 		resultsp.Put(results)
 		goto process
 	case RedirectRetry:
-		if c.retry && cmd.IsRetryable() {
+		canRetry := cmd.IsRetryable() || isSafePreFlightOrClusterTransitionErr(resp.Error(), resp.NonValkeyError())
+		if c.retry && canRetry {
 			shouldRetry := c.retryHandler.WaitOrSkipRetry(ctx, attempts, cmd, resp.Error())
 			if shouldRetry {
+				fmt.Printf("🔄 [RETRY] Cmd: %s %s on Node: %s failed (%v) -> Backing off attempt %d...\n", cmdName, cmdArg, cc.Addr(), resp.Error(), attempts)
 				attempts++
 				goto retry
 			}
@@ -875,7 +888,8 @@ func (c *clusterClient) doresultfn(
 			nc := cc
 			retryDelay := time.Duration(-1)
 			if mode == RedirectRetry {
-				if !c.retry || !cm.IsRetryable() {
+				canRetry := cm.IsRetryable() || isSafePreFlightOrClusterTransitionErr(resp.Error(), resp.NonValkeyError())
+				if !c.retry || !canRetry {
 					continue
 				}
 				retryDelay = c.retryHandler.RetryDelay(attempts, cm, resp.Error())
@@ -1814,7 +1828,8 @@ retry:
 		resp = w.Do(ctx, cmd)
 		switch _, mode := c.client.shouldRefreshRetry(resp.Error(), ctx); mode {
 		case RedirectRetry:
-			if c.retry && cmd.IsRetryable() && w.Error() == nil {
+			canRetry := cmd.IsRetryable() || isSafePreFlightOrClusterTransitionErr(resp.Error(), resp.NonValkeyError())
+			if c.retry && canRetry && w.Error() == nil {
 				shouldRetry := c.retryHandler.WaitOrSkipRetry(
 					ctx, attempts, cmd, resp.Error(),
 				)
@@ -1959,3 +1974,37 @@ const (
 	panicMsgCxSlot = "cross slot command in Dedicated is prohibited"
 	panicMixCxSlot = "Mixing no-slot and cross slot commands in DoMulti is prohibited"
 )
+
+// isSafePreFlightOrClusterTransitionErr returns true if the error guarantees
+// that the command was definitively not executed by the server.
+func isSafePreFlightOrClusterTransitionErr(err error, nonValkeyErr error) bool {
+	if nonValkeyErr == context.Canceled || nonValkeyErr == context.DeadlineExceeded ||
+		err == context.Canceled || err == context.DeadlineExceeded {
+		return false
+	}
+	if vErr, ok := err.(*ValkeyError); ok {
+		return vErr.IsClusterDown() || vErr.IsTryAgain() || vErr.IsLoading()
+	}
+	if nonValkeyErr == io.EOF || nonValkeyErr == io.ErrUnexpectedEOF || err == io.EOF || err == io.ErrUnexpectedEOF {
+		return false
+	}
+	if opErr, ok := nonValkeyErr.(*net.OpError); ok {
+		return opErr.Op == "dial"
+	}
+	if opErr, ok := err.(*net.OpError); ok {
+		return opErr.Op == "dial"
+	}
+	if errors.Is(nonValkeyErr, context.Canceled) || errors.Is(nonValkeyErr, context.DeadlineExceeded) ||
+		errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	var opErr *net.OpError
+	if (errors.As(nonValkeyErr, &opErr) || errors.As(err, &opErr)) && opErr.Op == "dial" {
+		return true
+	}
+	if errors.Is(nonValkeyErr, syscall.ECONNREFUSED) || errors.Is(nonValkeyErr, syscall.EHOSTUNREACH) ||
+		errors.Is(err, syscall.ECONNREFUSED) || errors.Is(err, syscall.EHOSTUNREACH) {
+		return true
+	}
+	return false
+}
