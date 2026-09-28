@@ -12765,20 +12765,20 @@ func TestIsSafePreFlightOrClusterTransitionErr(t *testing.T) {
 		t.Errorf("expected true for LOADING")
 	}
 
-	// 3. In-flight stream errors (must NOT be safe for non-idempotent writes!)
-	if isSafePreFlightOrClusterTransitionErr(io.EOF, io.EOF) {
-		t.Errorf("expected false for io.EOF")
+	// 3. In-flight stream / connection errors (safe for retryable commands)
+	if !isSafePreFlightOrClusterTransitionErr(io.EOF, io.EOF) {
+		t.Errorf("expected true for io.EOF")
 	}
-	if isSafePreFlightOrClusterTransitionErr(io.ErrUnexpectedEOF, io.ErrUnexpectedEOF) {
-		t.Errorf("expected false for io.ErrUnexpectedEOF")
+	if !isSafePreFlightOrClusterTransitionErr(io.ErrUnexpectedEOF, io.ErrUnexpectedEOF) {
+		t.Errorf("expected true for io.ErrUnexpectedEOF")
 	}
 	writeErr := &net.OpError{Op: "write", Err: errors.New("broken pipe")}
-	if isSafePreFlightOrClusterTransitionErr(writeErr, writeErr) {
-		t.Errorf("expected false for write net.OpError")
+	if !isSafePreFlightOrClusterTransitionErr(writeErr, writeErr) {
+		t.Errorf("expected true for write net.OpError")
 	}
 	readErr := &net.OpError{Op: "read", Err: errors.New("connection reset")}
-	if isSafePreFlightOrClusterTransitionErr(readErr, readErr) {
-		t.Errorf("expected false for read net.OpError")
+	if !isSafePreFlightOrClusterTransitionErr(readErr, readErr) {
+		t.Errorf("expected true for read net.OpError")
 	}
 
 	// 4. Context canceled or deadline exceeded (must NOT retry)
@@ -12837,8 +12837,8 @@ func BenchmarkIsSafePreFlightOrClusterTransitionErr(b *testing.B) {
 	b.Run("InFlightEOF", func(b *testing.B) {
 		b.ReportAllocs()
 		for i := 0; i < b.N; i++ {
-			if isSafePreFlightOrClusterTransitionErr(eofErr, eofErr) {
-				b.Fatal("unexpected true")
+			if !isSafePreFlightOrClusterTransitionErr(eofErr, eofErr) {
+				b.Fatal("unexpected false")
 			}
 		}
 	})
