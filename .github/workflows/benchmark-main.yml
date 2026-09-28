@@ -31,11 +31,18 @@ jobs:
       - name: Start Valkey
         run: |
           docker compose up -d valkey
+          count=0
           until docker compose exec -T valkey valkey-cli ping | grep -q PONG; do
+            if [ $count -gt 30 ]; then
+              echo "Timeout waiting for Valkey"
+              exit 1
+            fi
             echo "Waiting for Valkey..."
             sleep 1
+            count=$((count+1))
           done
       - name: Run Main Benchmarks
+        shell: bash
         run: go test -bench=. -run=^$ -benchmem -count=10 ./... | tee out.txt
       - name: Average Results
         if: always()
@@ -45,7 +52,7 @@ jobs:
         if: always()
         run: docker compose down -v
       - name: Update gh-pages Baseline
-        if: success() || failure()
+        if: success()
         uses: benchmark-action/github-action-benchmark@v1
         with:
           tool: 'go'
