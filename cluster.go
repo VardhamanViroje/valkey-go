@@ -3,7 +3,6 @@ package valkey
 import (
 	"context"
 	"errors"
-	"fmt"
 	"io"
 	"math/rand"
 	"net"
@@ -671,14 +670,6 @@ retry:
 	if err != nil {
 		return NewErrorResult(err)
 	}
-	cmdName, cmdArg := "", ""
-	if cs := cmd.Commands(); len(cs) > 0 {
-		cmdName = cs[0]
-		if len(cs) > 1 {
-			cmdArg = cs[1]
-		}
-	}
-	fmt.Printf("📡 [ROUTER] Cmd: %s %s -> Target Node: %s (Slot: %d)\n", cmdName, cmdArg, cc.Addr(), cmd.Slot())
 	resp = cc.Do(ctx, cmd)
 	if resp.NonValkeyError() == errConnExpired {
 		goto retry
@@ -691,7 +682,6 @@ process:
 			return resp
 		}
 		ncc := c.redirectOrNew(addr, cc, cmd.Slot(), mode)
-		fmt.Printf("↪️  [REDIRECT-MOVED] Cmd: %s %s -> Redirected from %s to New Node: %s (Slot: %d)\n", cmdName, cmdArg, cc.Addr(), ncc.Addr(), cmd.Slot())
 	recover1:
 		resp = ncc.Do(ctx, cmd)
 		if resp.NonValkeyError() == errConnExpired {
@@ -717,7 +707,6 @@ process:
 		if c.retry && canRetry {
 			shouldRetry := c.retryHandler.WaitOrSkipRetry(ctx, attempts, cmd, resp.Error())
 			if shouldRetry {
-				fmt.Printf("🔄 [RETRY] Cmd: %s %s on Node: %s failed (%v) -> Backing off attempt %d...\n", cmdName, cmdArg, cc.Addr(), resp.Error(), attempts)
 				attempts++
 
 				// ⚡ TRIGGER PREEMPTIBLE SINGLEFLIGHT:

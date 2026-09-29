@@ -2,7 +2,6 @@ package valkey
 
 import (
 	"context"
-	"fmt"
 	"sync"
 	"time"
 )
@@ -40,7 +39,6 @@ func (c *call) Do(ctx context.Context, fn func() error) error {
 	fl := c.fl
 	if fl != nil {
 		fl.wakeOnce.Do(func() {
-			fmt.Printf("⚡ [PREEMPTIBLE SINGLEFLIGHT] Waking up sleeping DelayDo timer early!\n")
 			close(fl.wake)
 		})
 		c.mu.Unlock()
