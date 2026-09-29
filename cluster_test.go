@@ -37,6 +37,18 @@ var slotsResp = NewResult(slicemsg('*', []ValkeyMessage{
 	}),
 }), nil)
 
+var slotsRespNoReplica = NewResult(slicemsg('*', []ValkeyMessage{
+	slicemsg('*', []ValkeyMessage{
+		{typ: ':', intlen: 0},
+		{typ: ':', intlen: 16383},
+		slicemsg('*', []ValkeyMessage{ // master
+			strmsg('+', "127.0.0.1"),
+			{typ: ':', intlen: 0},
+			strmsg('+', ""),
+		}),
+	}),
+}), nil)
+
 var slotsMultiResp = NewResult(slicemsg('*', []ValkeyMessage{
 	slicemsg('*', []ValkeyMessage{
 		{typ: ':', intlen: 0},
@@ -5954,7 +5966,7 @@ func TestClusterClientErr(t *testing.T) {
 
 func TestClusterClientRetry(t *testing.T) {
 	defer ShouldNotLeak(SetupLeakDetection())
-	SetupClientRetry(t, func(m *mockConn) Client {
+	SetupClientRetryWithErr(t, func(m *mockConn) Client {
 		m.DoOverride = map[string]func(cmd Completed) ValkeyResult{
 			"CLUSTER SLOTS": func(cmd Completed) ValkeyResult { return slotsMultiResp },
 		}
@@ -5967,7 +5979,7 @@ func TestClusterClientRetry(t *testing.T) {
 			t.Fatalf("unexpected err %v", err)
 		}
 		return c
-	})
+	}, errors.New("connection reset by peer"))
 }
 
 func TestClusterClientReplicaOnly_PickReplica(t *testing.T) {
@@ -7664,7 +7676,7 @@ func TestClusterClientCacheASKRetry(t *testing.T) {
 				errInjected = true
 				return &valkeyresults{s: []ValkeyResult{
 					{}, {},
-					NewErrorResult(errors.New("transport: connection closed")),
+					NewErrorResult(errors.New("transport: connection reset by peer")),
 				}}
 			}
 			// shouldRefreshRetry treats non-ValkeyError as RedirectRetry, so
@@ -11704,6 +11716,9 @@ func TestClusterDoMultiRepicksAfterReplicaRemoval(t *testing.T) {
 		DoFn: func(cmd Completed) ValkeyResult {
 			atomic.AddInt64(&initCalls, 1)
 			if strings.Join(cmd.Commands(), " ") == "CLUSTER SLOTS" {
+				if atomic.LoadInt64(&replicaCalls) > 0 {
+					return slotsRespNoReplica
+				}
 				return slotsResp
 			}
 			return ValkeyResult{}
@@ -11712,6 +11727,9 @@ func TestClusterDoMultiRepicksAfterReplicaRemoval(t *testing.T) {
 	primaryConn := &mockConn{
 		DoFn: func(cmd Completed) ValkeyResult {
 			if strings.Join(cmd.Commands(), " ") == "CLUSTER SLOTS" {
+				if atomic.LoadInt64(&replicaCalls) > 0 {
+					return slotsRespNoReplica
+				}
 				return slotsResp
 			}
 			return ValkeyResult{}
@@ -11809,6 +11827,9 @@ func TestClusterDoMultiPreservesAskingBucketing(t *testing.T) {
 	primaryConn := &mockConn{
 		DoFn: func(cmd Completed) ValkeyResult {
 			if strings.Join(cmd.Commands(), " ") == "CLUSTER SLOTS" {
+				if atomic.LoadInt64(&replicaCalls) > 0 {
+					return slotsRespNoReplica
+				}
 				return slotsResp
 			}
 			return ValkeyResult{}
@@ -11825,6 +11846,9 @@ func TestClusterDoMultiPreservesAskingBucketing(t *testing.T) {
 	replicaConn := &mockConn{
 		DoFn: func(cmd Completed) ValkeyResult {
 			if strings.Join(cmd.Commands(), " ") == "CLUSTER SLOTS" {
+				if atomic.LoadInt64(&replicaCalls) > 0 {
+					return slotsRespNoReplica
+				}
 				return slotsResp
 			}
 			return ValkeyResult{}
@@ -11843,7 +11867,15 @@ func TestClusterDoMultiPreservesAskingBucketing(t *testing.T) {
 		},
 	}
 	targetConn := &mockConn{
-		DoFn: func(cmd Completed) ValkeyResult { return ValkeyResult{} },
+		DoFn: func(cmd Completed) ValkeyResult {
+			if strings.Join(cmd.Commands(), " ") == "CLUSTER SLOTS" {
+				if atomic.LoadInt64(&replicaCalls) > 0 {
+					return slotsRespNoReplica
+				}
+				return slotsResp
+			}
+			return ValkeyResult{}
+		},
 		DoMultiFn: func(multi ...Completed) *valkeyresults {
 			atomic.AddInt64(&targetCalls, 1)
 			targetMu.Lock()
@@ -11876,6 +11908,9 @@ func TestClusterDoMultiPreservesAskingBucketing(t *testing.T) {
 			return &mockConn{
 				DoFn: func(cmd Completed) ValkeyResult {
 					if strings.Join(cmd.Commands(), " ") == "CLUSTER SLOTS" {
+						if atomic.LoadInt64(&replicaCalls) > 0 {
+							return slotsRespNoReplica
+						}
 						return slotsResp
 					}
 					return ValkeyResult{}
@@ -11943,6 +11978,9 @@ func TestClusterDoMultiCacheRepicksAfterReplicaRemoval(t *testing.T) {
 	primaryConn := &mockConn{
 		DoFn: func(cmd Completed) ValkeyResult {
 			if strings.Join(cmd.Commands(), " ") == "CLUSTER SLOTS" {
+				if atomic.LoadInt64(&replicaCalls) > 0 {
+					return slotsRespNoReplica
+				}
 				return slotsResp
 			}
 			return ValkeyResult{}
@@ -11988,6 +12026,9 @@ func TestClusterDoMultiCacheRepicksAfterReplicaRemoval(t *testing.T) {
 			return &mockConn{
 				DoFn: func(cmd Completed) ValkeyResult {
 					if strings.Join(cmd.Commands(), " ") == "CLUSTER SLOTS" {
+						if atomic.LoadInt64(&replicaCalls) > 0 {
+							return slotsRespNoReplica
+						}
 						return slotsResp
 					}
 					return ValkeyResult{}
@@ -12451,7 +12492,7 @@ func TestClusterClient_PreFlightRetry(t *testing.T) {
 			return NewResult(strmsg('+', "OK"), nil)
 		}
 
-		if v, err := client.Do(context.Background(), client.B().Set().Key("k").Value("v").Build()).ToString(); err != nil || v != "OK" {
+		if v, err := client.Do(context.Background(), client.B().Set().Key("k").Value("v").Build().ToRetryable()).ToString(); err != nil || v != "OK" {
 			t.Fatalf("unexpected response %v %v", v, err)
 		}
 		if attempts != 2 {
@@ -12473,7 +12514,7 @@ func TestClusterClient_PreFlightRetry(t *testing.T) {
 			return NewResult(strmsg('+', "OK"), nil)
 		}
 
-		if v, err := client.Do(context.Background(), client.B().Set().Key("k").Value("v").Build()).ToString(); err != nil || v != "OK" {
+		if v, err := client.Do(context.Background(), client.B().Set().Key("k").Value("v").Build().ToRetryable()).ToString(); err != nil || v != "OK" {
 			t.Fatalf("unexpected response %v %v", v, err)
 		}
 		if attempts != 2 {
@@ -12495,7 +12536,7 @@ func TestClusterClient_PreFlightRetry(t *testing.T) {
 			return NewResult(strmsg('+', "OK"), nil)
 		}
 
-		if v, err := client.Do(context.Background(), client.B().Set().Key("k").Value("v").Build()).ToString(); err != nil || v != "OK" {
+		if v, err := client.Do(context.Background(), client.B().Set().Key("k").Value("v").Build().ToRetryable()).ToString(); err != nil || v != "OK" {
 			t.Fatalf("unexpected response %v %v", v, err)
 		}
 		if attempts != 2 {
@@ -12517,7 +12558,7 @@ func TestClusterClient_PreFlightRetry(t *testing.T) {
 			return NewResult(strmsg('+', "OK"), nil)
 		}
 
-		if v, err := client.Do(context.Background(), client.B().Set().Key("k").Value("v").Build()).ToString(); err != nil || v != "OK" {
+		if v, err := client.Do(context.Background(), client.B().Set().Key("k").Value("v").Build().ToRetryable()).ToString(); err != nil || v != "OK" {
 			t.Fatalf("unexpected response %v %v", v, err)
 		}
 		if attempts != 2 {
@@ -12542,7 +12583,7 @@ func TestClusterClient_PreFlightRetry(t *testing.T) {
 		c, cancel := client.Dedicate()
 		defer cancel()
 
-		if v, err := c.Do(context.Background(), client.B().Set().Key("k").Value("v").Build()).ToString(); err != nil || v != "OK" {
+		if v, err := c.Do(context.Background(), client.B().Set().Key("k").Value("v").Build().ToRetryable()).ToString(); err != nil || v != "OK" {
 			t.Fatalf("unexpected response %v %v", v, err)
 		}
 		if attempts != 2 {
@@ -12697,7 +12738,7 @@ func TestClusterClient_Pipelining_PreFlightRetry(t *testing.T) {
 			return &valkeyresults{s: []ValkeyResult{NewResult(strmsg('+', "OK"), nil)}}
 		}
 
-		cmd := client.B().Set().Key("k").Value("v").Build()
+		cmd := client.B().Set().Key("k").Value("v").Build().ToRetryable()
 		resps := client.DoMulti(context.Background(), cmd)
 		if len(resps) != 1 {
 			t.Fatalf("unexpected resps length %v", len(resps))
