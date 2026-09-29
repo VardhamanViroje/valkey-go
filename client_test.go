@@ -641,8 +641,12 @@ func TestSingleClientRetry(t *testing.T) {
 	})
 }
 
-//gocyclo:ignore
 func SetupClientRetry(t *testing.T, fn func(mock *mockConn) Client) {
+	SetupClientRetryWithErr(t, fn, ErrClosing)
+}
+
+//gocyclo:ignore
+func SetupClientRetryWithErr(t *testing.T, fn func(mock *mockConn) Client, retryErr error) {
 	setup := func() (Client, *mockConn) {
 		m := &mockConn{}
 		return fn(m), m
@@ -691,7 +695,7 @@ func SetupClientRetry(t *testing.T, fn func(mock *mockConn) Client) {
 	t.Run("Delegate Do ReadOnly Retry", func(t *testing.T) {
 		c, m := setup()
 		m.DoFn = makeDoFn(
-			NewErrorResult(ErrClosing),
+			NewErrorResult(retryErr),
 			NewResult(strmsg('+', "Do"), nil),
 		)
 		if v, err := c.Do(context.Background(), c.B().Get().Key("Do").Build()).ToString(); err != nil || v != "Do" {
@@ -710,10 +714,10 @@ func SetupClientRetry(t *testing.T, fn func(mock *mockConn) Client) {
 
 	t.Run("Delegate Do ReadOnly NoRetry - ctx done", func(t *testing.T) {
 		c, m := setup()
-		m.DoFn = makeDoFn(NewErrorResult(ErrClosing))
+		m.DoFn = makeDoFn(NewErrorResult(retryErr))
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
-		if v, err := c.Do(ctx, c.B().Get().Key("Do").Build()).ToString(); err != ErrClosing {
+		if v, err := c.Do(ctx, c.B().Get().Key("Do").Build()).ToString(); !errors.Is(err, retryErr) {
 			t.Fatalf("unexpected response %v %v", v, err)
 		}
 	})
@@ -742,18 +746,18 @@ func SetupClientRetry(t *testing.T, fn func(mock *mockConn) Client) {
 			}
 		}
 		m.DoFn = makeDoFn(
-			NewErrorResult(ErrClosing),
+			NewErrorResult(retryErr),
 			NewResult(strmsg('+', "Do"), nil),
 		)
-		if v, err := c.Do(context.Background(), c.B().Get().Key("Do").Build()).ToString(); !errors.Is(err, ErrClosing) {
+		if v, err := c.Do(context.Background(), c.B().Get().Key("Do").Build()).ToString(); !errors.Is(err, retryErr) {
 			t.Fatalf("unexpected response %v %v", v, err)
 		}
 	})
 
 	t.Run("Delegate Do Write NoRetry", func(t *testing.T) {
 		c, m := setup()
-		m.DoFn = makeDoFn(NewErrorResult(ErrClosing))
-		if v, err := c.Do(context.Background(), c.B().Set().Key("Do").Value("V").Build()).ToString(); err != ErrClosing {
+		m.DoFn = makeDoFn(NewErrorResult(retryErr))
+		if v, err := c.Do(context.Background(), c.B().Set().Key("Do").Value("V").Build()).ToString(); !errors.Is(err, retryErr) {
 			t.Fatalf("unexpected response %v %v", v, err)
 		}
 	})
@@ -761,7 +765,7 @@ func SetupClientRetry(t *testing.T, fn func(mock *mockConn) Client) {
 	t.Run("Delegate Do Write Retryable Retry", func(t *testing.T) {
 		c, m := setup()
 		m.DoFn = makeDoFn(
-			NewErrorResult(ErrClosing),
+			NewErrorResult(retryErr),
 			NewResult(strmsg('+', "Do"), nil),
 		)
 		if v, err := c.Do(context.Background(), c.B().Set().Key("Do").Value("V").Build().ToRetryable()).ToString(); err != nil || v != "Do" {
@@ -772,7 +776,7 @@ func SetupClientRetry(t *testing.T, fn func(mock *mockConn) Client) {
 	t.Run("Delegate DoMulti ReadOnly Retry", func(t *testing.T) {
 		c, m := setup()
 		m.DoMultiFn = makeDoMultiFn(
-			[]ValkeyResult{NewErrorResult(ErrClosing)},
+			[]ValkeyResult{NewErrorResult(retryErr)},
 			[]ValkeyResult{NewResult(strmsg('+', "Do"), nil)},
 		)
 		if v, err := c.DoMulti(context.Background(), c.B().Get().Key("Do").Build())[0].ToString(); err != nil || v != "Do" {
@@ -791,10 +795,10 @@ func SetupClientRetry(t *testing.T, fn func(mock *mockConn) Client) {
 
 	t.Run("Delegate DoMulti ReadOnly NoRetry - ctx done", func(t *testing.T) {
 		c, m := setup()
-		m.DoMultiFn = makeDoMultiFn([]ValkeyResult{NewErrorResult(ErrClosing)})
+		m.DoMultiFn = makeDoMultiFn([]ValkeyResult{NewErrorResult(retryErr)})
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
-		if v, err := c.DoMulti(ctx, c.B().Get().Key("Do").Build())[0].ToString(); err != ErrClosing {
+		if v, err := c.DoMulti(ctx, c.B().Get().Key("Do").Build())[0].ToString(); !errors.Is(err, retryErr) {
 			t.Fatalf("unexpected response %v %v", v, err)
 		}
 	})
@@ -831,18 +835,18 @@ func SetupClientRetry(t *testing.T, fn func(mock *mockConn) Client) {
 			}
 		}
 		m.DoMultiFn = makeDoMultiFn(
-			[]ValkeyResult{NewErrorResult(ErrClosing)},
+			[]ValkeyResult{NewErrorResult(retryErr)},
 			[]ValkeyResult{NewResult(strmsg('+', "Do"), nil)},
 		)
-		if v, err := c.DoMulti(context.Background(), c.B().Get().Key("Do").Build())[0].ToString(); !errors.Is(err, ErrClosing) {
+		if v, err := c.DoMulti(context.Background(), c.B().Get().Key("Do").Build())[0].ToString(); !errors.Is(err, retryErr) {
 			t.Fatalf("unexpected response %v %v", v, err)
 		}
 	})
 
 	t.Run("Delegate DoMulti Write NoRetry", func(t *testing.T) {
 		c, m := setup()
-		m.DoMultiFn = makeDoMultiFn([]ValkeyResult{NewErrorResult(ErrClosing)})
-		if v, err := c.DoMulti(context.Background(), c.B().Set().Key("Do").Value("V").Build())[0].ToString(); err != ErrClosing {
+		m.DoMultiFn = makeDoMultiFn([]ValkeyResult{NewErrorResult(retryErr)})
+		if v, err := c.DoMulti(context.Background(), c.B().Set().Key("Do").Value("V").Build())[0].ToString(); !errors.Is(err, retryErr) {
 			t.Fatalf("unexpected response %v %v", v, err)
 		}
 	})
@@ -850,7 +854,7 @@ func SetupClientRetry(t *testing.T, fn func(mock *mockConn) Client) {
 	t.Run("Delegate DoMulti Write Retryable Retry", func(t *testing.T) {
 		c, m := setup()
 		m.DoMultiFn = makeDoMultiFn(
-			[]ValkeyResult{NewErrorResult(ErrClosing)},
+			[]ValkeyResult{NewErrorResult(retryErr)},
 			[]ValkeyResult{NewResult(strmsg('+', "Do"), nil)},
 		)
 		if v, err := c.DoMulti(context.Background(), c.B().Set().Key("Do").Value("V").Build().ToRetryable())[0].ToString(); err != nil || v != "Do" {
@@ -861,7 +865,7 @@ func SetupClientRetry(t *testing.T, fn func(mock *mockConn) Client) {
 	t.Run("Delegate DoCache Retry", func(t *testing.T) {
 		c, m := setup()
 		m.DoCacheFn = makeDoCacheFn(
-			NewErrorResult(ErrClosing),
+			NewErrorResult(retryErr),
 			NewResult(strmsg('+', "Do"), nil),
 		)
 		if v, err := c.DoCache(context.Background(), c.B().Get().Key("Do").Cache(), 0).ToString(); err != nil || v != "Do" {
@@ -880,10 +884,10 @@ func SetupClientRetry(t *testing.T, fn func(mock *mockConn) Client) {
 
 	t.Run("Delegate DoCache ReadOnly NoRetry - ctx done", func(t *testing.T) {
 		c, m := setup()
-		m.DoCacheFn = makeDoCacheFn(NewErrorResult(ErrClosing))
+		m.DoCacheFn = makeDoCacheFn(NewErrorResult(retryErr))
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
-		if v, err := c.DoCache(ctx, c.B().Get().Key("Do").Cache(), 0).ToString(); err != ErrClosing {
+		if v, err := c.DoCache(ctx, c.B().Get().Key("Do").Cache(), 0).ToString(); !errors.Is(err, retryErr) {
 			t.Fatalf("unexpected response %v %v", v, err)
 		}
 	})
@@ -912,10 +916,10 @@ func SetupClientRetry(t *testing.T, fn func(mock *mockConn) Client) {
 			}
 		}
 		m.DoCacheFn = makeDoCacheFn(
-			NewErrorResult(ErrClosing),
+			NewErrorResult(retryErr),
 			NewResult(strmsg('+', "Do"), nil),
 		)
-		if v, err := c.DoCache(context.Background(), c.B().Get().Key("Do").Cache(), 0).ToString(); !errors.Is(err, ErrClosing) {
+		if v, err := c.DoCache(context.Background(), c.B().Get().Key("Do").Cache(), 0).ToString(); !errors.Is(err, retryErr) {
 			t.Fatalf("unexpected response %v %v", v, err)
 		}
 	})
@@ -923,7 +927,7 @@ func SetupClientRetry(t *testing.T, fn func(mock *mockConn) Client) {
 	t.Run("Delegate DoMultiCache Retry", func(t *testing.T) {
 		c, m := setup()
 		m.DoMultiCacheFn = makeDoMultiCacheFn(
-			[]ValkeyResult{NewErrorResult(ErrClosing)},
+			[]ValkeyResult{NewErrorResult(retryErr)},
 			[]ValkeyResult{NewResult(strmsg('+', "Do"), nil)},
 		)
 		if v, err := c.DoMultiCache(context.Background(), CT(c.B().Get().Key("Do").Cache(), 0))[0].ToString(); err != nil || v != "Do" {
@@ -942,10 +946,10 @@ func SetupClientRetry(t *testing.T, fn func(mock *mockConn) Client) {
 
 	t.Run("Delegate DoMultiCache ReadOnly NoRetry - ctx done", func(t *testing.T) {
 		c, m := setup()
-		m.DoMultiCacheFn = makeDoMultiCacheFn([]ValkeyResult{NewErrorResult(ErrClosing)})
+		m.DoMultiCacheFn = makeDoMultiCacheFn([]ValkeyResult{NewErrorResult(retryErr)})
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
-		if v, err := c.DoMultiCache(ctx, CT(c.B().Get().Key("Do").Cache(), 0))[0].ToString(); err != ErrClosing {
+		if v, err := c.DoMultiCache(ctx, CT(c.B().Get().Key("Do").Cache(), 0))[0].ToString(); !errors.Is(err, retryErr) {
 			t.Fatalf("unexpected response %v %v", v, err)
 		}
 	})
@@ -982,17 +986,17 @@ func SetupClientRetry(t *testing.T, fn func(mock *mockConn) Client) {
 			}
 		}
 		m.DoMultiCacheFn = makeDoMultiCacheFn(
-			[]ValkeyResult{NewErrorResult(ErrClosing)},
+			[]ValkeyResult{NewErrorResult(retryErr)},
 			[]ValkeyResult{NewResult(strmsg('+', "Do"), nil)},
 		)
-		if v, err := c.DoMultiCache(context.Background(), CT(c.B().Get().Key("Do").Cache(), 0))[0].ToString(); !errors.Is(err, ErrClosing) {
+		if v, err := c.DoMultiCache(context.Background(), CT(c.B().Get().Key("Do").Cache(), 0))[0].ToString(); !errors.Is(err, retryErr) {
 			t.Fatalf("unexpected response %v %v", v, err)
 		}
 	})
 
 	t.Run("Delegate Receive Retry", func(t *testing.T) {
 		c, m := setup()
-		m.ReceiveFn = makeReceiveFn(ErrClosing, nil)
+		m.ReceiveFn = makeReceiveFn(retryErr, nil)
 		if err := c.Receive(context.Background(), c.B().Subscribe().Channel("ch").Build(), nil); err != nil {
 			t.Fatalf("unexpected response %v", err)
 		}
@@ -1009,10 +1013,10 @@ func SetupClientRetry(t *testing.T, fn func(mock *mockConn) Client) {
 
 	t.Run("Delegate Receive NoRetry - ctx done", func(t *testing.T) {
 		c, m := setup()
-		m.ReceiveFn = makeReceiveFn(ErrClosing)
+		m.ReceiveFn = makeReceiveFn(retryErr)
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
-		if err := c.Receive(ctx, c.B().Subscribe().Channel("ch").Build(), nil); err != ErrClosing {
+		if err := c.Receive(ctx, c.B().Subscribe().Channel("ch").Build(), nil); !errors.Is(err, retryErr) {
 			t.Fatalf("unexpected response %v", err)
 		}
 	})
@@ -1040,8 +1044,8 @@ func SetupClientRetry(t *testing.T, fn func(mock *mockConn) Client) {
 				},
 			}
 		}
-		m.ReceiveFn = makeReceiveFn(ErrClosing, nil)
-		if err := c.Receive(context.Background(), c.B().Subscribe().Channel("ch").Build(), nil); !errors.Is(err, ErrClosing) {
+		m.ReceiveFn = makeReceiveFn(retryErr, nil)
+		if err := c.Receive(context.Background(), c.B().Subscribe().Channel("ch").Build(), nil); !errors.Is(err, retryErr) {
 			t.Fatalf("unexpected response %v", err)
 		}
 	})
@@ -1049,7 +1053,7 @@ func SetupClientRetry(t *testing.T, fn func(mock *mockConn) Client) {
 	t.Run("Dedicate Delegate Do ReadOnly Retry", func(t *testing.T) {
 		c, m := setup()
 		m.DoFn = makeDoFn(
-			NewErrorResult(ErrClosing),
+			NewErrorResult(retryErr),
 			NewResult(strmsg('+', "Do"), nil),
 		)
 		m.AcquireFn = func() wire { return &mockWire{DoFn: m.DoFn} }
@@ -1065,25 +1069,25 @@ func SetupClientRetry(t *testing.T, fn func(mock *mockConn) Client) {
 
 	t.Run("Dedicate Delegate Do ReadOnly NoRetry - broken", func(t *testing.T) {
 		c, m := setup()
-		m.DoFn = makeDoFn(NewErrorResult(ErrClosing))
-		m.ErrorFn = func() error { return ErrClosing }
+		m.DoFn = makeDoFn(NewErrorResult(retryErr))
+		m.ErrorFn = func() error { return retryErr }
 		m.AcquireFn = func() wire { return &mockWire{DoFn: m.DoFn, ErrorFn: m.ErrorFn} }
 		if ret := c.Dedicated(func(cc DedicatedClient) error {
 			return cc.Do(context.Background(), c.B().Get().Key("Do").Build()).Error()
-		}); ret != ErrClosing {
+		}); !errors.Is(ret, retryErr) {
 			t.Fatalf("unexpected response %v", ret)
 		}
 	})
 
 	t.Run("Dedicate Delegate Do ReadOnly NoRetry - ctx done", func(t *testing.T) {
 		c, m := setup()
-		m.DoFn = makeDoFn(NewErrorResult(ErrClosing))
+		m.DoFn = makeDoFn(NewErrorResult(retryErr))
 		m.AcquireFn = func() wire { return &mockWire{DoFn: m.DoFn} }
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
 		if ret := c.Dedicated(func(cc DedicatedClient) error {
 			return cc.Do(ctx, c.B().Get().Key("Do").Build()).Error()
-		}); ret != ErrClosing {
+		}); !errors.Is(ret, retryErr) {
 			t.Fatalf("unexpected response %v", ret)
 		}
 	})
@@ -1091,7 +1095,7 @@ func SetupClientRetry(t *testing.T, fn func(mock *mockConn) Client) {
 	t.Run("Dedicate Delegate Do ReadOnly NoRetry - not retryable", func(t *testing.T) {
 		c, m := setup()
 		m.DoFn = makeDoFn(
-			NewErrorResult(ErrClosing),
+			NewErrorResult(retryErr),
 			NewResult(strmsg('+', "Do"), nil),
 		)
 		m.AcquireFn = func() wire { return &mockWire{DoFn: m.DoFn} }
@@ -1111,7 +1115,7 @@ func SetupClientRetry(t *testing.T, fn func(mock *mockConn) Client) {
 				}
 			}
 
-			if v, err := cc.Do(context.Background(), c.B().Get().Key("Do").Build()).ToString(); !errors.Is(err, ErrClosing) {
+			if v, err := cc.Do(context.Background(), c.B().Get().Key("Do").Build()).ToString(); !errors.Is(err, retryErr) {
 				t.Fatalf("unexpected response %v %v", v, err)
 			}
 			return errors.New("done")
@@ -1122,11 +1126,11 @@ func SetupClientRetry(t *testing.T, fn func(mock *mockConn) Client) {
 
 	t.Run("Dedicate Delegate Do Write NoRetry", func(t *testing.T) {
 		c, m := setup()
-		m.DoFn = makeDoFn(NewErrorResult(ErrClosing))
+		m.DoFn = makeDoFn(NewErrorResult(retryErr))
 		m.AcquireFn = func() wire { return &mockWire{DoFn: m.DoFn} }
 		if ret := c.Dedicated(func(cc DedicatedClient) error {
 			return cc.Do(context.Background(), c.B().Set().Key("Do").Value("Do").Build()).Error()
-		}); ret != ErrClosing {
+		}); !errors.Is(ret, retryErr) {
 			t.Fatalf("unexpected response %v", ret)
 		}
 	})
@@ -1134,7 +1138,7 @@ func SetupClientRetry(t *testing.T, fn func(mock *mockConn) Client) {
 	t.Run("Dedicate Delegate Do Write Retryable Retry", func(t *testing.T) {
 		c, m := setup()
 		m.DoFn = makeDoFn(
-			NewErrorResult(ErrClosing),
+			NewErrorResult(retryErr),
 			NewResult(strmsg('+', "Do"), nil),
 		)
 		m.AcquireFn = func() wire { return &mockWire{DoFn: m.DoFn} }
@@ -1151,7 +1155,7 @@ func SetupClientRetry(t *testing.T, fn func(mock *mockConn) Client) {
 	t.Run("Dedicate Delegate DoMulti ReadOnly Retry", func(t *testing.T) {
 		c, m := setup()
 		m.DoMultiFn = makeDoMultiFn(
-			[]ValkeyResult{NewErrorResult(ErrClosing)},
+			[]ValkeyResult{NewErrorResult(retryErr)},
 			[]ValkeyResult{NewResult(strmsg('+', "Do"), nil)},
 		)
 		m.AcquireFn = func() wire { return &mockWire{DoMultiFn: m.DoMultiFn} }
@@ -1167,25 +1171,25 @@ func SetupClientRetry(t *testing.T, fn func(mock *mockConn) Client) {
 
 	t.Run("Dedicate Delegate DoMulti ReadOnly NoRetry - broken", func(t *testing.T) {
 		c, m := setup()
-		m.DoMultiFn = makeDoMultiFn([]ValkeyResult{NewErrorResult(ErrClosing)})
-		m.ErrorFn = func() error { return ErrClosing }
+		m.DoMultiFn = makeDoMultiFn([]ValkeyResult{NewErrorResult(retryErr)})
+		m.ErrorFn = func() error { return retryErr }
 		m.AcquireFn = func() wire { return &mockWire{DoMultiFn: m.DoMultiFn, ErrorFn: m.ErrorFn} }
 		if ret := c.Dedicated(func(cc DedicatedClient) error {
 			return cc.DoMulti(context.Background(), c.B().Get().Key("Do").Build())[0].Error()
-		}); ret != ErrClosing {
+		}); !errors.Is(ret, retryErr) {
 			t.Fatalf("unexpected response %v", ret)
 		}
 	})
 
 	t.Run("Dedicate Delegate DoMulti ReadOnly NoRetry - ctx done", func(t *testing.T) {
 		c, m := setup()
-		m.DoMultiFn = makeDoMultiFn([]ValkeyResult{NewErrorResult(ErrClosing)})
+		m.DoMultiFn = makeDoMultiFn([]ValkeyResult{NewErrorResult(retryErr)})
 		m.AcquireFn = func() wire { return &mockWire{DoMultiFn: m.DoMultiFn} }
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
 		if ret := c.Dedicated(func(cc DedicatedClient) error {
 			return cc.DoMulti(ctx, c.B().Get().Key("Do").Build())[0].Error()
-		}); ret != ErrClosing {
+		}); !errors.Is(ret, retryErr) {
 			t.Fatalf("unexpected response %v", ret)
 		}
 	})
@@ -1193,7 +1197,7 @@ func SetupClientRetry(t *testing.T, fn func(mock *mockConn) Client) {
 	t.Run("Dedicate Delegate DoMulti ReadOnly NoRetry - not retryable", func(t *testing.T) {
 		c, m := setup()
 		m.DoMultiFn = makeDoMultiFn(
-			[]ValkeyResult{NewErrorResult(ErrClosing)},
+			[]ValkeyResult{NewErrorResult(retryErr)},
 			[]ValkeyResult{NewResult(strmsg('+', "Do"), nil)},
 		)
 		m.AcquireFn = func() wire { return &mockWire{DoMultiFn: m.DoMultiFn} }
@@ -1213,7 +1217,7 @@ func SetupClientRetry(t *testing.T, fn func(mock *mockConn) Client) {
 				}
 			}
 
-			if v, err := cc.DoMulti(context.Background(), c.B().Get().Key("Do").Build())[0].ToString(); !errors.Is(err, ErrClosing) {
+			if v, err := cc.DoMulti(context.Background(), c.B().Get().Key("Do").Build())[0].ToString(); !errors.Is(err, retryErr) {
 				t.Fatalf("unexpected response %v %v", v, err)
 			}
 			return errors.New("done")
@@ -1224,11 +1228,11 @@ func SetupClientRetry(t *testing.T, fn func(mock *mockConn) Client) {
 
 	t.Run("Dedicate Delegate DoMulti Write NoRetry", func(t *testing.T) {
 		c, m := setup()
-		m.DoMultiFn = makeDoMultiFn([]ValkeyResult{NewErrorResult(ErrClosing)})
+		m.DoMultiFn = makeDoMultiFn([]ValkeyResult{NewErrorResult(retryErr)})
 		m.AcquireFn = func() wire { return &mockWire{DoMultiFn: m.DoMultiFn} }
 		if ret := c.Dedicated(func(cc DedicatedClient) error {
 			return cc.DoMulti(context.Background(), c.B().Set().Key("Do").Value("Do").Build())[0].Error()
-		}); ret != ErrClosing {
+		}); !errors.Is(ret, retryErr) {
 			t.Fatalf("unexpected response %v", ret)
 		}
 	})
@@ -1236,7 +1240,7 @@ func SetupClientRetry(t *testing.T, fn func(mock *mockConn) Client) {
 	t.Run("Dedicate Delegate DoMulti Write Retryable Retry", func(t *testing.T) {
 		c, m := setup()
 		m.DoMultiFn = makeDoMultiFn(
-			[]ValkeyResult{NewErrorResult(ErrClosing)},
+			[]ValkeyResult{NewErrorResult(retryErr)},
 			[]ValkeyResult{NewResult(strmsg('+', "Do"), nil)},
 		)
 		m.AcquireFn = func() wire { return &mockWire{DoMultiFn: m.DoMultiFn} }
@@ -1252,7 +1256,7 @@ func SetupClientRetry(t *testing.T, fn func(mock *mockConn) Client) {
 
 	t.Run("Dedicate Delegate Receive Retry", func(t *testing.T) {
 		c, m := setup()
-		m.ReceiveFn = makeReceiveFn(ErrClosing, nil)
+		m.ReceiveFn = makeReceiveFn(retryErr, nil)
 		m.AcquireFn = func() wire { return &mockWire{ReceiveFn: m.ReceiveFn} }
 		if ret := c.Dedicated(func(cc DedicatedClient) error {
 			if err := cc.Receive(context.Background(), c.B().Subscribe().Channel("Do").Build(), nil); err != nil {
@@ -1266,32 +1270,32 @@ func SetupClientRetry(t *testing.T, fn func(mock *mockConn) Client) {
 
 	t.Run("Dedicate Delegate Receive NoRetry - broken", func(t *testing.T) {
 		c, m := setup()
-		m.ReceiveFn = makeReceiveFn(ErrClosing)
-		m.ErrorFn = func() error { return ErrClosing }
+		m.ReceiveFn = makeReceiveFn(retryErr)
+		m.ErrorFn = func() error { return retryErr }
 		m.AcquireFn = func() wire { return &mockWire{ReceiveFn: m.ReceiveFn, ErrorFn: m.ErrorFn} }
 		if ret := c.Dedicated(func(cc DedicatedClient) error {
 			return cc.Receive(context.Background(), c.B().Subscribe().Channel("Do").Build(), nil)
-		}); ret != ErrClosing {
+		}); !errors.Is(ret, retryErr) {
 			t.Fatalf("unexpected response %v", ret)
 		}
 	})
 
 	t.Run("Dedicate Delegate Receive NoRetry - ctx done", func(t *testing.T) {
 		c, m := setup()
-		m.ReceiveFn = makeReceiveFn(ErrClosing)
+		m.ReceiveFn = makeReceiveFn(retryErr)
 		m.AcquireFn = func() wire { return &mockWire{ReceiveFn: m.ReceiveFn} }
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
 		if ret := c.Dedicated(func(cc DedicatedClient) error {
 			return cc.Receive(ctx, c.B().Subscribe().Channel("Do").Build(), nil)
-		}); ret != ErrClosing {
+		}); !errors.Is(ret, retryErr) {
 			t.Fatalf("unexpected response %v", ret)
 		}
 	})
 
 	t.Run("Dedicate Delegate Receive NoRetry - not retryable", func(t *testing.T) {
 		c, m := setup()
-		m.ReceiveFn = makeReceiveFn(ErrClosing, nil)
+		m.ReceiveFn = makeReceiveFn(retryErr, nil)
 		m.AcquireFn = func() wire { return &mockWire{ReceiveFn: m.ReceiveFn} }
 		if ret := c.Dedicated(func(cc DedicatedClient) error {
 			if cli, ok := cc.(*dedicatedClusterClient); ok {
@@ -1309,7 +1313,7 @@ func SetupClientRetry(t *testing.T, fn func(mock *mockConn) Client) {
 				}
 			}
 
-			if err := cc.Receive(context.Background(), c.B().Subscribe().Channel("Do").Build(), nil); !errors.Is(err, ErrClosing) {
+			if err := cc.Receive(context.Background(), c.B().Subscribe().Channel("Do").Build(), nil); !errors.Is(err, retryErr) {
 				t.Fatalf("unexpected response %v", err)
 			}
 			return errors.New("done")

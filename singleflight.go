@@ -10,8 +10,10 @@ import (
 // before ch is closed, so any goroutine that observed the close may read err
 // without further synchronization.
 type flight struct {
-	err error
-	ch  chan struct{}
+	err      error
+	ch       chan struct{}
+	wakeOnce sync.Once
+	wake     chan struct{}
 }
 
 type call struct {
@@ -36,6 +38,9 @@ func (c *call) Do(ctx context.Context, fn func() error) error {
 	c.cn++
 	fl := c.fl
 	if fl != nil {
+		fl.wakeOnce.Do(func() {
+			close(fl.wake)
+		})
 		c.mu.Unlock()
 		if ctxCh := ctx.Done(); ctxCh != nil {
 			select {
@@ -48,7 +53,10 @@ func (c *call) Do(ctx context.Context, fn func() error) error {
 		}
 		return fl.err
 	}
-	fl = &flight{ch: make(chan struct{})}
+	fl = &flight{
+		ch:   make(chan struct{}),
+		wake: make(chan struct{}),
+	}
 	c.fl = fl
 	c.mu.Unlock()
 	return c.do(fl, fn)
@@ -61,12 +69,22 @@ func (c *call) DelayDo(delay time.Duration, fn func() error) {
 		c.mu.Unlock()
 		return
 	}
-	fl := &flight{ch: make(chan struct{})}
+	fl := &flight{
+		ch:   make(chan struct{}),
+		wake: make(chan struct{}),
+	}
 	c.fl = fl
 	c.cn++
 	c.mu.Unlock()
 	go func(delay time.Duration, fl *flight, fn func() error) {
-		time.Sleep(delay)
+		if delay > 0 {
+			tm := time.NewTimer(delay)
+			select {
+			case <-tm.C:
+			case <-fl.wake:
+				tm.Stop()
+			}
+		}
 		c.do(fl, fn)
 	}(delay, fl, fn)
 }

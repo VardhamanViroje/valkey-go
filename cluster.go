@@ -7,8 +7,10 @@ import (
 	"math/rand"
 	"net"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/valkey-io/valkey-go/internal/cmds"
@@ -701,13 +703,22 @@ process:
 		resultsp.Put(results)
 		goto process
 	case RedirectRetry:
-		if c.retry && cmd.IsRetryable() {
+		canRetry := cmd.IsRetryable() && isSafePreFlightOrClusterTransitionErr(resp.Error(), resp.NonValkeyError())
+		if c.retry && canRetry {
 			shouldRetry := c.retryHandler.WaitOrSkipRetry(ctx, attempts, cmd, resp.Error())
 			if shouldRetry {
 				attempts++
+
+				// ⚡ TRIGGER PREEMPTIBLE SINGLEFLIGHT:
+				// c.refresh(ctx) calls c.sc.Do(), which immediately closes fl.wake!
+				// The sleeping DelayDo timer is aborted instantly (<1ms), and
+				// the topology is refreshed synchronously before the next attempt.
+				_ = c.refresh(ctx)
+
 				goto retry
 			}
 		}
+		return resp
 	}
 	return resp
 }
@@ -875,7 +886,8 @@ func (c *clusterClient) doresultfn(
 			nc := cc
 			retryDelay := time.Duration(-1)
 			if mode == RedirectRetry {
-				if !c.retry || !cm.IsRetryable() {
+				canRetry := cm.IsRetryable() && isSafePreFlightOrClusterTransitionErr(resp.Error(), resp.NonValkeyError())
+				if !c.retry || !canRetry {
 					continue
 				}
 				retryDelay = c.retryHandler.RetryDelay(attempts, cm, resp.Error())
@@ -1138,6 +1150,7 @@ retry:
 		}
 		if retries.RetryDelay >= 0 {
 			c.retryHandler.WaitForRetry(ctx, retries.RetryDelay)
+			_ = c.refresh(ctx)
 			c.rebucketRetries(retries)
 			attempts++
 			goto retry
@@ -1197,13 +1210,17 @@ process:
 		resultsp.Put(results)
 		goto process
 	case RedirectRetry:
-		if c.retry {
-			shouldRetry := c.retryHandler.WaitOrSkipRetry(ctx, attempts, Completed(cmd), resp.Error())
+		cCmd := Completed(cmd)
+		canRetry := cCmd.IsRetryable() && isSafePreFlightOrClusterTransitionErr(resp.Error(), resp.NonValkeyError())
+		if c.retry && canRetry {
+			shouldRetry := c.retryHandler.WaitOrSkipRetry(ctx, attempts, cCmd, resp.Error())
 			if shouldRetry {
 				attempts++
+				_ = c.refresh(ctx)
 				goto retry
 			}
 		}
+		return resp
 	}
 	return resp
 }
@@ -1438,10 +1455,12 @@ func (c *clusterClient) resultcachefn(
 			nc := cc
 			retryDelay := time.Duration(-1)
 			if mode == RedirectRetry {
-				if !c.retry {
+				cCmd := Completed(cm.Cmd)
+				canRetry := cCmd.IsRetryable() && isSafePreFlightOrClusterTransitionErr(resp.Error(), resp.NonValkeyError())
+				if !c.retry || !canRetry {
 					continue
 				}
-				retryDelay = c.retryHandler.RetryDelay(attempts, Completed(cm.Cmd), resp.Error())
+				retryDelay = c.retryHandler.RetryDelay(attempts, cCmd, resp.Error())
 			} else {
 				nc = c.redirectOrNew(addr, cc, cm.Cmd.Slot(), mode)
 			}
@@ -1600,6 +1619,7 @@ retry:
 		}
 		if retries.RetryDelay >= 0 {
 			c.retryHandler.WaitForRetry(ctx, retries.RetryDelay)
+			_ = c.refresh(ctx)
 			c.rebucketRetriesCache(retries)
 			attempts++
 			goto retry
@@ -1626,10 +1646,14 @@ retry:
 		goto retry
 	}
 	if _, mode := c.shouldRefreshRetry(err, ctx); c.retry && mode != RedirectNone {
-		shouldRetry := c.retryHandler.WaitOrSkipRetry(ctx, attempts, subscribe, err)
-		if shouldRetry {
-			attempts++
-			goto retry
+		canRetry := subscribe.IsRetryable() && isSafePreFlightOrClusterTransitionErr(err, err)
+		if canRetry {
+			shouldRetry := c.retryHandler.WaitOrSkipRetry(ctx, attempts, subscribe, err)
+			if shouldRetry {
+				attempts++
+				_ = c.refresh(ctx)
+				goto retry
+			}
 		}
 	}
 ret:
@@ -1814,12 +1838,14 @@ retry:
 		resp = w.Do(ctx, cmd)
 		switch _, mode := c.client.shouldRefreshRetry(resp.Error(), ctx); mode {
 		case RedirectRetry:
-			if c.retry && cmd.IsRetryable() && w.Error() == nil {
+			canRetry := cmd.IsRetryable() && isSafePreFlightOrClusterTransitionErr(resp.Error(), resp.NonValkeyError())
+			if c.retry && canRetry && w.Error() == nil {
 				shouldRetry := c.retryHandler.WaitOrSkipRetry(
 					ctx, attempts, cmd, resp.Error(),
 				)
 				if shouldRetry {
 					attempts++
+					_ = c.client.refresh(ctx)
 					goto retry
 				}
 			}
@@ -1850,12 +1876,16 @@ retry:
 		for i, r := range resp {
 			_, mode := c.client.shouldRefreshRetry(r.Error(), ctx)
 			if mode == RedirectRetry && retryable && w.Error() == nil {
-				shouldRetry := c.retryHandler.WaitOrSkipRetry(
-					ctx, attempts, multi[i], r.Error(),
-				)
-				if shouldRetry {
-					attempts++
-					goto retry
+				canRetry := multi[i].IsRetryable() && isSafePreFlightOrClusterTransitionErr(r.Error(), r.NonValkeyError())
+				if canRetry {
+					shouldRetry := c.retryHandler.WaitOrSkipRetry(
+						ctx, attempts, multi[i], r.Error(),
+					)
+					if shouldRetry {
+						attempts++
+						_ = c.client.refresh(ctx)
+						goto retry
+					}
 				}
 			}
 			if mode != RedirectNone {
@@ -1885,10 +1915,14 @@ retry:
 	if w, err = c.acquire(ctx, subscribe.Slot()); err == nil {
 		err = w.Receive(ctx, subscribe, fn)
 		if _, mode := c.client.shouldRefreshRetry(err, ctx); c.retry && mode == RedirectRetry && w.Error() == nil {
-			shouldRetry := c.retryHandler.WaitOrSkipRetry(ctx, attempts, subscribe, err)
-			if shouldRetry {
-				attempts++
-				goto retry
+			canRetry := subscribe.IsRetryable() && isSafePreFlightOrClusterTransitionErr(err, err)
+			if canRetry {
+				shouldRetry := c.retryHandler.WaitOrSkipRetry(ctx, attempts, subscribe, err)
+				if shouldRetry {
+					attempts++
+					_ = c.client.refresh(ctx)
+					goto retry
+				}
 			}
 		}
 	}
@@ -1959,3 +1993,51 @@ const (
 	panicMsgCxSlot = "cross slot command in Dedicated is prohibited"
 	panicMixCxSlot = "Mixing no-slot and cross slot commands in DoMulti is prohibited"
 )
+
+// isSafePreFlightOrClusterTransitionErr returns true if the error guarantees
+// that the command was either not executed by the server or is a safe connection/cluster error.
+func isSafePreFlightOrClusterTransitionErr(err error, nonValkeyErr error) bool {
+	if nonValkeyErr == context.Canceled || nonValkeyErr == context.DeadlineExceeded ||
+		err == context.Canceled || err == context.DeadlineExceeded ||
+		errors.Is(nonValkeyErr, context.Canceled) || errors.Is(nonValkeyErr, context.DeadlineExceeded) ||
+		errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	if vErr, ok := err.(*ValkeyError); ok {
+		return vErr.IsClusterDown() || vErr.IsTryAgain() || vErr.IsLoading()
+	}
+	if nonValkeyErr == io.EOF || nonValkeyErr == io.ErrUnexpectedEOF ||
+		err == io.EOF || err == io.ErrUnexpectedEOF {
+		return true
+	}
+	if errors.Is(nonValkeyErr, syscall.ECONNREFUSED) || errors.Is(err, syscall.ECONNREFUSED) ||
+		errors.Is(nonValkeyErr, syscall.ETIMEDOUT) || errors.Is(err, syscall.ETIMEDOUT) ||
+		errors.Is(nonValkeyErr, syscall.ECONNRESET) || errors.Is(err, syscall.ECONNRESET) ||
+		errors.Is(nonValkeyErr, syscall.EPIPE) || errors.Is(err, syscall.EPIPE) ||
+		errors.Is(nonValkeyErr, syscall.ENETUNREACH) || errors.Is(err, syscall.ENETUNREACH) ||
+		errors.Is(nonValkeyErr, syscall.EHOSTUNREACH) || errors.Is(err, syscall.EHOSTUNREACH) {
+		return true
+	}
+	var opErr *net.OpError
+	if errors.As(nonValkeyErr, &opErr) || errors.As(err, &opErr) {
+		return true
+	}
+	var targetErr error
+	if nonValkeyErr != nil {
+		targetErr = nonValkeyErr
+	} else {
+		targetErr = err
+	}
+	if targetErr != nil {
+		msg := strings.ToLower(targetErr.Error())
+		return strings.Contains(msg, "connection refused") ||
+			strings.Contains(msg, "connection reset") ||
+			strings.Contains(msg, "timeout") ||
+			strings.Contains(msg, "timed out") ||
+			strings.Contains(msg, "broken pipe") ||
+			strings.Contains(msg, "network is unreachable") ||
+			strings.Contains(msg, "no route to host") ||
+			strings.Contains(msg, "eof")
+	}
+	return false
+}

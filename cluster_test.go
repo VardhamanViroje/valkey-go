@@ -6,12 +6,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"reflect"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -30,6 +32,18 @@ var slotsResp = NewResult(slicemsg('*', []ValkeyMessage{
 		slicemsg('*', []ValkeyMessage{ // replica
 			strmsg('+', "127.0.1.1"),
 			{typ: ':', intlen: 1},
+			strmsg('+', ""),
+		}),
+	}),
+}), nil)
+
+var slotsRespNoReplica = NewResult(slicemsg('*', []ValkeyMessage{
+	slicemsg('*', []ValkeyMessage{
+		{typ: ':', intlen: 0},
+		{typ: ':', intlen: 16383},
+		slicemsg('*', []ValkeyMessage{ // master
+			strmsg('+', "127.0.0.1"),
+			{typ: ':', intlen: 0},
 			strmsg('+', ""),
 		}),
 	}),
@@ -5952,7 +5966,7 @@ func TestClusterClientErr(t *testing.T) {
 
 func TestClusterClientRetry(t *testing.T) {
 	defer ShouldNotLeak(SetupLeakDetection())
-	SetupClientRetry(t, func(m *mockConn) Client {
+	SetupClientRetryWithErr(t, func(m *mockConn) Client {
 		m.DoOverride = map[string]func(cmd Completed) ValkeyResult{
 			"CLUSTER SLOTS": func(cmd Completed) ValkeyResult { return slotsMultiResp },
 		}
@@ -5965,7 +5979,7 @@ func TestClusterClientRetry(t *testing.T) {
 			t.Fatalf("unexpected err %v", err)
 		}
 		return c
-	})
+	}, errors.New("connection reset by peer"))
 }
 
 func TestClusterClientReplicaOnly_PickReplica(t *testing.T) {
@@ -6302,11 +6316,11 @@ func TestGetClusterSlotsPreferShards(t *testing.T) {
 		wantCmd      string
 		wantShards   bool
 	}{
-		{version: 8, preferShards: false, wantCmd: "CLUSTER SHARDS", wantShards: true},  // >= 8 always shards
-		{version: 7, preferShards: false, wantCmd: "CLUSTER SLOTS", wantShards: false},  // default keeps 7.x on slots
-		{version: 7, preferShards: true, wantCmd: "CLUSTER SHARDS", wantShards: true},   // opt-in enables shards on 7
-		{version: 6, preferShards: true, wantCmd: "CLUSTER SLOTS", wantShards: false},   // floor: no shards below 7
-		{version: 5, preferShards: true, wantCmd: "CLUSTER SLOTS", wantShards: false},   // RESP2 fallback stays slots
+		{version: 8, preferShards: false, wantCmd: "CLUSTER SHARDS", wantShards: true}, // >= 8 always shards
+		{version: 7, preferShards: false, wantCmd: "CLUSTER SLOTS", wantShards: false}, // default keeps 7.x on slots
+		{version: 7, preferShards: true, wantCmd: "CLUSTER SHARDS", wantShards: true},  // opt-in enables shards on 7
+		{version: 6, preferShards: true, wantCmd: "CLUSTER SLOTS", wantShards: false},  // floor: no shards below 7
+		{version: 5, preferShards: true, wantCmd: "CLUSTER SLOTS", wantShards: false},  // RESP2 fallback stays slots
 	} {
 		t.Run(fmt.Sprintf("v%d_prefer%v", tc.version, tc.preferShards), func(t *testing.T) {
 			var got string
@@ -7662,7 +7676,7 @@ func TestClusterClientCacheASKRetry(t *testing.T) {
 				errInjected = true
 				return &valkeyresults{s: []ValkeyResult{
 					{}, {},
-					NewErrorResult(errors.New("transport: connection closed")),
+					NewErrorResult(errors.New("transport: connection reset by peer")),
 				}}
 			}
 			// shouldRefreshRetry treats non-ValkeyError as RedirectRetry, so
@@ -11702,6 +11716,9 @@ func TestClusterDoMultiRepicksAfterReplicaRemoval(t *testing.T) {
 		DoFn: func(cmd Completed) ValkeyResult {
 			atomic.AddInt64(&initCalls, 1)
 			if strings.Join(cmd.Commands(), " ") == "CLUSTER SLOTS" {
+				if atomic.LoadInt64(&replicaCalls) > 0 {
+					return slotsRespNoReplica
+				}
 				return slotsResp
 			}
 			return ValkeyResult{}
@@ -11710,6 +11727,9 @@ func TestClusterDoMultiRepicksAfterReplicaRemoval(t *testing.T) {
 	primaryConn := &mockConn{
 		DoFn: func(cmd Completed) ValkeyResult {
 			if strings.Join(cmd.Commands(), " ") == "CLUSTER SLOTS" {
+				if atomic.LoadInt64(&replicaCalls) > 0 {
+					return slotsRespNoReplica
+				}
 				return slotsResp
 			}
 			return ValkeyResult{}
@@ -11807,6 +11827,9 @@ func TestClusterDoMultiPreservesAskingBucketing(t *testing.T) {
 	primaryConn := &mockConn{
 		DoFn: func(cmd Completed) ValkeyResult {
 			if strings.Join(cmd.Commands(), " ") == "CLUSTER SLOTS" {
+				if atomic.LoadInt64(&replicaCalls) > 0 {
+					return slotsRespNoReplica
+				}
 				return slotsResp
 			}
 			return ValkeyResult{}
@@ -11823,6 +11846,9 @@ func TestClusterDoMultiPreservesAskingBucketing(t *testing.T) {
 	replicaConn := &mockConn{
 		DoFn: func(cmd Completed) ValkeyResult {
 			if strings.Join(cmd.Commands(), " ") == "CLUSTER SLOTS" {
+				if atomic.LoadInt64(&replicaCalls) > 0 {
+					return slotsRespNoReplica
+				}
 				return slotsResp
 			}
 			return ValkeyResult{}
@@ -11841,7 +11867,15 @@ func TestClusterDoMultiPreservesAskingBucketing(t *testing.T) {
 		},
 	}
 	targetConn := &mockConn{
-		DoFn: func(cmd Completed) ValkeyResult { return ValkeyResult{} },
+		DoFn: func(cmd Completed) ValkeyResult {
+			if strings.Join(cmd.Commands(), " ") == "CLUSTER SLOTS" {
+				if atomic.LoadInt64(&replicaCalls) > 0 {
+					return slotsRespNoReplica
+				}
+				return slotsResp
+			}
+			return ValkeyResult{}
+		},
 		DoMultiFn: func(multi ...Completed) *valkeyresults {
 			atomic.AddInt64(&targetCalls, 1)
 			targetMu.Lock()
@@ -11874,6 +11908,9 @@ func TestClusterDoMultiPreservesAskingBucketing(t *testing.T) {
 			return &mockConn{
 				DoFn: func(cmd Completed) ValkeyResult {
 					if strings.Join(cmd.Commands(), " ") == "CLUSTER SLOTS" {
+						if atomic.LoadInt64(&replicaCalls) > 0 {
+							return slotsRespNoReplica
+						}
 						return slotsResp
 					}
 					return ValkeyResult{}
@@ -11941,6 +11978,9 @@ func TestClusterDoMultiCacheRepicksAfterReplicaRemoval(t *testing.T) {
 	primaryConn := &mockConn{
 		DoFn: func(cmd Completed) ValkeyResult {
 			if strings.Join(cmd.Commands(), " ") == "CLUSTER SLOTS" {
+				if atomic.LoadInt64(&replicaCalls) > 0 {
+					return slotsRespNoReplica
+				}
 				return slotsResp
 			}
 			return ValkeyResult{}
@@ -11986,6 +12026,9 @@ func TestClusterDoMultiCacheRepicksAfterReplicaRemoval(t *testing.T) {
 			return &mockConn{
 				DoFn: func(cmd Completed) ValkeyResult {
 					if strings.Join(cmd.Commands(), " ") == "CLUSTER SLOTS" {
+						if atomic.LoadInt64(&replicaCalls) > 0 {
+							return slotsRespNoReplica
+						}
 						return slotsResp
 					}
 					return ValkeyResult{}
@@ -12409,4 +12452,435 @@ func TestClusterRebucketRetriesKeylessConsolidates(t *testing.T) {
 			t.Fatalf("expected all 3 keyless commands on one conn, got %d", len(bucket.commands))
 		}
 	}
+}
+
+func TestClusterClient_PreFlightRetry(t *testing.T) {
+	defer ShouldNotLeak(SetupLeakDetection())
+
+	setup := func() (*clusterClient, *mockConn) {
+		m := &mockConn{
+			DoFn: func(cmd Completed) ValkeyResult {
+				if strings.Join(cmd.Commands(), " ") == "CLUSTER SLOTS" {
+					return slotsMultiResp
+				}
+				return ValkeyResult{}
+			},
+		}
+		client, err := newClusterClient(
+			&ClientOption{InitAddress: []string{":0"}},
+			func(dst string, opt *ClientOption) conn { return m },
+			newRetryer(defaultRetryDelayFn),
+		)
+		if err != nil {
+			t.Fatalf("unexpected err %v", err)
+		}
+		return client, m
+	}
+
+	t.Run("Write command retries on dial error and succeeds", func(t *testing.T) {
+		client, m := setup()
+		attempts := 0
+		dialErr := &net.OpError{Op: "dial", Err: errors.New("connection refused")}
+		m.DoFn = func(cmd Completed) ValkeyResult {
+			if strings.Join(cmd.Commands(), " ") == "CLUSTER SLOTS" {
+				return slotsMultiResp
+			}
+			attempts++
+			if attempts == 1 {
+				return NewErrorResult(dialErr)
+			}
+			return NewResult(strmsg('+', "OK"), nil)
+		}
+
+		if v, err := client.Do(context.Background(), client.B().Set().Key("k").Value("v").Build().ToRetryable()).ToString(); err != nil || v != "OK" {
+			t.Fatalf("unexpected response %v %v", v, err)
+		}
+		if attempts != 2 {
+			t.Fatalf("expected 2 attempts for pre-flight dial retry, got %v", attempts)
+		}
+	})
+
+	t.Run("Write command retries on CLUSTERDOWN and succeeds", func(t *testing.T) {
+		client, m := setup()
+		attempts := 0
+		m.DoFn = func(cmd Completed) ValkeyResult {
+			if strings.Join(cmd.Commands(), " ") == "CLUSTER SLOTS" {
+				return slotsMultiResp
+			}
+			attempts++
+			if attempts == 1 {
+				return NewResult(strmsg('-', "CLUSTERDOWN Hash slot not served"), nil)
+			}
+			return NewResult(strmsg('+', "OK"), nil)
+		}
+
+		if v, err := client.Do(context.Background(), client.B().Set().Key("k").Value("v").Build().ToRetryable()).ToString(); err != nil || v != "OK" {
+			t.Fatalf("unexpected response %v %v", v, err)
+		}
+		if attempts != 2 {
+			t.Fatalf("expected 2 attempts, got %v", attempts)
+		}
+	})
+
+	t.Run("Write command retries on LOADING and succeeds", func(t *testing.T) {
+		client, m := setup()
+		attempts := 0
+		m.DoFn = func(cmd Completed) ValkeyResult {
+			if strings.Join(cmd.Commands(), " ") == "CLUSTER SLOTS" {
+				return slotsMultiResp
+			}
+			attempts++
+			if attempts == 1 {
+				return NewResult(strmsg('-', "LOADING Valkey is loading the dataset in memory"), nil)
+			}
+			return NewResult(strmsg('+', "OK"), nil)
+		}
+
+		if v, err := client.Do(context.Background(), client.B().Set().Key("k").Value("v").Build().ToRetryable()).ToString(); err != nil || v != "OK" {
+			t.Fatalf("unexpected response %v %v", v, err)
+		}
+		if attempts != 2 {
+			t.Fatalf("expected 2 attempts, got %v", attempts)
+		}
+	})
+
+	t.Run("Write command retries on TRYAGAIN and succeeds", func(t *testing.T) {
+		client, m := setup()
+		attempts := 0
+		m.DoFn = func(cmd Completed) ValkeyResult {
+			if strings.Join(cmd.Commands(), " ") == "CLUSTER SLOTS" {
+				return slotsMultiResp
+			}
+			attempts++
+			if attempts == 1 {
+				return NewResult(strmsg('-', "TRYAGAIN Multiple keys request during rehashing"), nil)
+			}
+			return NewResult(strmsg('+', "OK"), nil)
+		}
+
+		if v, err := client.Do(context.Background(), client.B().Set().Key("k").Value("v").Build().ToRetryable()).ToString(); err != nil || v != "OK" {
+			t.Fatalf("unexpected response %v %v", v, err)
+		}
+		if attempts != 2 {
+			t.Fatalf("expected 2 attempts, got %v", attempts)
+		}
+	})
+
+	t.Run("Dedicated client write command retries on CLUSTERDOWN and succeeds", func(t *testing.T) {
+		client, m := setup()
+		attempts := 0
+		w := &mockWire{
+			DoFn: func(cmd Completed) ValkeyResult {
+				attempts++
+				if attempts == 1 {
+					return NewResult(strmsg('-', "CLUSTERDOWN Hash slot not served"), nil)
+				}
+				return NewResult(strmsg('+', "OK"), nil)
+			},
+		}
+		m.AcquireFn = func() wire { return w }
+
+		c, cancel := client.Dedicate()
+		defer cancel()
+
+		if v, err := c.Do(context.Background(), client.B().Set().Key("k").Value("v").Build().ToRetryable()).ToString(); err != nil || v != "OK" {
+			t.Fatalf("unexpected response %v %v", v, err)
+		}
+		if attempts != 2 {
+			t.Fatalf("expected 2 attempts, got %v", attempts)
+		}
+	})
+}
+
+func TestClusterClient_IdempotencySafeguard(t *testing.T) {
+	defer ShouldNotLeak(SetupLeakDetection())
+
+	setup := func() (*clusterClient, *mockConn) {
+		m := &mockConn{
+			DoFn: func(cmd Completed) ValkeyResult {
+				if strings.Join(cmd.Commands(), " ") == "CLUSTER SLOTS" {
+					return slotsMultiResp
+				}
+				return ValkeyResult{}
+			},
+		}
+		client, err := newClusterClient(
+			&ClientOption{InitAddress: []string{":0"}},
+			func(dst string, opt *ClientOption) conn { return m },
+			newRetryer(defaultRetryDelayFn),
+		)
+		if err != nil {
+			t.Fatalf("unexpected err %v", err)
+		}
+		return client, m
+	}
+
+	t.Run("In-flight EOF mid-stream must NOT retry write command", func(t *testing.T) {
+		client, m := setup()
+		attempts := 0
+		m.DoFn = func(cmd Completed) ValkeyResult {
+			if strings.Join(cmd.Commands(), " ") == "CLUSTER SLOTS" {
+				return slotsMultiResp
+			}
+			attempts++
+			return NewErrorResult(io.EOF)
+		}
+
+		err := client.Do(context.Background(), client.B().Incr().Key("counter").Build()).Error()
+		if !errors.Is(err, io.EOF) {
+			t.Fatalf("expected io.EOF, got %v", err)
+		}
+		if attempts != 1 {
+			t.Fatalf("expected exactly 1 attempt (fail fast without retry for in-flight drop), got %v", attempts)
+		}
+	})
+
+	t.Run("In-flight EOF mid-stream DOES retry read-only command", func(t *testing.T) {
+		client, m := setup()
+		attempts := 0
+		m.DoFn = func(cmd Completed) ValkeyResult {
+			if strings.Join(cmd.Commands(), " ") == "CLUSTER SLOTS" {
+				return slotsMultiResp
+			}
+			attempts++
+			if attempts == 1 {
+				return NewErrorResult(io.EOF)
+			}
+			return NewResult(strmsg('+', "val"), nil)
+		}
+
+		v, err := client.Do(context.Background(), client.B().Get().Key("k").Build()).ToString()
+		if err != nil || v != "val" {
+			t.Fatalf("unexpected response %v %v", v, err)
+		}
+		if attempts != 2 {
+			t.Fatalf("expected 2 attempts for read command retry on EOF, got %v", attempts)
+		}
+	})
+
+	t.Run("In-flight write OpError must NOT retry write command", func(t *testing.T) {
+		client, m := setup()
+		attempts := 0
+		writeErr := &net.OpError{Op: "write", Err: errors.New("broken pipe")}
+		m.DoFn = func(cmd Completed) ValkeyResult {
+			if strings.Join(cmd.Commands(), " ") == "CLUSTER SLOTS" {
+				return slotsMultiResp
+			}
+			attempts++
+			return NewErrorResult(writeErr)
+		}
+
+		err := client.Do(context.Background(), client.B().Set().Key("k").Value("v").Build()).Error()
+		if err != writeErr {
+			t.Fatalf("expected writeErr, got %v", err)
+		}
+		if attempts != 1 {
+			t.Fatalf("expected exactly 1 attempt, got %v", attempts)
+		}
+	})
+
+	t.Run("Dedicated client in-flight EOF must NOT retry write command", func(t *testing.T) {
+		client, m := setup()
+		attempts := 0
+		w := &mockWire{
+			DoFn: func(cmd Completed) ValkeyResult {
+				attempts++
+				return NewErrorResult(io.EOF)
+			},
+		}
+		m.AcquireFn = func() wire { return w }
+
+		c, cancel := client.Dedicate()
+		defer cancel()
+
+		err := c.Do(context.Background(), client.B().Set().Key("k").Value("v").Build()).Error()
+		if !errors.Is(err, io.EOF) {
+			t.Fatalf("expected io.EOF, got %v", err)
+		}
+		if attempts != 1 {
+			t.Fatalf("expected 1 attempt (fail fast without retry), got %v", attempts)
+		}
+	})
+}
+
+func TestClusterClient_Pipelining_PreFlightRetry(t *testing.T) {
+	defer ShouldNotLeak(SetupLeakDetection())
+
+	setup := func() (*clusterClient, *mockConn) {
+		m := &mockConn{
+			DoFn: func(cmd Completed) ValkeyResult {
+				if strings.Join(cmd.Commands(), " ") == "CLUSTER SLOTS" {
+					return slotsMultiResp
+				}
+				return ValkeyResult{}
+			},
+		}
+		client, err := newClusterClient(
+			&ClientOption{InitAddress: []string{":0"}},
+			func(dst string, opt *ClientOption) conn { return m },
+			newRetryer(defaultRetryDelayFn),
+		)
+		if err != nil {
+			t.Fatalf("unexpected err %v", err)
+		}
+		return client, m
+	}
+
+	t.Run("DoMulti write retries on pre-flight dial error", func(t *testing.T) {
+		client, m := setup()
+		attempts := 0
+		dialErr := &net.OpError{Op: "dial", Err: errors.New("connection refused")}
+		m.DoMultiFn = func(multi ...Completed) *valkeyresults {
+			attempts++
+			if attempts == 1 {
+				return &valkeyresults{s: []ValkeyResult{NewErrorResult(dialErr)}}
+			}
+			return &valkeyresults{s: []ValkeyResult{NewResult(strmsg('+', "OK"), nil)}}
+		}
+
+		cmd := client.B().Set().Key("k").Value("v").Build().ToRetryable()
+		resps := client.DoMulti(context.Background(), cmd)
+		if len(resps) != 1 {
+			t.Fatalf("unexpected resps length %v", len(resps))
+		}
+		if v, err := resps[0].ToString(); err != nil || v != "OK" {
+			t.Fatalf("unexpected response %v %v", v, err)
+		}
+		if attempts != 2 {
+			t.Fatalf("expected 2 attempts, got %v", attempts)
+		}
+	})
+
+	t.Run("DoMulti write fails fast on in-flight EOF", func(t *testing.T) {
+		client, m := setup()
+		attempts := 0
+		m.DoMultiFn = func(multi ...Completed) *valkeyresults {
+			attempts++
+			return &valkeyresults{s: []ValkeyResult{NewErrorResult(io.EOF)}}
+		}
+
+		cmd := client.B().Set().Key("k").Value("v").Build()
+		resps := client.DoMulti(context.Background(), cmd)
+		if len(resps) != 1 {
+			t.Fatalf("unexpected resps length %v", len(resps))
+		}
+		if err := resps[0].Error(); !errors.Is(err, io.EOF) {
+			t.Fatalf("expected io.EOF, got %v", err)
+		}
+		if attempts != 1 {
+			t.Fatalf("expected 1 attempt (fail fast without retry for in-flight drop), got %v", attempts)
+		}
+	})
+}
+
+func TestIsSafePreFlightOrClusterTransitionErr(t *testing.T) {
+	// 1. Dial errors (pre-flight safe)
+	dialErr := &net.OpError{Op: "dial", Err: errors.New("connection refused")}
+	if !isSafePreFlightOrClusterTransitionErr(dialErr, dialErr) {
+		t.Errorf("expected true for dial net.OpError")
+	}
+	wrappedDialErr := fmt.Errorf("network error: %w", dialErr)
+	if !isSafePreFlightOrClusterTransitionErr(wrappedDialErr, wrappedDialErr) {
+		t.Errorf("expected true for wrapped dial net.OpError")
+	}
+	if !isSafePreFlightOrClusterTransitionErr(syscall.ECONNREFUSED, syscall.ECONNREFUSED) {
+		t.Errorf("expected true for syscall.ECONNREFUSED")
+	}
+	if !isSafePreFlightOrClusterTransitionErr(syscall.EHOSTUNREACH, syscall.EHOSTUNREACH) {
+		t.Errorf("expected true for syscall.EHOSTUNREACH")
+	}
+
+	// 2. Server rejections prior to execution (cluster transitions)
+	clusterDownMsg := strmsg('-', "CLUSTERDOWN The cluster is down")
+	if !isSafePreFlightOrClusterTransitionErr(clusterDownMsg.Error(), nil) {
+		t.Errorf("expected true for CLUSTERDOWN")
+	}
+
+	tryAgainMsg := strmsg('-', "TRYAGAIN Multiple keys request during rehashing")
+	if !isSafePreFlightOrClusterTransitionErr(tryAgainMsg.Error(), nil) {
+		t.Errorf("expected true for TRYAGAIN")
+	}
+
+	loadingMsg := strmsg('-', "LOADING Valkey is loading the dataset in memory")
+	if !isSafePreFlightOrClusterTransitionErr(loadingMsg.Error(), nil) {
+		t.Errorf("expected true for LOADING")
+	}
+
+	// 3. In-flight stream / connection errors (safe for retryable commands)
+	if !isSafePreFlightOrClusterTransitionErr(io.EOF, io.EOF) {
+		t.Errorf("expected true for io.EOF")
+	}
+	if !isSafePreFlightOrClusterTransitionErr(io.ErrUnexpectedEOF, io.ErrUnexpectedEOF) {
+		t.Errorf("expected true for io.ErrUnexpectedEOF")
+	}
+	writeErr := &net.OpError{Op: "write", Err: errors.New("broken pipe")}
+	if !isSafePreFlightOrClusterTransitionErr(writeErr, writeErr) {
+		t.Errorf("expected true for write net.OpError")
+	}
+	readErr := &net.OpError{Op: "read", Err: errors.New("connection reset")}
+	if !isSafePreFlightOrClusterTransitionErr(readErr, readErr) {
+		t.Errorf("expected true for read net.OpError")
+	}
+
+	// 4. Context canceled or deadline exceeded (must NOT retry)
+	ctxCancel, cancel := context.WithCancel(context.Background())
+	cancel()
+	if isSafePreFlightOrClusterTransitionErr(ctxCancel.Err(), ctxCancel.Err()) {
+		t.Errorf("expected false for context.Canceled")
+	}
+	ctxTimeout, cancelTimeout := context.WithTimeout(context.Background(), 0)
+	defer cancelTimeout()
+	<-ctxTimeout.Done()
+	if isSafePreFlightOrClusterTransitionErr(ctxTimeout.Err(), ctxTimeout.Err()) {
+		t.Errorf("expected false for context.DeadlineExceeded")
+	}
+
+	// 5. Arbitrary errors & nil
+	if isSafePreFlightOrClusterTransitionErr(nil, nil) {
+		t.Errorf("expected false for nil")
+	}
+	if isSafePreFlightOrClusterTransitionErr(ErrClosing, ErrClosing) {
+		t.Errorf("expected false for ErrClosing")
+	}
+	genericErrMsg := strmsg('-', "ERR unknown error")
+	if isSafePreFlightOrClusterTransitionErr(genericErrMsg.Error(), nil) {
+		t.Errorf("expected false for generic ValkeyError")
+	}
+	if isSafePreFlightOrClusterTransitionErr(errors.New("generic"), errors.New("generic")) {
+		t.Errorf("expected false for generic error")
+	}
+}
+
+func BenchmarkIsSafePreFlightOrClusterTransitionErr(b *testing.B) {
+	dialErr := &net.OpError{Op: "dial", Err: errors.New("connection refused")}
+	clusterDownMsg := strmsg('-', "CLUSTERDOWN The cluster is down")
+	clusterDownErr := clusterDownMsg.Error()
+	eofErr := io.EOF
+
+	b.Run("DialError", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			if !isSafePreFlightOrClusterTransitionErr(dialErr, dialErr) {
+				b.Fatal("unexpected false")
+			}
+		}
+	})
+
+	b.Run("ClusterDown", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			if !isSafePreFlightOrClusterTransitionErr(clusterDownErr, nil) {
+				b.Fatal("unexpected false")
+			}
+		}
+	})
+
+	b.Run("InFlightEOF", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			if !isSafePreFlightOrClusterTransitionErr(eofErr, eofErr) {
+				b.Fatal("unexpected false")
+			}
+		}
+	})
 }
