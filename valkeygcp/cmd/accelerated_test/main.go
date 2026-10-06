@@ -45,8 +45,7 @@ func main() {
 		if err != nil {
 			log.Fatalf("authFn error: %v", err)
 		}
-		log.Printf("Token Password: %s, Next Refresh Scheduled in: %v",
-			creds.Password,
+		log.Printf("Token acquired. Next Refresh Scheduled in: %v",
 			time.Until(creds.RefreshAfter).Round(time.Millisecond),
 		)
 		time.Sleep(1 * time.Second)
