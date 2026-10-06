@@ -2,6 +2,7 @@ package valkeygcp
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"sync"
 	"time"
@@ -72,7 +73,17 @@ func NewGCPTokenProvider(ctx context.Context, opt IAMAuthOptions) (GCPTokenProvi
 		}
 		baseSource = ts
 	} else if len(opt.CredentialsJSON) > 0 {
-		creds, err := google.CredentialsFromJSON(ctx, opt.CredentialsJSON, opt.Scopes...)
+		var credTypeHeader struct {
+			Type google.CredentialsType `json:"type"`
+		}
+		if err := json.Unmarshal(opt.CredentialsJSON, &credTypeHeader); err != nil {
+			return nil, fmt.Errorf("valkeygcp: invalid credentials JSON: %w", err)
+		}
+		credType := credTypeHeader.Type
+		if credType == "" {
+			credType = google.ServiceAccount
+		}
+		creds, err := google.CredentialsFromJSONWithType(ctx, opt.CredentialsJSON, credType, opt.Scopes...)
 		if err != nil {
 			return nil, fmt.Errorf("valkeygcp: invalid credentials JSON: %w", err)
 		}
