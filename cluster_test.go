@@ -12492,7 +12492,7 @@ func TestClusterClient_PreFlightRetry(t *testing.T) {
 			return NewResult(strmsg('+', "OK"), nil)
 		}
 
-		if v, err := client.Do(context.Background(), client.B().Set().Key("k").Value("v").Build().ToRetryable()).ToString(); err != nil || v != "OK" {
+		if v, err := client.Do(context.Background(), client.B().Set().Key("k").Value("v").Build()).ToString(); err != nil || v != "OK" {
 			t.Fatalf("unexpected response %v %v", v, err)
 		}
 		if attempts != 2 {
@@ -12514,7 +12514,7 @@ func TestClusterClient_PreFlightRetry(t *testing.T) {
 			return NewResult(strmsg('+', "OK"), nil)
 		}
 
-		if v, err := client.Do(context.Background(), client.B().Set().Key("k").Value("v").Build().ToRetryable()).ToString(); err != nil || v != "OK" {
+		if v, err := client.Do(context.Background(), client.B().Set().Key("k").Value("v").Build()).ToString(); err != nil || v != "OK" {
 			t.Fatalf("unexpected response %v %v", v, err)
 		}
 		if attempts != 2 {
@@ -12536,7 +12536,7 @@ func TestClusterClient_PreFlightRetry(t *testing.T) {
 			return NewResult(strmsg('+', "OK"), nil)
 		}
 
-		if v, err := client.Do(context.Background(), client.B().Set().Key("k").Value("v").Build().ToRetryable()).ToString(); err != nil || v != "OK" {
+		if v, err := client.Do(context.Background(), client.B().Set().Key("k").Value("v").Build()).ToString(); err != nil || v != "OK" {
 			t.Fatalf("unexpected response %v %v", v, err)
 		}
 		if attempts != 2 {
@@ -12558,7 +12558,7 @@ func TestClusterClient_PreFlightRetry(t *testing.T) {
 			return NewResult(strmsg('+', "OK"), nil)
 		}
 
-		if v, err := client.Do(context.Background(), client.B().Set().Key("k").Value("v").Build().ToRetryable()).ToString(); err != nil || v != "OK" {
+		if v, err := client.Do(context.Background(), client.B().Set().Key("k").Value("v").Build()).ToString(); err != nil || v != "OK" {
 			t.Fatalf("unexpected response %v %v", v, err)
 		}
 		if attempts != 2 {
@@ -12583,7 +12583,7 @@ func TestClusterClient_PreFlightRetry(t *testing.T) {
 		c, cancel := client.Dedicate()
 		defer cancel()
 
-		if v, err := c.Do(context.Background(), client.B().Set().Key("k").Value("v").Build().ToRetryable()).ToString(); err != nil || v != "OK" {
+		if v, err := c.Do(context.Background(), client.B().Set().Key("k").Value("v").Build()).ToString(); err != nil || v != "OK" {
 			t.Fatalf("unexpected response %v %v", v, err)
 		}
 		if attempts != 2 {
@@ -12738,7 +12738,7 @@ func TestClusterClient_Pipelining_PreFlightRetry(t *testing.T) {
 			return &valkeyresults{s: []ValkeyResult{NewResult(strmsg('+', "OK"), nil)}}
 		}
 
-		cmd := client.B().Set().Key("k").Value("v").Build().ToRetryable()
+		cmd := client.B().Set().Key("k").Value("v").Build()
 		resps := client.DoMulti(context.Background(), cmd)
 		if len(resps) != 1 {
 			t.Fatalf("unexpected resps length %v", len(resps))
@@ -12774,7 +12774,7 @@ func TestClusterClient_Pipelining_PreFlightRetry(t *testing.T) {
 }
 
 func TestIsSafePreFlightOrClusterTransitionErr(t *testing.T) {
-	// 1. Dial errors (pre-flight safe)
+	// 1. Dial errors and pre-flight wrapped errors (pre-flight safe)
 	dialErr := &net.OpError{Op: "dial", Err: errors.New("connection refused")}
 	if !isSafePreFlightOrClusterTransitionErr(dialErr, dialErr) {
 		t.Errorf("expected true for dial net.OpError")
@@ -12783,11 +12783,21 @@ func TestIsSafePreFlightOrClusterTransitionErr(t *testing.T) {
 	if !isSafePreFlightOrClusterTransitionErr(wrappedDialErr, wrappedDialErr) {
 		t.Errorf("expected true for wrapped dial net.OpError")
 	}
-	if !isSafePreFlightOrClusterTransitionErr(syscall.ECONNREFUSED, syscall.ECONNREFUSED) {
-		t.Errorf("expected true for syscall.ECONNREFUSED")
+	pfErr := &errPreFlight{error: errors.New("dial failed")}
+	if !isSafePreFlightOrClusterTransitionErr(pfErr, pfErr) {
+		t.Errorf("expected true for errPreFlight")
 	}
-	if !isSafePreFlightOrClusterTransitionErr(syscall.EHOSTUNREACH, syscall.EHOSTUNREACH) {
-		t.Errorf("expected true for syscall.EHOSTUNREACH")
+	wrappedPfErr := fmt.Errorf("transport init error: %w", pfErr)
+	if !isSafePreFlightOrClusterTransitionErr(wrappedPfErr, wrappedPfErr) {
+		t.Errorf("expected true for wrapped errPreFlight")
+	}
+
+	// Raw errnos without Op == "dial" or errPreFlight must NOT be treated as pre-flight
+	if isSafePreFlightOrClusterTransitionErr(syscall.ECONNREFUSED, syscall.ECONNREFUSED) {
+		t.Errorf("expected false for raw syscall.ECONNREFUSED")
+	}
+	if isSafePreFlightOrClusterTransitionErr(syscall.EHOSTUNREACH, syscall.EHOSTUNREACH) {
+		t.Errorf("expected false for raw syscall.EHOSTUNREACH")
 	}
 
 	// 2. Server rejections prior to execution (cluster transitions)
@@ -12806,20 +12816,20 @@ func TestIsSafePreFlightOrClusterTransitionErr(t *testing.T) {
 		t.Errorf("expected true for LOADING")
 	}
 
-	// 3. In-flight stream / connection errors (safe for retryable commands)
-	if !isSafePreFlightOrClusterTransitionErr(io.EOF, io.EOF) {
-		t.Errorf("expected true for io.EOF")
+	// 3. In-flight stream / connection errors (must NOT be treated as pre-flight)
+	if isSafePreFlightOrClusterTransitionErr(io.EOF, io.EOF) {
+		t.Errorf("expected false for io.EOF")
 	}
-	if !isSafePreFlightOrClusterTransitionErr(io.ErrUnexpectedEOF, io.ErrUnexpectedEOF) {
-		t.Errorf("expected true for io.ErrUnexpectedEOF")
+	if isSafePreFlightOrClusterTransitionErr(io.ErrUnexpectedEOF, io.ErrUnexpectedEOF) {
+		t.Errorf("expected false for io.ErrUnexpectedEOF")
 	}
 	writeErr := &net.OpError{Op: "write", Err: errors.New("broken pipe")}
-	if !isSafePreFlightOrClusterTransitionErr(writeErr, writeErr) {
-		t.Errorf("expected true for write net.OpError")
+	if isSafePreFlightOrClusterTransitionErr(writeErr, writeErr) {
+		t.Errorf("expected false for write net.OpError")
 	}
 	readErr := &net.OpError{Op: "read", Err: errors.New("connection reset")}
-	if !isSafePreFlightOrClusterTransitionErr(readErr, readErr) {
-		t.Errorf("expected true for read net.OpError")
+	if isSafePreFlightOrClusterTransitionErr(readErr, readErr) {
+		t.Errorf("expected false for read net.OpError")
 	}
 
 	// 4. Context canceled or deadline exceeded (must NOT retry)
@@ -12878,8 +12888,8 @@ func BenchmarkIsSafePreFlightOrClusterTransitionErr(b *testing.B) {
 	b.Run("InFlightEOF", func(b *testing.B) {
 		b.ReportAllocs()
 		for i := 0; i < b.N; i++ {
-			if !isSafePreFlightOrClusterTransitionErr(eofErr, eofErr) {
-				b.Fatal("unexpected false")
+			if isSafePreFlightOrClusterTransitionErr(eofErr, eofErr) {
+				b.Fatal("unexpected true")
 			}
 		}
 	})

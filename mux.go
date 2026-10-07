@@ -69,6 +69,14 @@ type mux struct {
 	optIn   bool
 }
 
+type errPreFlight struct {
+	error
+}
+
+func (e *errPreFlight) Unwrap() error {
+	return e.error
+}
+
 func makeMux(dst string, option *ClientOption, dialFn dialFn) *mux {
 	dead := deadFn()
 	connFn := func(ctx context.Context) (net.Conn, error) {
@@ -78,6 +86,9 @@ func makeMux(dst string, option *ClientOption, dialFn dialFn) *mux {
 		return func(ctx context.Context) (w wire) {
 			w, err := pipeFn(ctx, connFn, option)
 			if err != nil {
+				if _, ok := err.(*ValkeyError); !ok {
+					err = &errPreFlight{error: err}
+				}
 				dead.error.Store(&errs{error: err})
 				w = dead
 			}
