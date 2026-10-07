@@ -33,11 +33,10 @@ func TestNewClusterClient_OptionWiring(t *testing.T) {
 func TestNewClusterClient_OptionError(t *testing.T) {
 	ctx := context.Background()
 	errExpected := errors.New("custom option error")
-	errOpt := func(opt *valkey.ClientOption) error {
-		return errExpected
-	}
 
-	_, err := NewClusterClient(ctx, "127.0.0.1:6379", errOpt)
+	_, err := NewClusterClient(ctx, "127.0.0.1:6379", func(opt *valkey.ClientOption) error {
+		return errExpected
+	})
 	if !errors.Is(err, errExpected) {
 		t.Fatalf("expected error %v, got %v", errExpected, err)
 	}
@@ -66,11 +65,10 @@ func TestNewStandaloneClient_OptionWiring(t *testing.T) {
 func TestNewStandaloneClient_OptionError(t *testing.T) {
 	ctx := context.Background()
 	errExpected := errors.New("standalone option error")
-	errOpt := func(opt *valkey.ClientOption) error {
-		return errExpected
-	}
 
-	_, err := NewStandaloneClient(ctx, "127.0.0.1:6379", "127.0.0.1:6380", errOpt)
+	_, err := NewStandaloneClient(ctx, "127.0.0.1:6379", "127.0.0.1:6380", func(opt *valkey.ClientOption) error {
+		return errExpected
+	})
 	if !errors.Is(err, errExpected) {
 		t.Fatalf("expected error %v, got %v", errExpected, err)
 	}
