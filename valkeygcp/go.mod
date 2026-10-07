@@ -1,6 +1,6 @@
 module github.com/valkey-io/valkey-go/valkeygcp
 
-go 1.26.0
+go 1.25.0
 
 replace github.com/valkey-io/valkey-go => ../
 
