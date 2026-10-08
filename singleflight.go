@@ -84,7 +84,12 @@ func (c *call) DelayDo(delay time.Duration, fn func() error) {
 			select {
 			case <-tm.C:
 			case <-fl.wake:
-				tm.Stop()
+				if !tm.Stop() {
+					select {
+					case <-tm.C:
+					default:
+					}
+				}
 			}
 		}
 		c.do(fl, fn)

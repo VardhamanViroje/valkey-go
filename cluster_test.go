@@ -12773,6 +12773,84 @@ func TestClusterClient_Pipelining_PreFlightRetry(t *testing.T) {
 	})
 }
 
+func TestClusterClient_ErrNoSlot_Retry(t *testing.T) {
+	defer ShouldNotLeak(SetupLeakDetection())
+
+	t.Run("Do write retries on ErrNoSlot and succeeds when slot maps", func(t *testing.T) {
+		refreshCount := 0
+		var m *mockConn
+		m = &mockConn{
+			DoFn: func(cmd Completed) ValkeyResult {
+				if strings.Join(cmd.Commands(), " ") == "CLUSTER SLOTS" {
+					refreshCount++
+					if refreshCount == 1 {
+						return singleSlotResp
+					}
+					return slotsMultiResp
+				}
+				return NewResult(strmsg('+', "OK"), nil)
+			},
+		}
+		client, err := newClusterClient(
+			&ClientOption{InitAddress: []string{":0"}},
+			func(dst string, opt *ClientOption) conn { return m },
+			newRetryer(defaultRetryDelayFn),
+		)
+		if err != nil {
+			t.Fatalf("unexpected err %v", err)
+		}
+
+		cmd := client.B().Set().Key("k").Value("v").Build()
+		resp := client.Do(context.Background(), cmd)
+		if v, err := resp.ToString(); err != nil || v != "OK" {
+			t.Fatalf("unexpected response %v %v", v, err)
+		}
+		if refreshCount < 2 {
+			t.Fatalf("expected at least 2 refreshes, got %v", refreshCount)
+		}
+	})
+
+	t.Run("DoMulti retries on ErrNoSlot and succeeds when slot maps", func(t *testing.T) {
+		refreshCount := 0
+		var m *mockConn
+		m = &mockConn{
+			DoFn: func(cmd Completed) ValkeyResult {
+				if strings.Join(cmd.Commands(), " ") == "CLUSTER SLOTS" {
+					refreshCount++
+					if refreshCount == 1 {
+						return singleSlotResp
+					}
+					return slotsMultiResp
+				}
+				return NewResult(strmsg('+', "OK"), nil)
+			},
+			DoMultiFn: func(multi ...Completed) *valkeyresults {
+				return &valkeyresults{s: []ValkeyResult{NewResult(strmsg('+', "OK"), nil)}}
+			},
+		}
+		client, err := newClusterClient(
+			&ClientOption{InitAddress: []string{":0"}},
+			func(dst string, opt *ClientOption) conn { return m },
+			newRetryer(defaultRetryDelayFn),
+		)
+		if err != nil {
+			t.Fatalf("unexpected err %v", err)
+		}
+
+		cmd := client.B().Set().Key("k").Value("v").Build()
+		resps := client.DoMulti(context.Background(), cmd)
+		if len(resps) != 1 {
+			t.Fatalf("unexpected resps length %v", len(resps))
+		}
+		if v, err := resps[0].ToString(); err != nil || v != "OK" {
+			t.Fatalf("unexpected response %v %v", v, err)
+		}
+		if refreshCount < 2 {
+			t.Fatalf("expected at least 2 refreshes, got %v", refreshCount)
+		}
+	})
+}
+
 func TestIsSafePreFlightOrClusterTransitionErr(t *testing.T) {
 	// 1. Dial errors and pre-flight wrapped errors (pre-flight safe)
 	dialErr := &net.OpError{Op: "dial", Err: errors.New("connection refused")}

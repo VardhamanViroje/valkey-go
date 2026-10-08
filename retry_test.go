@@ -3,6 +3,7 @@ package valkey
 import (
 	"context"
 	"errors"
+	"net"
 	"testing"
 	"time"
 )
@@ -35,6 +36,38 @@ func TestDefaultRetryDelay(t *testing.T) {
 		if got < 0 || got > defaultMaxRetryDelay {
 			t.Errorf("defaultRetryDelayFn(%d, %v) = %v; want >= 0 and <= %v", i, err, got, defaultMaxRetryDelay)
 		}
+	}
+}
+
+func TestAdaptiveRetryDelay(t *testing.T) {
+	adaptiveErrs := []error{
+		ErrNoSlot,
+		&net.OpError{Op: "dial", Err: errors.New("connection refused")},
+		&errPreFlight{error: errors.New("dial failed")},
+		errors.New("CLUSTERDOWN Hash slot not served"),
+		errors.New("TRYAGAIN Multiple keys request"),
+		errors.New("LOADING Valkey is loading dataset"),
+		errors.New("connection refused"),
+		errors.New("EOF"),
+		errors.New("read: connection reset by peer"),
+	}
+
+	for _, err := range adaptiveErrs {
+		for i := 0; i < 20; i++ {
+			delay := defaultRetryDelayFn(i, Completed{}, err)
+			if delay < 10*time.Millisecond {
+				t.Errorf("expected adaptive delay >= 10ms for %v at attempt %d, got %v", err, i, delay)
+			}
+			if delay > defaultMaxRetryDelay {
+				t.Errorf("delay %v exceeded cap %v for %v", delay, defaultMaxRetryDelay, err)
+			}
+		}
+	}
+
+	normalErr := errors.New("normal error")
+	delay0 := defaultRetryDelayFn(0, Completed{}, normalErr)
+	if delay0 >= 10*time.Millisecond {
+		t.Errorf("expected microsecond delay for normal error, got %v", delay0)
 	}
 }
 

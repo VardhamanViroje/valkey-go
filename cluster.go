@@ -161,7 +161,12 @@ func (c *clusterClient) lazyRefresh() {
 
 func (c *clusterClient) clusterRefreshStartDelay() time.Duration {
 	maxDelay := c.clusterRefreshMaxDelay()
-	return time.Duration(util.FastRand(int(maxDelay)))
+	base := time.Duration(util.FastRand(int(maxDelay)))
+	floor := time.Duration(10+util.FastRand(40)) * time.Millisecond
+	if base < floor {
+		return floor
+	}
+	return base
 }
 
 func (c *clusterClient) clusterRefreshMaxDelay() time.Duration {
@@ -668,6 +673,12 @@ func (c *clusterClient) do(ctx context.Context, cmd Completed) (resp ValkeyResul
 retry:
 	cc, err := c.pick(ctx, cmd.Slot(), c.toReplica(cmd))
 	if err != nil {
+		if errors.Is(err, ErrNoSlot) && c.retry {
+			if shouldRetry := c.retryHandler.WaitOrSkipRetry(ctx, attempts, cmd, err); shouldRetry {
+				attempts++
+				goto retry
+			}
+		}
 		return NewErrorResult(err)
 	}
 	cmdName, cmdArg := "", ""
@@ -1114,8 +1125,22 @@ func (c *clusterClient) DoMulti(ctx context.Context, multi ...Completed) []Valke
 		return nil
 	}
 
+	attempts := 1
+	redirects := 0
+
+retryPick:
 	retries, hasInit, err := c.pickMulti(ctx, multi)
 	if err != nil {
+		if errors.Is(err, ErrNoSlot) && c.retry {
+			cCmd := Completed{}
+			if len(multi) > 0 {
+				cCmd = multi[0]
+			}
+			if shouldRetry := c.retryHandler.WaitOrSkipRetry(ctx, attempts, cCmd, err); shouldRetry {
+				attempts++
+				goto retryPick
+			}
+		}
 		return fillErrs(len(multi), err)
 	}
 	defer connretryp.Put(retries)
@@ -1124,9 +1149,6 @@ func (c *clusterClient) DoMulti(ctx context.Context, multi ...Completed) []Valke
 	var mu sync.Mutex
 
 	results := resultsp.Get(len(multi), len(multi))
-
-	attempts := 1
-	redirects := 0
 
 retry:
 	retries.RetryDelay = -1 // Assume no retry. Because a client retry flag can be set to false.
@@ -1190,6 +1212,13 @@ func (c *clusterClient) doCache(ctx context.Context, cmd Cacheable, ttl time.Dur
 retry:
 	cc, err := c.pick(ctx, cmd.Slot(), c.toReplica(Completed(cmd)))
 	if err != nil {
+		if errors.Is(err, ErrNoSlot) && c.retry {
+			cCmd := Completed(cmd)
+			if shouldRetry := c.retryHandler.WaitOrSkipRetry(ctx, attempts, cCmd, err); shouldRetry {
+				attempts++
+				goto retry
+			}
+		}
 		return NewErrorResult(err)
 	}
 	resp = cc.DoCache(ctx, cmd, ttl)
@@ -1581,8 +1610,22 @@ func (c *clusterClient) DoMultiCache(ctx context.Context, multi ...CacheableTTL)
 		return nil
 	}
 
+	attempts := 1
+	redirects := 0
+
+retryPick:
 	retries, err := c.pickMultiCache(ctx, multi)
 	if err != nil {
+		if errors.Is(err, ErrNoSlot) && c.retry {
+			cCmd := Completed{}
+			if len(multi) > 0 {
+				cCmd = Completed(multi[0].Cmd)
+			}
+			if shouldRetry := c.retryHandler.WaitOrSkipRetry(ctx, attempts, cCmd, err); shouldRetry {
+				attempts++
+				goto retryPick
+			}
+		}
 		return fillErrs(len(multi), err)
 	}
 	defer connretrycachep.Put(retries)
@@ -1591,9 +1634,6 @@ func (c *clusterClient) DoMultiCache(ctx context.Context, multi ...CacheableTTL)
 	var mu sync.Mutex
 
 	results := resultsp.Get(len(multi), len(multi))
-
-	attempts := 1
-	redirects := 0
 
 retry:
 	retries.RetryDelay = -1 // Assume no retry. Because a client retry flag can be set to false.
@@ -1647,6 +1687,12 @@ func (c *clusterClient) Receive(ctx context.Context, subscribe Completed, fn fun
 retry:
 	cc, err := c.pick(ctx, subscribe.Slot(), c.toReplica(subscribe))
 	if err != nil {
+		if errors.Is(err, ErrNoSlot) && c.retry {
+			if shouldRetry := c.retryHandler.WaitOrSkipRetry(ctx, attempts, subscribe, err); shouldRetry {
+				attempts++
+				goto retry
+			}
+		}
 		goto ret
 	}
 	err = cc.Receive(ctx, subscribe, fn)
@@ -1841,6 +1887,12 @@ func (c *dedicatedClusterClient) Do(ctx context.Context, cmd Completed) (resp Va
 	attempts := 1
 retry:
 	if w, err := c.acquire(ctx, cmd.Slot()); err != nil {
+		if errors.Is(err, ErrNoSlot) && c.retry {
+			if shouldRetry := c.retryHandler.WaitOrSkipRetry(ctx, attempts, cmd, err); shouldRetry {
+				attempts++
+				goto retry
+			}
+		}
 		resp = NewErrorResult(err)
 	} else {
 		resp = w.Do(ctx, cmd)
@@ -1901,6 +1953,13 @@ retry:
 			}
 		}
 	} else {
+		if errors.Is(err, ErrNoSlot) && retryable {
+			cCmd := multi[0]
+			if shouldRetry := c.retryHandler.WaitOrSkipRetry(ctx, attempts, cCmd, err); shouldRetry {
+				attempts++
+				goto retry
+			}
+		}
 		resp = resultsp.Get(len(multi), len(multi)).s
 		for i := range resp {
 			resp[i] = NewErrorResult(err)
@@ -1920,17 +1979,24 @@ func (c *dedicatedClusterClient) Receive(ctx context.Context, subscribe Complete
 		attempts = 1
 	)
 retry:
-	if w, err = c.acquire(ctx, subscribe.Slot()); err == nil {
-		err = w.Receive(ctx, subscribe, fn)
-		if _, mode := c.client.shouldRefreshRetry(err, ctx); c.retry && mode == RedirectRetry && w.Error() == nil {
-			canRetry := subscribe.IsRetryable() || isSafePreFlightOrClusterTransitionErr(err, err)
-			if canRetry {
-				shouldRetry := c.retryHandler.WaitOrSkipRetry(ctx, attempts, subscribe, err)
-				if shouldRetry {
-					attempts++
-					_ = c.client.refresh(ctx)
-					goto retry
-				}
+	if w, err = c.acquire(ctx, subscribe.Slot()); err != nil {
+		if errors.Is(err, ErrNoSlot) && c.retry {
+			if shouldRetry := c.retryHandler.WaitOrSkipRetry(ctx, attempts, subscribe, err); shouldRetry {
+				attempts++
+				goto retry
+			}
+		}
+		return err
+	}
+	err = w.Receive(ctx, subscribe, fn)
+	if _, mode := c.client.shouldRefreshRetry(err, ctx); c.retry && mode == RedirectRetry && w.Error() == nil {
+		canRetry := subscribe.IsRetryable() || isSafePreFlightOrClusterTransitionErr(err, err)
+		if canRetry {
+			shouldRetry := c.retryHandler.WaitOrSkipRetry(ctx, attempts, subscribe, err)
+			if shouldRetry {
+				attempts++
+				_ = c.client.refresh(ctx)
+				goto retry
 			}
 		}
 	}
