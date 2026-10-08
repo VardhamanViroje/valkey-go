@@ -76,12 +76,26 @@ services:
         valkey-server --port 7001 --save "" --appendonly no --cluster-enabled yes --cluster-config-file 7001.conf &
         valkey-server --port 7002 --save "" --appendonly no --cluster-enabled yes --cluster-config-file 7002.conf &
         valkey-server --port 7003 --save "" --appendonly no --cluster-enabled yes --cluster-config-file 7003.conf &
-        while ! valkey-cli --cluster create 127.0.0.1:7001 127.0.0.1:7002 127.0.0.1:7003 --cluster-yes; do sleep 1; done
+        valkey-server --port 7021 --save "" --appendonly no --cluster-enabled yes --cluster-config-file 7021.conf &
+        valkey-server --port 7022 --save "" --appendonly no --cluster-enabled yes --cluster-config-file 7022.conf &
+        valkey-server --port 7023 --save "" --appendonly no --cluster-enabled yes --cluster-config-file 7023.conf &
+        if ! valkey-cli -p 7001 cluster info 2>/dev/null | grep -q "cluster_state:ok"; then
+          while ! valkey-cli --cluster create 127.0.0.1:7001 127.0.0.1:7002 127.0.0.1:7003 --cluster-yes; do sleep 1; done
+          id1=$$(valkey-cli -p 7001 CLUSTER MYID)
+          id2=$$(valkey-cli -p 7002 CLUSTER MYID)
+          id3=$$(valkey-cli -p 7003 CLUSTER MYID)
+          valkey-cli --cluster add-node 127.0.0.1:7021 127.0.0.1:7001 --cluster-slave --cluster-master-id $$id1
+          valkey-cli --cluster add-node 127.0.0.1:7022 127.0.0.1:7002 --cluster-slave --cluster-master-id $$id2
+          valkey-cli --cluster add-node 127.0.0.1:7023 127.0.0.1:7003 --cluster-slave --cluster-master-id $$id3
+        fi
         wait
     ports:
       - "7001:7001"
       - "7002:7002"
       - "7003:7003"
+      - "7021:7021"
+      - "7022:7022"
+      - "7023:7023"
   cluster5:
     image: redis:5-alpine
     entrypoint:

@@ -8,6 +8,7 @@ import (
 	"math/rand"
 	"net"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -669,9 +670,6 @@ retry:
 	if err != nil {
 		return NewErrorResult(err)
 	}
-	if err != nil {
-		return NewErrorResult(err)
-	}
 	cmdName, cmdArg := "", ""
 	if cs := cmd.Commands(); len(cs) > 0 {
 		cmdName = cs[0]
@@ -1223,8 +1221,7 @@ process:
 		goto process
 	case RedirectRetry:
 		cCmd := Completed(cmd)
-		canRetry := cCmd.IsRetryable() || isSafePreFlightOrClusterTransitionErr(resp.Error(), resp.NonValkeyError())
-		if c.retry && canRetry {
+		if c.retry && cCmd.IsRetryable() {
 			shouldRetry := c.retryHandler.WaitOrSkipRetry(ctx, attempts, cCmd, resp.Error())
 			if shouldRetry {
 				attempts++
@@ -1468,8 +1465,7 @@ func (c *clusterClient) resultcachefn(
 			retryDelay := time.Duration(-1)
 			if mode == RedirectRetry {
 				cCmd := Completed(cm.Cmd)
-				canRetry := cCmd.IsRetryable() || isSafePreFlightOrClusterTransitionErr(resp.Error(), resp.NonValkeyError())
-				if !c.retry || !canRetry {
+				if !c.retry || !cCmd.IsRetryable() {
 					continue
 				}
 				retryDelay = c.retryHandler.RetryDelay(attempts, cCmd, resp.Error())
@@ -2010,6 +2006,18 @@ const (
 // that the command was definitively not executed by the server (e.g. dial/handshake
 // failure where no wire was created) or is a safe cluster transition error.
 func isSafePreFlightOrClusterTransitionErr(err error, nonValkeyErr error) bool {
+	for _, e := range []error{nonValkeyErr, err} {
+		if e == nil {
+			continue
+		}
+		if errors.Is(e, context.Canceled) || errors.Is(e, context.DeadlineExceeded) {
+			return false
+		}
+		msg := strings.ToLower(e.Error())
+		if strings.Contains(msg, "context canceled") || strings.Contains(msg, "deadline exceeded") {
+			return false
+		}
+	}
 	var pf *errPreFlight
 	if errors.As(nonValkeyErr, &pf) || errors.As(err, &pf) {
 		return true
@@ -2018,8 +2026,20 @@ func isSafePreFlightOrClusterTransitionErr(err error, nonValkeyErr error) bool {
 	if (errors.As(nonValkeyErr, &opErr) || errors.As(err, &opErr)) && opErr.Op == "dial" {
 		return true
 	}
-	if vErr, ok := err.(*ValkeyError); ok {
+	var vErr *ValkeyError
+	if errors.As(err, &vErr) || errors.As(nonValkeyErr, &vErr) {
 		return vErr.IsClusterDown() || vErr.IsTryAgain() || vErr.IsLoading()
+	}
+	for _, e := range []error{err, nonValkeyErr} {
+		if e == nil {
+			continue
+		}
+		msg := strings.ToUpper(e.Error())
+		if strings.HasPrefix(msg, "CLUSTERDOWN") ||
+			strings.HasPrefix(msg, "TRYAGAIN") ||
+			strings.HasPrefix(msg, "LOADING") {
+			return true
+		}
 	}
 	return false
 }

@@ -12845,7 +12845,50 @@ func TestIsSafePreFlightOrClusterTransitionErr(t *testing.T) {
 		t.Errorf("expected false for context.DeadlineExceeded")
 	}
 
-	// 5. Arbitrary errors & nil
+	// errPreFlight wrapping context.Canceled or context.DeadlineExceeded must NOT be safe
+	pfCtxCancel := &errPreFlight{error: context.Canceled}
+	if isSafePreFlightOrClusterTransitionErr(pfCtxCancel, pfCtxCancel) {
+		t.Errorf("expected false for errPreFlight wrapping context.Canceled")
+	}
+	pfCtxTimeout := &errPreFlight{error: context.DeadlineExceeded}
+	if isSafePreFlightOrClusterTransitionErr(pfCtxTimeout, pfCtxTimeout) {
+		t.Errorf("expected false for errPreFlight wrapping context.DeadlineExceeded")
+	}
+	if isSafePreFlightOrClusterTransitionErr(errors.New("context canceled"), nil) {
+		t.Errorf("expected false for string context canceled in err")
+	}
+	if isSafePreFlightOrClusterTransitionErr(nil, errors.New("context deadline exceeded")) {
+		t.Errorf("expected false for string context deadline exceeded in nonValkeyErr")
+	}
+
+	// 5. Asymmetric argument testing and wrapped cluster transitions
+	if !isSafePreFlightOrClusterTransitionErr(nil, pfErr) {
+		t.Errorf("expected true for errPreFlight in nonValkeyErr with nil err")
+	}
+	if !isSafePreFlightOrClusterTransitionErr(pfErr, nil) {
+		t.Errorf("expected true for errPreFlight in err with nil nonValkeyErr")
+	}
+	if !isSafePreFlightOrClusterTransitionErr(nil, dialErr) {
+		t.Errorf("expected true for dial net.OpError in nonValkeyErr with nil err")
+	}
+	if !isSafePreFlightOrClusterTransitionErr(dialErr, nil) {
+		t.Errorf("expected true for dial net.OpError in err with nil nonValkeyErr")
+	}
+	wrappedClusterDown := fmt.Errorf("remote Valkey failure: %w", clusterDownMsg.Error())
+	if !isSafePreFlightOrClusterTransitionErr(wrappedClusterDown, nil) {
+		t.Errorf("expected true for wrapped CLUSTERDOWN ValkeyError")
+	}
+	if !isSafePreFlightOrClusterTransitionErr(errors.New("CLUSTERDOWN hash slot unassigned"), nil) {
+		t.Errorf("expected true for CLUSTERDOWN string error")
+	}
+	if !isSafePreFlightOrClusterTransitionErr(errors.New("TRYAGAIN key migration"), nil) {
+		t.Errorf("expected true for TRYAGAIN string error")
+	}
+	if !isSafePreFlightOrClusterTransitionErr(errors.New("LOADING data restoring"), nil) {
+		t.Errorf("expected true for LOADING string error")
+	}
+
+	// 6. Arbitrary errors & nil
 	if isSafePreFlightOrClusterTransitionErr(nil, nil) {
 		t.Errorf("expected false for nil")
 	}

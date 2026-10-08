@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -1455,3 +1456,90 @@ func (m *mockWire) Close() {
 		m.CloseFn()
 	}
 }
+
+func TestIsPreFlightDialError(t *testing.T) {
+	if isPreFlightDialError(nil) {
+		t.Errorf("expected false for nil")
+	}
+	if isPreFlightDialError(context.Canceled) {
+		t.Errorf("expected false for context.Canceled")
+	}
+	if isPreFlightDialError(context.DeadlineExceeded) {
+		t.Errorf("expected false for context.DeadlineExceeded")
+	}
+	dialErr := &net.OpError{Op: "dial", Err: errors.New("connection refused")}
+	if !isPreFlightDialError(dialErr) {
+		t.Errorf("expected true for dial net.OpError")
+	}
+	wrappedDialErr := fmt.Errorf("outer: %w", dialErr)
+	if !isPreFlightDialError(wrappedDialErr) {
+		t.Errorf("expected true for wrapped dial net.OpError")
+	}
+	writeErr := &net.OpError{Op: "write", Err: errors.New("broken pipe")}
+	if isPreFlightDialError(writeErr) {
+		t.Errorf("expected false for write net.OpError")
+	}
+	readErr := &net.OpError{Op: "read", Err: errors.New("connection reset")}
+	if isPreFlightDialError(readErr) {
+		t.Errorf("expected false for read net.OpError")
+	}
+	dnsErr := &net.DNSError{Err: "no such host", Name: "valkey.local"}
+	if !isPreFlightDialError(dnsErr) {
+		t.Errorf("expected true for net.DNSError")
+	}
+	if !isPreFlightDialError(syscall.ECONNREFUSED) {
+		t.Errorf("expected true for syscall.ECONNREFUSED")
+	}
+	if !isPreFlightDialError(syscall.EHOSTUNREACH) {
+		t.Errorf("expected true for syscall.EHOSTUNREACH")
+	}
+	if !isPreFlightDialError(syscall.ENETUNREACH) {
+		t.Errorf("expected true for syscall.ENETUNREACH")
+	}
+	if !isPreFlightDialError(syscall.ETIMEDOUT) {
+		t.Errorf("expected true for syscall.ETIMEDOUT")
+	}
+	if !isPreFlightDialError(syscall.ECONNRESET) {
+		t.Errorf("expected true for syscall.ECONNRESET")
+	}
+	if !isPreFlightDialError(errors.New("dial tcp 127.0.0.1:7001: connect: connection refused")) {
+		t.Errorf("expected true for connection refused string")
+	}
+	if !isPreFlightDialError(errors.New("connect: no route to host")) {
+		t.Errorf("expected true for no route to host string")
+	}
+	if !isPreFlightDialError(errors.New("lookup valkey.local: no such host")) {
+		t.Errorf("expected true for no such host string")
+	}
+	if !isPreFlightDialError(errors.New("network is unreachable")) {
+		t.Errorf("expected true for network is unreachable string")
+	}
+	if !isPreFlightDialError(errors.New("connection reset by peer")) {
+		t.Errorf("expected true for connection reset by peer string")
+	}
+	if !isPreFlightDialError(errors.New("i/o timeout")) {
+		t.Errorf("expected true for i/o timeout string")
+	}
+	if isPreFlightDialError(errors.New("context canceled: connection closed")) {
+		t.Errorf("expected false for string containing context canceled")
+	}
+	if isPreFlightDialError(errors.New("deadline exceeded: timeout")) {
+		t.Errorf("expected false for string containing deadline exceeded")
+	}
+	if isPreFlightDialError(&net.OpError{Op: "dial", Err: errors.New("context canceled")}) {
+		t.Errorf("expected false for dial net.OpError with context canceled string")
+	}
+	if isPreFlightDialError(&net.OpError{Op: "dial", Err: errors.New("context deadline exceeded")}) {
+		t.Errorf("expected false for dial net.OpError with context deadline exceeded string")
+	}
+	if isPreFlightDialError(fmt.Errorf("wrapped context: %w", context.Canceled)) {
+		t.Errorf("expected false for wrapped context.Canceled")
+	}
+	if isPreFlightDialError(fmt.Errorf("wrapped deadline: %w", context.DeadlineExceeded)) {
+		t.Errorf("expected false for wrapped context.DeadlineExceeded")
+	}
+	if isPreFlightDialError(errors.New("generic unknown error")) {
+		t.Errorf("expected false for generic error")
+	}
+}
+

@@ -2,11 +2,13 @@ package valkey
 
 import (
 	"context"
+	"errors"
 	"net"
 	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/valkey-io/valkey-go/internal/cmds"
@@ -77,18 +79,55 @@ func (e *errPreFlight) Unwrap() error {
 	return e.error
 }
 
+func isPreFlightDialError(err error) bool {
+	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	if strings.Contains(msg, "context canceled") || strings.Contains(msg, "deadline exceeded") {
+		return false
+	}
+	var opErr *net.OpError
+	if errors.As(err, &opErr) && opErr.Op == "dial" {
+		return true
+	}
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) {
+		return true
+	}
+	if errors.Is(err, syscall.ECONNREFUSED) ||
+		errors.Is(err, syscall.EHOSTUNREACH) ||
+		errors.Is(err, syscall.ENETUNREACH) ||
+		errors.Is(err, syscall.ETIMEDOUT) ||
+		errors.Is(err, syscall.ECONNRESET) {
+		return true
+	}
+	return strings.Contains(msg, "connection refused") ||
+		strings.Contains(msg, "no route to host") ||
+		strings.Contains(msg, "network is unreachable") ||
+		strings.Contains(msg, "connection reset by peer") ||
+		strings.Contains(msg, "i/o timeout") ||
+		strings.Contains(msg, "connect: connection timed out") ||
+		strings.Contains(msg, "operation timed out") ||
+		strings.Contains(msg, "no such host")
+}
+
 func makeMux(dst string, option *ClientOption, dialFn dialFn) *mux {
 	dead := deadFn()
 	connFn := func(ctx context.Context) (net.Conn, error) {
-		return dialFn(ctx, dst, option)
+		conn, err := dialFn(ctx, dst, option)
+		if err != nil {
+			if isPreFlightDialError(err) {
+				return nil, &errPreFlight{error: err}
+			}
+			return nil, err
+		}
+		return conn, nil
 	}
 	wireFn := func(pipeFn pipeFn) func(context.Context) wire {
 		return func(ctx context.Context) (w wire) {
 			w, err := pipeFn(ctx, connFn, option)
 			if err != nil {
-				if _, ok := err.(*ValkeyError); !ok {
-					err = &errPreFlight{error: err}
-				}
 				dead.error.Store(&errs{error: err})
 				w = dead
 			}
