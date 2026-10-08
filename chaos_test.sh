@@ -6,7 +6,8 @@
 # (up, restart, down, chaos/infinite) to test client-side write resilience
 # and dynamic node redirection.
 # ==============================================================================
-
+docker compose down
+docker compose up -d cluster
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
