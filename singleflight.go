@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"sync"
 	"time"
+
+	"github.com/valkey-io/valkey-go/internal/util"
 )
 
 // flight is the shared state of one fn execution. err is written exactly once,
@@ -85,6 +87,9 @@ func (c *call) DelayDo(delay time.Duration, fn func() error) {
 			case <-tm.C:
 			case <-fl.wake:
 				tm.Stop()
+				if jitter := time.Duration(util.FastRand(50)) * time.Millisecond; jitter > 0 {
+					time.Sleep(jitter)
+				}
 			}
 		}
 		c.do(fl, fn)

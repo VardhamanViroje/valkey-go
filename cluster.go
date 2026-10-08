@@ -2008,6 +2008,10 @@ const (
 // isSafePreFlightOrClusterTransitionErr returns true if the error guarantees
 // that the command was either not executed by the server or is a safe connection/cluster error.
 func isSafePreFlightOrClusterTransitionErr(err error, nonValkeyErr error) bool {
+	var opErr *net.OpError
+	if (errors.As(nonValkeyErr, &opErr) || errors.As(err, &opErr)) && opErr.Op == "dial" {
+		return true
+	}
 	if nonValkeyErr == context.Canceled || nonValkeyErr == context.DeadlineExceeded ||
 		err == context.Canceled || err == context.DeadlineExceeded ||
 		errors.Is(nonValkeyErr, context.Canceled) || errors.Is(nonValkeyErr, context.DeadlineExceeded) ||
@@ -2029,10 +2033,7 @@ func isSafePreFlightOrClusterTransitionErr(err error, nonValkeyErr error) bool {
 		errors.Is(nonValkeyErr, syscall.EHOSTUNREACH) || errors.Is(err, syscall.EHOSTUNREACH) {
 		return true
 	}
-	var opErr *net.OpError
-	if errors.As(nonValkeyErr, &opErr) || errors.As(err, &opErr) {
-		return true
-	}
+	
 	var targetErr error
 	if nonValkeyErr != nil {
 		targetErr = nonValkeyErr

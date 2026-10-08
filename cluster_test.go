@@ -12779,6 +12779,10 @@ func TestIsSafePreFlightOrClusterTransitionErr(t *testing.T) {
 	if !isSafePreFlightOrClusterTransitionErr(dialErr, dialErr) {
 		t.Errorf("expected true for dial net.OpError")
 	}
+	dialTimeoutErr := &net.OpError{Op: "dial", Err: context.DeadlineExceeded}
+	if !isSafePreFlightOrClusterTransitionErr(dialTimeoutErr, dialTimeoutErr) {
+		t.Errorf("expected true for dial net.OpError with DeadlineExceeded")
+	}
 	wrappedDialErr := fmt.Errorf("network error: %w", dialErr)
 	if !isSafePreFlightOrClusterTransitionErr(wrappedDialErr, wrappedDialErr) {
 		t.Errorf("expected true for wrapped dial net.OpError")
