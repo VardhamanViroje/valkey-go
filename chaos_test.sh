@@ -6,12 +6,11 @@
 # (up, restart, down, chaos/infinite) to test client-side write resilience
 # and dynamic node redirection.
 # ==============================================================================
-docker compose down
-docker compose up -d cluster
-set -e
-
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-COMPOSE_FILE="$SCRIPT_DIR/docker-compose.yml"
+COMPOSE_FILE="$SCRIPT_DIR/docker-compose.chaos.yml"
+docker compose -f "$COMPOSE_FILE" down
+docker compose -f "$COMPOSE_FILE" up -d cluster
+set -e
 
 # Colors
 GREEN='\033[0;32m'
