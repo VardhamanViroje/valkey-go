@@ -2,7 +2,6 @@ package valkey
 
 import (
 	"context"
-	"fmt"
 	"sync"
 	"time"
 
@@ -41,8 +40,9 @@ func (c *call) Do(ctx context.Context, fn func() error) error {
 	c.cn++
 	fl := c.fl
 	if fl != nil {
+		// Preempt any sleeping timer if this flight was started by DelayDo
+		// (only DelayDo flights select on fl.wake).
 		fl.wakeOnce.Do(func() {
-			fmt.Printf("⚡ [PREEMPTIBLE SINGLEFLIGHT] Waking up sleeping DelayDo timer early!\n")
 			close(fl.wake)
 		})
 		c.mu.Unlock()

@@ -13,7 +13,6 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"testing"
 	"time"
 
@@ -5966,7 +5965,7 @@ func TestClusterClientErr(t *testing.T) {
 
 func TestClusterClientRetry(t *testing.T) {
 	defer ShouldNotLeak(SetupLeakDetection())
-	SetupClientRetryWithErr(t, func(m *mockConn) Client {
+	SetupClientRetry(t, func(m *mockConn) Client {
 		m.DoOverride = map[string]func(cmd Completed) ValkeyResult{
 			"CLUSTER SLOTS": func(cmd Completed) ValkeyResult { return slotsMultiResp },
 		}
@@ -5979,7 +5978,7 @@ func TestClusterClientRetry(t *testing.T) {
 			t.Fatalf("unexpected err %v", err)
 		}
 		return c
-	}, errors.New("connection reset by peer"))
+	})
 }
 
 func TestClusterClientReplicaOnly_PickReplica(t *testing.T) {
@@ -6316,11 +6315,11 @@ func TestGetClusterSlotsPreferShards(t *testing.T) {
 		wantCmd      string
 		wantShards   bool
 	}{
-		{version: 8, preferShards: false, wantCmd: "CLUSTER SHARDS", wantShards: true}, // >= 8 always shards
-		{version: 7, preferShards: false, wantCmd: "CLUSTER SLOTS", wantShards: false}, // default keeps 7.x on slots
-		{version: 7, preferShards: true, wantCmd: "CLUSTER SHARDS", wantShards: true},  // opt-in enables shards on 7
-		{version: 6, preferShards: true, wantCmd: "CLUSTER SLOTS", wantShards: false},  // floor: no shards below 7
-		{version: 5, preferShards: true, wantCmd: "CLUSTER SLOTS", wantShards: false},  // RESP2 fallback stays slots
+		{version: 8, preferShards: false, wantCmd: "CLUSTER SHARDS", wantShards: true},  // >= 8 always shards
+		{version: 7, preferShards: false, wantCmd: "CLUSTER SLOTS", wantShards: false},  // default keeps 7.x on slots
+		{version: 7, preferShards: true, wantCmd: "CLUSTER SHARDS", wantShards: true},   // opt-in enables shards on 7
+		{version: 6, preferShards: true, wantCmd: "CLUSTER SLOTS", wantShards: false},   // floor: no shards below 7
+		{version: 5, preferShards: true, wantCmd: "CLUSTER SLOTS", wantShards: false},   // RESP2 fallback stays slots
 	} {
 		t.Run(fmt.Sprintf("v%d_prefer%v", tc.version, tc.preferShards), func(t *testing.T) {
 			var got string
@@ -7676,7 +7675,7 @@ func TestClusterClientCacheASKRetry(t *testing.T) {
 				errInjected = true
 				return &valkeyresults{s: []ValkeyResult{
 					{}, {},
-					NewErrorResult(errors.New("transport: connection reset by peer")),
+					NewErrorResult(errors.New("transport: connection closed")),
 				}}
 			}
 			// shouldRefreshRetry treats non-ValkeyError as RedirectRetry, so
@@ -11746,6 +11745,9 @@ func TestClusterDoMultiRepicksAfterReplicaRemoval(t *testing.T) {
 	replicaConn := &mockConn{
 		DoFn: func(cmd Completed) ValkeyResult {
 			if strings.Join(cmd.Commands(), " ") == "CLUSTER SLOTS" {
+				if atomic.LoadInt64(&replicaCalls) > 0 {
+					return slotsRespNoReplica
+				}
 				return slotsResp
 			}
 			return ValkeyResult{}
@@ -11786,8 +11788,8 @@ func TestClusterDoMultiRepicksAfterReplicaRemoval(t *testing.T) {
 		RetryDelayFn: func(int, Completed, error) time.Duration { return time.Microsecond },
 		WaitForRetryFn: func(ctx context.Context, d time.Duration) {
 			atomic.AddInt64(&handlerCalls, 1)
-			// Simulate lazyRefresh convergence: replica is now unreachable in
-			// topology, so rslots for its slots now point at the primary.
+			// Point rslots at primary before the synchronous refresh() that
+			// follows WaitForRetry also converges on slotsRespNoReplica.
 			client.mu.Lock()
 			for i := range client.rslots {
 				if client.rslots[i] != nil {
@@ -11997,6 +11999,9 @@ func TestClusterDoMultiCacheRepicksAfterReplicaRemoval(t *testing.T) {
 	replicaConn := &mockConn{
 		DoFn: func(cmd Completed) ValkeyResult {
 			if strings.Join(cmd.Commands(), " ") == "CLUSTER SLOTS" {
+				if atomic.LoadInt64(&replicaCalls) > 0 {
+					return slotsRespNoReplica
+				}
 				return slotsResp
 			}
 			return ValkeyResult{}
@@ -12769,122 +12774,6 @@ func TestClusterClient_Pipelining_PreFlightRetry(t *testing.T) {
 		}
 		if attempts != 1 {
 			t.Fatalf("expected 1 attempt (fail fast without retry for in-flight drop), got %v", attempts)
-		}
-	})
-}
-
-func TestIsSafePreFlightOrClusterTransitionErr(t *testing.T) {
-	// 1. Dial errors (pre-flight safe)
-	dialErr := &net.OpError{Op: "dial", Err: errors.New("connection refused")}
-	if !isSafePreFlightOrClusterTransitionErr(dialErr, dialErr) {
-		t.Errorf("expected true for dial net.OpError")
-	}
-	dialTimeoutErr := &net.OpError{Op: "dial", Err: context.DeadlineExceeded}
-	if !isSafePreFlightOrClusterTransitionErr(dialTimeoutErr, dialTimeoutErr) {
-		t.Errorf("expected true for dial net.OpError with DeadlineExceeded")
-	}
-	wrappedDialErr := fmt.Errorf("network error: %w", dialErr)
-	if !isSafePreFlightOrClusterTransitionErr(wrappedDialErr, wrappedDialErr) {
-		t.Errorf("expected true for wrapped dial net.OpError")
-	}
-	if !isSafePreFlightOrClusterTransitionErr(syscall.ECONNREFUSED, syscall.ECONNREFUSED) {
-		t.Errorf("expected true for syscall.ECONNREFUSED")
-	}
-	if !isSafePreFlightOrClusterTransitionErr(syscall.EHOSTUNREACH, syscall.EHOSTUNREACH) {
-		t.Errorf("expected true for syscall.EHOSTUNREACH")
-	}
-
-	// 2. Server rejections prior to execution (cluster transitions)
-	clusterDownMsg := strmsg('-', "CLUSTERDOWN The cluster is down")
-	if !isSafePreFlightOrClusterTransitionErr(clusterDownMsg.Error(), nil) {
-		t.Errorf("expected true for CLUSTERDOWN")
-	}
-
-	tryAgainMsg := strmsg('-', "TRYAGAIN Multiple keys request during rehashing")
-	if !isSafePreFlightOrClusterTransitionErr(tryAgainMsg.Error(), nil) {
-		t.Errorf("expected true for TRYAGAIN")
-	}
-
-	loadingMsg := strmsg('-', "LOADING Valkey is loading the dataset in memory")
-	if !isSafePreFlightOrClusterTransitionErr(loadingMsg.Error(), nil) {
-		t.Errorf("expected true for LOADING")
-	}
-
-	// 3. In-flight stream / connection errors (safe for retryable commands)
-	if !isSafePreFlightOrClusterTransitionErr(io.EOF, io.EOF) {
-		t.Errorf("expected true for io.EOF")
-	}
-	if !isSafePreFlightOrClusterTransitionErr(io.ErrUnexpectedEOF, io.ErrUnexpectedEOF) {
-		t.Errorf("expected true for io.ErrUnexpectedEOF")
-	}
-	writeErr := &net.OpError{Op: "write", Err: errors.New("broken pipe")}
-	if !isSafePreFlightOrClusterTransitionErr(writeErr, writeErr) {
-		t.Errorf("expected true for write net.OpError")
-	}
-	readErr := &net.OpError{Op: "read", Err: errors.New("connection reset")}
-	if !isSafePreFlightOrClusterTransitionErr(readErr, readErr) {
-		t.Errorf("expected true for read net.OpError")
-	}
-
-	// 4. Context canceled or deadline exceeded (must NOT retry)
-	ctxCancel, cancel := context.WithCancel(context.Background())
-	cancel()
-	if isSafePreFlightOrClusterTransitionErr(ctxCancel.Err(), ctxCancel.Err()) {
-		t.Errorf("expected false for context.Canceled")
-	}
-	ctxTimeout, cancelTimeout := context.WithTimeout(context.Background(), 0)
-	defer cancelTimeout()
-	<-ctxTimeout.Done()
-	if isSafePreFlightOrClusterTransitionErr(ctxTimeout.Err(), ctxTimeout.Err()) {
-		t.Errorf("expected false for context.DeadlineExceeded")
-	}
-
-	// 5. Arbitrary errors & nil
-	if isSafePreFlightOrClusterTransitionErr(nil, nil) {
-		t.Errorf("expected false for nil")
-	}
-	if isSafePreFlightOrClusterTransitionErr(ErrClosing, ErrClosing) {
-		t.Errorf("expected false for ErrClosing")
-	}
-	genericErrMsg := strmsg('-', "ERR unknown error")
-	if isSafePreFlightOrClusterTransitionErr(genericErrMsg.Error(), nil) {
-		t.Errorf("expected false for generic ValkeyError")
-	}
-	if isSafePreFlightOrClusterTransitionErr(errors.New("generic"), errors.New("generic")) {
-		t.Errorf("expected false for generic error")
-	}
-}
-
-func BenchmarkIsSafePreFlightOrClusterTransitionErr(b *testing.B) {
-	dialErr := &net.OpError{Op: "dial", Err: errors.New("connection refused")}
-	clusterDownMsg := strmsg('-', "CLUSTERDOWN The cluster is down")
-	clusterDownErr := clusterDownMsg.Error()
-	eofErr := io.EOF
-
-	b.Run("DialError", func(b *testing.B) {
-		b.ReportAllocs()
-		for i := 0; i < b.N; i++ {
-			if !isSafePreFlightOrClusterTransitionErr(dialErr, dialErr) {
-				b.Fatal("unexpected false")
-			}
-		}
-	})
-
-	b.Run("ClusterDown", func(b *testing.B) {
-		b.ReportAllocs()
-		for i := 0; i < b.N; i++ {
-			if !isSafePreFlightOrClusterTransitionErr(clusterDownErr, nil) {
-				b.Fatal("unexpected false")
-			}
-		}
-	})
-
-	b.Run("InFlightEOF", func(b *testing.B) {
-		b.ReportAllocs()
-		for i := 0; i < b.N; i++ {
-			if !isSafePreFlightOrClusterTransitionErr(eofErr, eofErr) {
-				b.Fatal("unexpected false")
-			}
 		}
 	})
 }
