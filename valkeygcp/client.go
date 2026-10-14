@@ -8,6 +8,17 @@ import (
 	"github.com/valkey-io/valkey-go"
 )
 
+// GCPOption configures the valkey.ClientOption with Google Cloud specific parameters.
+type GCPOption func(*valkey.ClientOption) error
+
+// Connection defaults shared by the constructors and NewClient.
+const (
+	defaultDialTimeout           = 2 * time.Second
+	defaultKeepAlive             = 1 * time.Second
+	defaultConnWriteTimeout      = 3 * time.Second
+	defaultShardsRefreshInterval = 10 * time.Second // Fix C6: 10s with jitter
+)
+
 // NewClusterClient creates a Memorystore Cluster Mode client with discovery pinning,
 // fast failover reconnection, and optional IAM authentication.
 func NewClusterClient(ctx context.Context, discoveryEndpoint string, opts ...GCPOption) (valkey.Client, error) {
@@ -15,14 +26,15 @@ func NewClusterClient(ctx context.Context, discoveryEndpoint string, opts ...GCP
 		InitAddress: []string{discoveryEndpoint},
 		ClusterOption: valkey.ClusterOption{
 			PreferInitAddressRefresh: true,
-			ShardsRefreshInterval:    10 * time.Second,
-			PreferClusterShards:       true,
+			ShardsRefreshInterval:    defaultShardsRefreshInterval,
+			PreferClusterShards:      true,
 		},
 		Dialer: net.Dialer{
-			KeepAlive: 1 * time.Second,
-			Timeout:   2 * time.Second,
+			KeepAlive: defaultKeepAlive,
+			Timeout:   defaultDialTimeout,
 		},
-		ConnWriteTimeout: 3 * time.Second,
+		ConnWriteTimeout: defaultConnWriteTimeout,
+		RetryDelay:       memorystoreRetryDelay, // Correction V9: defined in retry.go
 	}
 
 	for _, opt := range opts {
@@ -42,14 +54,13 @@ func NewStandaloneClient(ctx context.Context, primaryEndpoint, readerEndpoint st
 		Standalone: valkey.StandaloneOption{
 			ReplicaAddress: []string{readerEndpoint},
 		},
-		SendToReplicas: func(cmd valkey.Completed) bool {
-			return cmd.IsReadOnly() && !cmd.IsBlock()
-		},
+		SendToReplicas: sendReadsToReplicas,
 		Dialer: net.Dialer{
-			KeepAlive: 1 * time.Second,
-			Timeout:   2 * time.Second,
+			KeepAlive: defaultKeepAlive,
+			Timeout:   defaultDialTimeout,
 		},
-		ConnWriteTimeout: 3 * time.Second,
+		ConnWriteTimeout: defaultConnWriteTimeout,
+		RetryDelay:       memorystoreRetryDelay, // Correction V9: defined in retry.go
 	}
 
 	for _, opt := range opts {
@@ -59,4 +70,10 @@ func NewStandaloneClient(ctx context.Context, primaryEndpoint, readerEndpoint st
 	}
 
 	return valkey.NewClient(clientOpt)
+}
+
+// sendReadsToReplicas routes read-only commands to the reader endpoint.
+func sendReadsToReplicas(cmd valkey.Completed) bool {
+	// Fix C5: Exclude blocking commands from replica routing
+	return cmd.IsReadOnly() && !cmd.IsBlock()
 }

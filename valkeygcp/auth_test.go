@@ -3,6 +3,8 @@ package valkeygcp
 import (
 	"context"
 	"errors"
+	"fmt"
+	"net"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -10,6 +12,8 @@ import (
 
 	"github.com/valkey-io/valkey-go"
 	"golang.org/x/oauth2"
+	"google.golang.org/api/impersonate"
+	"google.golang.org/api/option"
 )
 
 // mockTokenSource simulates a Google OAuth2 token source with configurable expiry and call tracking.
@@ -87,11 +91,11 @@ func TestNewGCPTokenProvider_CustomTokenSource(t *testing.T) {
 		t.Errorf("got password %q, want %q", creds.Password, expectedToken.AccessToken)
 	}
 
-	// Verify RefreshAfter is approximately Expiry - 10m
-	expectedRefresh := expectedToken.Expiry.Add(-10 * time.Minute)
-	diff := creds.RefreshAfter.Sub(expectedRefresh)
-	if diff < -time.Second || diff > time.Second {
-		t.Errorf("got RefreshAfter %v, want ~%v", creds.RefreshAfter, expectedRefresh)
+	// Verify RefreshAfter lands inside the C1 buffer window [Expiry - 10m, Expiry - 5m] (U5 jitter)
+	windowStart := expectedToken.Expiry.Add(-10 * time.Minute)
+	windowEnd := expectedToken.Expiry.Add(-5 * time.Minute)
+	if creds.RefreshAfter.Before(windowStart) || creds.RefreshAfter.After(windowEnd) {
+		t.Errorf("got RefreshAfter %v, want within [%v, %v]", creds.RefreshAfter, windowStart, windowEnd)
 	}
 }
 
@@ -359,5 +363,310 @@ func TestNewGCPTokenProvider_Defaults(t *testing.T) {
 	}
 	if creds.Username != DefaultIAMUsername {
 		t.Errorf("got username %q, want %q", creds.Username, DefaultIAMUsername)
+	}
+}
+
+// 10. Refresh tolerance (U6): the provider must not make refreshAuth close healthy connections.
+
+// T-U6-1
+func TestRefreshTolerance_CachedTokenValid(t *testing.T) {
+	var fail atomic.Bool
+	src := tokenSourceFunc(func() (*oauth2.Token, error) {
+		if fail.Load() {
+			return nil, errors.New("metadata server unreachable")
+		}
+		// Inside the 5m buffer, so the C1 cache asks the source again on the next call.
+		return &oauth2.Token{AccessToken: "cached", Expiry: time.Now().Add(3 * time.Minute)}, nil
+	})
+	var absorbed atomic.Int32
+	provider, err := NewGCPTokenProvider(context.Background(), IAMAuthOptions{
+		CustomTokenSource: src,
+		OnCredentialError: func(error) { absorbed.Add(1) },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	authFn := provider.AuthCredentialsFn()
+	if _, err := authFn(valkey.AuthCredentialsContext{}); err != nil {
+		t.Fatal(err)
+	}
+	fail.Store(true)
+	before := time.Now()
+	creds, err := authFn(valkey.AuthCredentialsContext{})
+	if err != nil {
+		t.Fatalf("refresh failure surfaced as an error (would close the connection): %v", err)
+	}
+	if creds.Username != DefaultIAMUsername || creds.Password != "cached" {
+		t.Errorf("creds = %+v, want the cached token", creds)
+	}
+	if d := creds.RefreshAfter.Sub(before); d < 27*time.Second || d > 30*time.Second+100*time.Millisecond {
+		t.Errorf("retry in %v, want 27-30s", d)
+	}
+	if absorbed.Load() != 1 {
+		t.Errorf("OnCredentialError called %d times, want 1", absorbed.Load())
+	}
+}
+
+// T-U6-2
+func TestRefreshTolerance_CachedTokenExpired(t *testing.T) {
+	mock := &mockTokenSource{tokens: []*oauth2.Token{{AccessToken: "expired", Expiry: time.Now().Add(-time.Minute)}}}
+	provider, err := NewGCPTokenProvider(context.Background(), IAMAuthOptions{CustomTokenSource: mock})
+	if err != nil {
+		t.Fatal(err)
+	}
+	authFn := provider.AuthCredentialsFn()
+	if _, err := authFn(valkey.AuthCredentialsContext{}); err != nil {
+		t.Fatal(err)
+	}
+	mock.mu.Lock()
+	mock.err = errors.New("sts unavailable")
+	mock.mu.Unlock()
+	before := time.Now()
+	creds, err := authFn(valkey.AuthCredentialsContext{})
+	if err != nil {
+		t.Fatalf("got error %v, want empty credentials", err)
+	}
+	if creds.Username != "" || creds.Password != "" {
+		t.Errorf("creds = %+v, want empty (refreshAuth then skips AUTH)", creds)
+	}
+	if d := creds.RefreshAfter.Sub(before); d < 27*time.Second || d > 30*time.Second+100*time.Millisecond {
+		t.Errorf("retry in %v, want 27-30s", d)
+	}
+}
+
+// T-U6-3
+func TestRefreshTolerance_NeverSucceeded(t *testing.T) {
+	var absorbed atomic.Int32
+	provider, err := NewGCPTokenProvider(context.Background(), IAMAuthOptions{
+		CustomTokenSource: &mockTokenSource{err: errors.New("no credentials")},
+		OnCredentialError: func(error) { absorbed.Add(1) },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := provider.AuthCredentialsFn()(valkey.AuthCredentialsContext{}); err == nil {
+		t.Fatal("want the real error when no token was ever fetched")
+	}
+	if absorbed.Load() != 0 {
+		t.Error("a surfaced error must not also go to OnCredentialError")
+	}
+}
+
+// T-U6-4: needs the docker compose Valkey on 127.0.0.1:6379 (run by dockertest.sh in CI).
+func TestRefreshTolerance_LiveConnection(t *testing.T) {
+	const addr = "127.0.0.1:6379"
+	if c, err := net.DialTimeout("tcp", addr, 300*time.Millisecond); err != nil {
+		t.Skipf("no local Valkey at %s: %v", addr, err)
+	} else {
+		c.Close()
+	}
+	var fail atomic.Bool
+	var issued atomic.Int32
+	src := tokenSourceFunc(func() (*oauth2.Token, error) {
+		if fail.Load() {
+			return nil, errors.New("metadata server unreachable")
+		}
+		return &oauth2.Token{AccessToken: fmt.Sprintf("tok-%d", issued.Add(1)), Expiry: time.Now().Add(3 * time.Second)}, nil
+	})
+	var absorbed atomic.Int32
+	provider, err := NewGCPTokenProvider(context.Background(), IAMAuthOptions{
+		CustomTokenSource: src,
+		RefreshBuffer:     2 * time.Second, // first re-AUTH 1-2s after the dial
+		OnCredentialError: func(error) { absorbed.Add(1) },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// One connection, so CLIENT ID tells whether it was replaced. The default user is
+	// nopass, so AUTH default <token> succeeds like an accepted IAM token.
+	client, err := valkey.NewClient(valkey.ClientOption{
+		InitAddress:       []string{addr},
+		ForceSingleClient: true,
+		PipelineMultiplex: -1,
+		DisableCache:      true,
+		AuthCredentialsFn: provider.AuthCredentialsFn(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	ctx := context.Background()
+	id, err := client.Do(ctx, client.B().ClientId().Build()).AsInt64()
+	if err != nil {
+		t.Fatal(err)
+	}
+	fail.Store(true) // the token source goes down before the first refresh
+	deadline := time.Now().Add(5 * time.Second)
+	for absorbed.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(50 * time.Millisecond)
+	}
+	if absorbed.Load() == 0 {
+		t.Fatal("the refresh never ran")
+	}
+	after, err := client.Do(ctx, client.B().ClientId().Build()).AsInt64()
+	if err != nil {
+		t.Fatalf("command failed after the refresh failure: %v", err)
+	}
+	if after != id {
+		t.Fatalf("connection was replaced (CLIENT ID %d -> %d)", id, after)
+	}
+	if err := client.Do(ctx, client.B().Set().Key("valkeygcp:u6").Value("ok").Build()).Error(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// T-U6-5
+func TestRefreshTolerance_RefreshTimeWindow(t *testing.T) {
+	now := time.Now()
+	expiry := now.Add(time.Hour)
+	const buffer = 5 * time.Minute
+	for range 1000 {
+		at := refreshTime(now, expiry, buffer)
+		if at.Before(expiry.Add(-buffer)) || at.After(expiry.Add(-buffer/2)) {
+			t.Fatalf("refresh at Expiry-%v, want within [Expiry-%v, Expiry-%v]", expiry.Sub(at), buffer, buffer/2)
+		}
+	}
+	if got := refreshTime(now, now.Add(2*time.Minute), buffer).Sub(now); got != time.Minute {
+		t.Errorf("near expiry: %v, want half the remaining time", got)
+	}
+	if got := refreshTime(now, now.Add(-time.Minute), buffer).Sub(now); got != 10*time.Second {
+		t.Errorf("expired: %v, want 10s", got)
+	}
+	for range 1000 {
+		if j := jitter(30 * time.Second); j < 27*time.Second || j > 30*time.Second {
+			t.Fatalf("jitter = %v", j)
+		}
+	}
+	if jitter(0) != 0 || jitter(-time.Second) != -time.Second {
+		t.Error("jitter must pass non-positive durations through")
+	}
+}
+
+// T-U6-6
+func TestRefreshTolerance_DisableProactiveReauth(t *testing.T) {
+	var fail atomic.Bool
+	expiry := time.Now().Add(3 * time.Minute)
+	src := tokenSourceFunc(func() (*oauth2.Token, error) {
+		if fail.Load() {
+			return nil, errors.New("down")
+		}
+		return &oauth2.Token{AccessToken: "t", Expiry: expiry}, nil
+	})
+	provider, err := NewGCPTokenProvider(context.Background(), IAMAuthOptions{CustomTokenSource: src, DisableProactiveReauth: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	authFn := provider.AuthCredentialsFn()
+	creds, err := authFn(valkey.AuthCredentialsContext{})
+	if err != nil || creds.Password != "t" || !creds.RefreshAfter.IsZero() {
+		t.Fatalf("creds = %+v, %v; want zero RefreshAfter", creds, err)
+	}
+	// Dial-only mode: a valid cached token is still served, without arming a timer...
+	fail.Store(true)
+	creds, err = authFn(valkey.AuthCredentialsContext{})
+	if err != nil || creds.Password != "t" || !creds.RefreshAfter.IsZero() {
+		t.Fatalf("cached: %+v, %v", creds, err)
+	}
+	// ...but an expired one fails the dial with the real error.
+	provider.(*tokenProvider).lastGood.Store(&oauth2.Token{AccessToken: "old", Expiry: time.Now().Add(-time.Second)})
+	if _, err := authFn(valkey.AuthCredentialsContext{}); err == nil {
+		t.Fatal("expired cached token in dial-only mode must fail")
+	}
+}
+
+func TestAuthCredentials_NonExpiringToken(t *testing.T) {
+	provider, err := NewGCPTokenProvider(context.Background(), IAMAuthOptions{
+		CustomTokenSource: oauth2.StaticTokenSource(&oauth2.Token{AccessToken: "forever"}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	creds, err := provider.AuthCredentialsFn()(valkey.AuthCredentialsContext{})
+	if err != nil || creds.Password != "forever" || !creds.RefreshAfter.IsZero() {
+		t.Fatalf("creds = %+v, %v; a token without expiry needs no refresh", creds, err)
+	}
+}
+
+// 11. Connection-rate pacing (U5)
+func TestMaxAuthPerSecond(t *testing.T) {
+	provider, err := NewGCPTokenProvider(context.Background(), IAMAuthOptions{
+		CustomTokenSource: &mockTokenSource{},
+		MaxAuthPerSecond:  20, // one AUTH per 50ms
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	authFn := provider.AuthCredentialsFn()
+	start := time.Now()
+	for range 4 {
+		if _, err := authFn(valkey.AuthCredentialsContext{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if elapsed := time.Since(start); elapsed < 140*time.Millisecond {
+		t.Errorf("4 AUTHs took %v, want >= 150ms at 20/s", elapsed)
+	}
+	var nilLimiter *authLimiter
+	nilLimiter.wait() // no-op, must not panic
+	if p := provider.(*tokenProvider); p.limiter == nil || p.limiter.interval != 50*time.Millisecond {
+		t.Errorf("limiter = %+v", p.limiter)
+	}
+	unpaced, _ := NewGCPTokenProvider(context.Background(), IAMAuthOptions{CustomTokenSource: &mockTokenSource{}})
+	if unpaced.(*tokenProvider).limiter != nil {
+		t.Error("MaxAuthPerSecond 0 must not create a limiter")
+	}
+}
+
+// 12. Impersonation with a custom token lifetime (G6)
+func TestImpersonateLifetime(t *testing.T) {
+	orig := impersonateTokenSource
+	defer func() { impersonateTokenSource = orig }()
+	var calls atomic.Int32
+	var got impersonate.CredentialsConfig
+	impersonateTokenSource = func(_ context.Context, cfg impersonate.CredentialsConfig, _ ...option.ClientOption) (oauth2.TokenSource, error) {
+		n := calls.Add(1)
+		got = cfg
+		// What impersonate returns when Lifetime is set: a static source that never refreshes.
+		return oauth2.StaticTokenSource(&oauth2.Token{AccessToken: fmt.Sprintf("imp-%d", n), Expiry: time.Now().Add(time.Minute)}), nil
+	}
+	const sa = "reader@db-proj.iam.gserviceaccount.com"
+	provider, err := NewGCPTokenProvider(context.Background(), IAMAuthOptions{
+		ImpersonateSA:       sa,
+		Delegates:           []string{"hop@p.iam.gserviceaccount.com"},
+		ImpersonateLifetime: 2 * time.Hour,
+		UsernameStrategy:    UsernamePrincipalEmail,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.TargetPrincipal != sa || got.Lifetime != 2*time.Hour || len(got.Delegates) != 1 || got.Scopes[0] != DefaultCloudPlatformScope {
+		t.Errorf("config = %+v", got)
+	}
+	for i, want := range []string{"imp-1", "imp-2"} {
+		tok, err := provider.Token(context.Background())
+		if err != nil || tok.AccessToken != want {
+			t.Fatalf("token %d = %v, %v; want %s (refreshed)", i, tok, err, want)
+		}
+	}
+	if creds, _ := provider.AuthCredentialsFn()(valkey.AuthCredentialsContext{}); creds.Username != sa {
+		t.Errorf("username = %q, want the impersonated principal", creds.Username)
+	}
+
+	// Without a Lifetime the impersonate source refreshes itself and is used directly.
+	calls.Store(0)
+	provider, err = NewGCPTokenProvider(context.Background(), IAMAuthOptions{ImpersonateSA: sa})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = provider.Token(context.Background())
+	_, _ = provider.Token(context.Background())
+	if calls.Load() != 1 {
+		t.Errorf("impersonate source built %d times, want 1", calls.Load())
+	}
+
+	for _, lifetime := range []time.Duration{-time.Minute, DefaultRefreshBuffer} {
+		if _, err := NewGCPTokenProvider(context.Background(), IAMAuthOptions{ImpersonateSA: sa, ImpersonateLifetime: lifetime}); err == nil {
+			t.Errorf("ImpersonateLifetime %v accepted", lifetime)
+		}
 	}
 }

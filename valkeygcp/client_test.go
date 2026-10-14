@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/valkey-io/valkey-go"
+	"github.com/valkey-io/valkey-go/internal/cmds"
 	"golang.org/x/oauth2"
 )
 
@@ -88,31 +89,50 @@ func TestNewStandaloneClient_SendToReplicasLogic(t *testing.T) {
 		t.Fatal("expected SendToReplicas to be configured")
 	}
 
-	dummyClient, _ := valkey.NewClient(valkey.ClientOption{
-		InitAddress:       []string{"127.0.0.1:0"},
-		ForceSingleClient: true,
-	})
-	if dummyClient == nil {
-		t.Skip("cannot construct dummy client for builder test")
-	}
-	defer dummyClient.Close()
+	builder := cmds.NewBuilder(cmds.NoSlot)
 
 	// Read-only command (GET) -> should route to replica
-	getCmd := dummyClient.B().Get().Key("k").Build()
+	getCmd := builder.Get().Key("k").Build()
 	if !capturedOpt.SendToReplicas(getCmd) {
 		t.Errorf("expected GET to route to replica, got false")
 	}
 
 	// Write command (SET) -> should NOT route to replica
-	setCmd := dummyClient.B().Set().Key("k").Value("v").Build()
+	setCmd := builder.Set().Key("k").Value("v").Build()
 	if capturedOpt.SendToReplicas(setCmd) {
 		t.Errorf("expected SET NOT to route to replica, got true")
 	}
 
 	// Blocking command (BLPOP) -> should NOT route to replica even if read-only
-	blpopCmd := dummyClient.B().Blpop().Key("k").Timeout(1).Build()
+	blpopCmd := builder.Blpop().Key("k").Timeout(1).Build()
 	if capturedOpt.SendToReplicas(blpopCmd) {
 		t.Errorf("expected BLPOP NOT to route to replica, got true")
+	}
+}
+
+func TestConstructors_MemorystoreRetryDelay(t *testing.T) {
+	errStop := errors.New("stop before dialing")
+	for name, construct := range map[string]func(GCPOption) error{
+		"cluster": func(o GCPOption) error {
+			_, err := NewClusterClient(context.Background(), "127.0.0.1:0", o)
+			return err
+		},
+		"standalone": func(o GCPOption) error {
+			_, err := NewStandaloneClient(context.Background(), "127.0.0.1:0", "127.0.0.1:0", o)
+			return err
+		},
+	} {
+		var captured valkey.ClientOption
+		err := construct(func(opt *valkey.ClientOption) error {
+			captured = *opt
+			return errStop
+		})
+		if !errors.Is(err, errStop) {
+			t.Fatalf("%s: got %v", name, err)
+		}
+		if captured.RetryDelay == nil || captured.RetryDelay(maxRetryAttempts, valkey.Completed{}, nil) >= 0 {
+			t.Errorf("%s: RetryDelay is not memorystoreRetryDelay", name)
+		}
 	}
 }
 
