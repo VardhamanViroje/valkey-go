@@ -212,7 +212,7 @@ func TestResolve_DiscoverNetworkSelection(t *testing.T) {
 func TestResolve_DiscoverDeprecatedDiscoveryEndpoints(t *testing.T) {
 	inst := &memorystorepb.Instance{
 		Mode:               memorystorepb.Instance_CLUSTER,
-		DiscoveryEndpoints: []*memorystorepb.DiscoveryEndpoint{{Address: "10.0.0.20", Port: 6380, Network: vpcA}},
+		DiscoveryEndpoints: []*memorystorepb.DiscoveryEndpoint{{Address: "10.0.0.20", Port: 6380, Network: vpcA}}, //nolint:staticcheck // SA1019: covers the fallback for the deprecated field
 	}
 	r, err := resolve(context.Background(), Config{Instance: testInstance}, (&fakeReader{inst: inst}).factory())
 	if err != nil || r.discovery != "10.0.0.20:6380" {

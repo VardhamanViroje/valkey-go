@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -283,7 +284,7 @@ func TestWithIAMOptions_ClientOptionWiring(t *testing.T) {
 		CustomTokenSource: mock,
 	})
 
-	if err := gcpOpt(&opt); err != nil {
+	if err := gcpOpt(context.Background(), &opt); err != nil {
 		t.Fatalf("WithIAMOptions failed: %v", err)
 	}
 
@@ -331,7 +332,7 @@ func TestWithIAMOptions_Error(t *testing.T) {
 		CredentialsJSON: []byte(`{ invalid-json`),
 	})
 
-	err := gcpOpt(&opt)
+	err := gcpOpt(context.Background(), &opt)
 	if err == nil {
 		t.Fatal("expected error from WithIAMOptions with invalid JSON, got nil")
 	}
@@ -455,10 +456,11 @@ func TestRefreshTolerance_NeverSucceeded(t *testing.T) {
 // T-U6-4: needs the docker compose Valkey on 127.0.0.1:6379 (run by dockertest.sh in CI).
 func TestRefreshTolerance_LiveConnection(t *testing.T) {
 	const addr = "127.0.0.1:6379"
-	if c, err := net.DialTimeout("tcp", addr, 300*time.Millisecond); err != nil {
+	dialer := net.Dialer{Timeout: 300 * time.Millisecond}
+	if c, err := dialer.DialContext(context.Background(), "tcp", addr); err != nil {
 		t.Skipf("no local Valkey at %s: %v", addr, err)
 	} else {
-		c.Close()
+		_ = c.Close()
 	}
 	var fail atomic.Bool
 	var issued atomic.Int32
@@ -668,5 +670,150 @@ func TestImpersonateLifetime(t *testing.T) {
 		if _, err := NewGCPTokenProvider(context.Background(), IAMAuthOptions{ImpersonateSA: sa, ImpersonateLifetime: lifetime}); err == nil {
 			t.Errorf("ImpersonateLifetime %v accepted", lifetime)
 		}
+	}
+}
+
+// 13. Context and timeouts: setup honors the caller's ctx; upstream fetches are capped.
+
+// T-CTX-3: impersonation setup errors surface from the provider and the option.
+func TestNewGCPTokenProvider_ImpersonationError(t *testing.T) {
+	orig := impersonateTokenSource
+	defer func() { impersonateTokenSource = orig }()
+	impersonateTokenSource = func(context.Context, impersonate.CredentialsConfig, ...option.ClientOption) (oauth2.TokenSource, error) {
+		return nil, errors.New("iam.serviceAccounts.getAccessToken denied")
+	}
+	opts := IAMAuthOptions{ImpersonateSA: "sa@p.iam.gserviceaccount.com"}
+	if _, err := NewGCPTokenProvider(context.Background(), opts); err == nil ||
+		!strings.Contains(err.Error(), "impersonation token source failed") || !strings.Contains(err.Error(), "denied") {
+		t.Fatalf("got %v, want the impersonation error", err)
+	}
+	var clientOpt valkey.ClientOption
+	if err := WithIAMOptions(opts)(context.Background(), &clientOpt); err == nil || clientOpt.AuthCredentialsFn != nil {
+		t.Fatalf("WithIAMOptions: err %v, AuthCredentialsFn set %v", err, clientOpt.AuthCredentialsFn != nil)
+	}
+}
+
+// T-CTX-4: a hung credential setup (here the eager impersonation fetch used with
+// ImpersonateLifetime) stops at the caller's deadline.
+func TestNewGCPTokenProvider_SetupHonorsContext(t *testing.T) {
+	orig := impersonateTokenSource
+	entered, release := make(chan struct{}), make(chan struct{})
+	impersonateTokenSource = func(context.Context, impersonate.CredentialsConfig, ...option.ClientOption) (oauth2.TokenSource, error) {
+		close(entered)
+		<-release // an IAM Credentials call that never answers
+		return nil, errors.New("released")
+	}
+	t.Cleanup(func() {
+		select { // the stub has read impersonateTokenSource before it is restored
+		case <-entered:
+		case <-time.After(5 * time.Second):
+		}
+		close(release)
+		impersonateTokenSource = orig
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	_, err := NewGCPTokenProvider(ctx, IAMAuthOptions{ImpersonateSA: "sa@p.iam.gserviceaccount.com", ImpersonateLifetime: time.Hour})
+	if !errors.Is(err, context.DeadlineExceeded) || !strings.Contains(err.Error(), "credential setup") {
+		t.Fatalf("got %v, want the caller's deadline", err)
+	}
+	if d := time.Since(start); d > 2*time.Second {
+		t.Fatalf("setup took %v despite a 50ms deadline", d)
+	}
+}
+
+// T-CTX-5: a hung token endpoint can't block a dial for longer than FetchTimeout, and later
+// calls share the running fetch instead of piling up goroutines.
+func TestFetchTimeout_HungSource(t *testing.T) {
+	const timeout = 40 * time.Millisecond
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	var calls atomic.Int32
+	hung := tokenSourceFunc(func() (*oauth2.Token, error) {
+		calls.Add(1)
+		<-release
+		return nil, errors.New("released")
+	})
+	provider, err := NewGCPTokenProvider(context.Background(), IAMAuthOptions{CustomTokenSource: hung, FetchTimeout: timeout})
+	if err != nil {
+		t.Fatal(err)
+	}
+	authFn := provider.AuthCredentialsFn()
+	start := time.Now()
+	if _, err := authFn(valkey.AuthCredentialsContext{}); err == nil || !strings.Contains(err.Error(), "timed out") {
+		t.Fatalf("got %v, want a fetch timeout (no token was ever fetched)", err)
+	}
+	if d := time.Since(start); d > timeout+time.Second {
+		t.Fatalf("dial blocked for %v", d)
+	}
+	if _, err := authFn(valkey.AuthCredentialsContext{}); err == nil {
+		t.Fatal("want a timeout while the fetch is still hung")
+	}
+	if n := calls.Load(); n != 1 {
+		t.Fatalf("upstream fetches = %d, want 1 while the first is still running", n)
+	}
+	time.Sleep(3 * timeout) // the running fetch now counts as stuck
+	_, _ = authFn(valkey.AuthCredentialsContext{})
+	if n := calls.Load(); n != 2 {
+		t.Fatalf("upstream fetches = %d, want a fresh fetch after 3*FetchTimeout", n)
+	}
+	if _, ok := withFetchTimeout(hung, -1).(*timeoutSource); ok {
+		t.Error("a negative FetchTimeout must disable the cap")
+	}
+}
+
+// T-CTX-6: a fetch that times out after a success serves the last valid token (U6).
+func TestFetchTimeout_FallsBackToLastGood(t *testing.T) {
+	const timeout = 40 * time.Millisecond
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	var calls atomic.Int32
+	src := tokenSourceFunc(func() (*oauth2.Token, error) {
+		if calls.Add(1) == 1 {
+			// Inside the refresh buffer, so the C1 cache fetches again on the next call.
+			return &oauth2.Token{AccessToken: "first", Expiry: time.Now().Add(time.Minute)}, nil
+		}
+		<-release
+		return nil, errors.New("released")
+	})
+	var absorbed atomic.Int32
+	provider, err := NewGCPTokenProvider(context.Background(), IAMAuthOptions{
+		CustomTokenSource: src,
+		FetchTimeout:      timeout,
+		OnCredentialError: func(error) { absorbed.Add(1) },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	authFn := provider.AuthCredentialsFn()
+	if creds, err := authFn(valkey.AuthCredentialsContext{}); err != nil || creds.Password != "first" {
+		t.Fatalf("first AUTH: %+v, %v", creds, err)
+	}
+	creds, err := authFn(valkey.AuthCredentialsContext{})
+	if err != nil || creds.Password != "first" || creds.RefreshAfter.IsZero() {
+		t.Fatalf("after a timeout: %+v, %v; want the last valid token and a retry", creds, err)
+	}
+	if absorbed.Load() != 1 {
+		t.Fatalf("OnCredentialError called %d times, want 1", absorbed.Load())
+	}
+}
+
+// T-CTX-7: GCPTokenProvider.Token honors its ctx.
+func TestTokenProvider_TokenHonorsContext(t *testing.T) {
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	hung := tokenSourceFunc(func() (*oauth2.Token, error) {
+		<-release
+		return nil, errors.New("released")
+	})
+	provider, err := NewGCPTokenProvider(context.Background(), IAMAuthOptions{CustomTokenSource: hung, FetchTimeout: time.Minute})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+	if _, err := provider.Token(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("got %v, want the caller's deadline", err)
 	}
 }

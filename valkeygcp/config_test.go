@@ -296,25 +296,6 @@ func TestResolveClientOption_Public(t *testing.T) {
 	}
 }
 
-func TestNewClient_ClosesProviderOnDialFailure(t *testing.T) {
-	closed := 0
-	orig := newSecretSource
-	defer func() { newSecretSource = orig }()
-	newSecretSource = func(context.Context, string) (func(context.Context) (string, error), func() error, error) {
-		return func(context.Context) (string, error) { return "tok", nil }, func() error { closed++; return nil }, nil
-	}
-	_, err := NewClient(context.Background(), Config{
-		PrimaryEndpoint: "127.0.0.1:0", // nothing listens on port 0
-		Auth:            AuthOptions{Token: TokenAuthOptions{SecretVersion: "projects/p/secrets/s/versions/latest"}},
-	})
-	if err == nil {
-		t.Fatal("dial to port 0 should fail")
-	}
-	if closed != 1 {
-		t.Fatalf("Secret Manager client closed %d times, want 1", closed)
-	}
-}
-
 func TestModeStrings(t *testing.T) {
 	for _, c := range []struct{ got, want string }{
 		{AuthIAM.String(), "AuthIAM"}, {AuthMode(7).String(), "AuthMode(7)"},
@@ -324,5 +305,40 @@ func TestModeStrings(t *testing.T) {
 		if c.got != c.want {
 			t.Errorf("got %q, want %q", c.got, c.want)
 		}
+	}
+}
+
+// AuthOptions.OnCredentialError reaches the Token Auth provider like it reaches IAM.
+func TestResolve_TokenAuthGetsOnCredentialError(t *testing.T) {
+	fail, absorbed := false, 0
+	opt, err := resolveOption(t, Config{
+		PrimaryEndpoint: "10.0.0.2:6379",
+		Auth: AuthOptions{
+			Token: TokenAuthOptions{ReloadInterval: 40 * time.Millisecond, Source: func(context.Context) (string, error) {
+				if fail {
+					return "", errors.New("secret manager unavailable")
+				}
+				return "tok", nil
+			}},
+			OnCredentialError: func(error) { absorbed++ },
+		},
+	}, noReader(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	fail = true
+	time.Sleep(30 * time.Millisecond) // past the cache window (ReloadInterval/2)
+	creds, err := opt.AuthCredentialsFn(valkey.AuthCredentialsContext{})
+	if err != nil || creds.Password != "tok" || absorbed != 1 {
+		t.Fatalf("creds = %+v, %v; OnCredentialError calls = %d, want the last token and 1 call", creds, err, absorbed)
+	}
+}
+
+// NewClient stops before dialing when ctx ended during setup (valkey.NewClient takes no context).
+func TestNewClient_ContextEndedBeforeDial(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := NewClient(ctx, Config{PrimaryEndpoint: "127.0.0.1:0"}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("got %v, want context.Canceled", err)
 	}
 }

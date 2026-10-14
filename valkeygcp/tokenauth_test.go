@@ -23,7 +23,7 @@ func authOnce(t *testing.T, p *tokenAuthProvider) valkey.AuthCredentials {
 
 // T-TOK-1
 func TestTokenAuth_StaticDefaultUser(t *testing.T) {
-	p, err := newTokenAuthProvider(context.Background(), TokenAuthOptions{Token: "static-token"}, nil)
+	p, err := newTokenAuthProvider(context.Background(), TokenAuthOptions{Token: "static-token"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -39,7 +39,7 @@ func TestTokenAuth_StaticDefaultUser(t *testing.T) {
 
 // T-TOK-2
 func TestTokenAuth_NamedUser(t *testing.T) {
-	p, err := newTokenAuthProvider(context.Background(), TokenAuthOptions{Username: "app-user", Token: "t"}, nil)
+	p, err := newTokenAuthProvider(context.Background(), TokenAuthOptions{Username: "app-user", Token: "t"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -60,7 +60,7 @@ func TestTokenAuth_ReloadAfterCacheWindow(t *testing.T) {
 			}
 			return "v2", nil
 		},
-	}, nil)
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -93,10 +93,11 @@ func TestTokenAuth_LastKnownGood(t *testing.T) {
 			}
 			return "good", nil
 		},
-	}, func(err error) {
-		mu.Lock()
-		absorbed = append(absorbed, err)
-		mu.Unlock()
+		OnCredentialError: func(err error) {
+			mu.Lock()
+			absorbed = append(absorbed, err)
+			mu.Unlock()
+		},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -126,14 +127,14 @@ func TestTokenAuth_LastKnownGood(t *testing.T) {
 func TestTokenAuth_InitialFetchFails(t *testing.T) {
 	_, err := newTokenAuthProvider(context.Background(), TokenAuthOptions{
 		Source: func(context.Context) (string, error) { return "", errors.New("permission denied") },
-	}, nil)
+	})
 	if err == nil || !strings.Contains(err.Error(), "initial token fetch") || !strings.Contains(err.Error(), "permission denied") {
 		t.Fatalf("got %v", err)
 	}
-	if _, err := newTokenAuthProvider(context.Background(), TokenAuthOptions{Source: func(context.Context) (string, error) { return " \n", nil }}, nil); err == nil {
+	if _, err := newTokenAuthProvider(context.Background(), TokenAuthOptions{Source: func(context.Context) (string, error) { return " \n", nil }}); err == nil {
 		t.Fatal("a blank token must be rejected")
 	}
-	if _, err := newTokenAuthProvider(context.Background(), TokenAuthOptions{}, nil); !errors.Is(err, errNoTokenSource) {
+	if _, err := newTokenAuthProvider(context.Background(), TokenAuthOptions{}); !errors.Is(err, errNoTokenSource) {
 		t.Fatalf("no source: got %v", err)
 	}
 }
@@ -143,13 +144,12 @@ func TestTokenAuth_SecretManagerTrimmed(t *testing.T) {
 	orig := newSecretSource
 	defer func() { newSecretSource = orig }()
 	var gotVersion string
-	var closed bool
-	newSecretSource = func(_ context.Context, version string) (func(context.Context) (string, error), func() error, error) {
+	newSecretSource = func(_ context.Context, version string) (func(context.Context) (string, error), error) {
 		gotVersion = version
-		return func(context.Context) (string, error) { return "secret-token\n", nil }, func() error { closed = true; return nil }, nil
+		return func(context.Context) (string, error) { return "secret-token\n", nil }, nil
 	}
 	const version = "projects/p/secrets/valkey-default-token/versions/latest"
-	p, err := newTokenAuthProvider(context.Background(), TokenAuthOptions{SecretVersion: version}, nil)
+	p, err := newTokenAuthProvider(context.Background(), TokenAuthOptions{SecretVersion: version})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -159,16 +159,12 @@ func TestTokenAuth_SecretManagerTrimmed(t *testing.T) {
 	if gotVersion != version {
 		t.Errorf("read %q, want %q", gotVersion, version)
 	}
-	p.close()
-	if !closed {
-		t.Error("Secret Manager client not closed")
-	}
 
 	// Source overrides SecretVersion and Token.
 	p, err = newTokenAuthProvider(context.Background(), TokenAuthOptions{
 		SecretVersion: version, Token: "static",
 		Source: func(context.Context) (string, error) { return "from-source", nil },
-	}, nil)
+	})
 	if err != nil || authOnce(t, p).Password != "from-source" {
 		t.Fatalf("Source precedence: %v", err)
 	}
@@ -182,7 +178,7 @@ func TestTokenAuth_OneFetchForManyDials(t *testing.T) {
 			calls.Add(1)
 			return "tok", nil
 		},
-	}, nil)
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -211,7 +207,7 @@ func TestTokenAuth_ReloadDisabled(t *testing.T) {
 			calls.Add(1)
 			return "tok", nil
 		},
-	}, nil)
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -225,10 +221,119 @@ func TestTokenAuth_ReloadDisabled(t *testing.T) {
 
 func TestWithTokenAuth(t *testing.T) {
 	var opt valkey.ClientOption
-	if err := WithTokenAuth(TokenAuthOptions{Token: "tok"})(&opt); err != nil || opt.AuthCredentialsFn == nil {
+	if err := WithTokenAuth(TokenAuthOptions{Token: "tok"})(context.Background(), &opt); err != nil || opt.AuthCredentialsFn == nil {
 		t.Fatalf("WithTokenAuth: %v", err)
 	}
-	if err := WithTokenAuth(TokenAuthOptions{})(&valkey.ClientOption{}); !errors.Is(err, errNoTokenSource) {
+	if err := WithTokenAuth(TokenAuthOptions{})(context.Background(), &valkey.ClientOption{}); !errors.Is(err, errNoTokenSource) {
 		t.Fatalf("got %v", err)
+	}
+}
+
+// T-TOK-8: the constructor's ctx bounds the first read made by WithTokenAuth.
+func TestWithTokenAuth_HonorsContext(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	_, err := NewStandaloneClient(ctx, "127.0.0.1:0", "127.0.0.1:0", WithTokenAuth(TokenAuthOptions{
+		Source: func(ctx context.Context) (string, error) {
+			<-ctx.Done() // a Secret Manager read that never answers
+			return "", ctx.Err()
+		},
+	}))
+	if !errors.Is(err, context.DeadlineExceeded) || !strings.Contains(err.Error(), "initial token fetch") {
+		t.Fatalf("got %v, want the caller's deadline on the first read", err)
+	}
+	if d := time.Since(start); d > 2*time.Second {
+		t.Fatalf("setup took %v despite a 50ms deadline", d)
+	}
+}
+
+// T-TOK-9: without a caller deadline the first read is still capped (setupTimeout), and
+// reads on the connection path get tokenFetchTimeout.
+func TestTokenAuth_ReadDeadlines(t *testing.T) {
+	var deadlines []time.Duration
+	p, err := newTokenAuthProvider(context.Background(), TokenAuthOptions{
+		ReloadInterval: 2 * time.Millisecond, // re-read on the next AUTH
+		Source: func(ctx context.Context) (string, error) {
+			d, ok := ctx.Deadline()
+			if !ok {
+				return "", errors.New("read without a deadline")
+			}
+			deadlines = append(deadlines, time.Until(d))
+			return "tok", nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(5 * time.Millisecond)
+	authOnce(t, p)
+	if len(deadlines) != 2 || deadlines[0] > setupTimeout || deadlines[0] <= tokenFetchTimeout || deadlines[1] > tokenFetchTimeout {
+		t.Fatalf("read deadlines = %v, want ~%v (setup) then <= %v (connection path)", deadlines, setupTimeout, tokenFetchTimeout)
+	}
+}
+
+// T-TOK-10: WithTokenAuth reports read errors hidden behind the last-known-good token.
+func TestWithTokenAuth_OnCredentialError(t *testing.T) {
+	var fail atomic.Bool
+	var absorbed atomic.Int32
+	var opt valkey.ClientOption
+	err := WithTokenAuth(TokenAuthOptions{
+		ReloadInterval: 40 * time.Millisecond,
+		Source: func(context.Context) (string, error) {
+			if fail.Load() {
+				return "", errors.New("secret manager unavailable")
+			}
+			return "good", nil
+		},
+		OnCredentialError: func(error) { absorbed.Add(1) },
+	})(context.Background(), &opt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fail.Store(true)
+	time.Sleep(30 * time.Millisecond) // past the cache window (ReloadInterval/2)
+	creds, err := opt.AuthCredentialsFn(valkey.AuthCredentialsContext{})
+	if err != nil || creds.Password != "good" || absorbed.Load() != 1 {
+		t.Fatalf("creds = %+v, %v; OnCredentialError calls = %d, want the last token and 1 call", creds, err, absorbed.Load())
+	}
+}
+
+// T-TOK-11: one Secret Manager client serves every provider; a failed creation isn't cached.
+func TestSharedSecretReader(t *testing.T) {
+	origNew := newSecretManagerReader
+	secretMu.Lock()
+	origReader := secretReader
+	secretReader = nil
+	secretMu.Unlock()
+	t.Cleanup(func() {
+		newSecretManagerReader = origNew
+		secretMu.Lock()
+		secretReader = origReader
+		secretMu.Unlock()
+	})
+	created, fail := 0, true
+	newSecretManagerReader = func(context.Context) (func(context.Context, string) (string, error), error) {
+		created++ // called under secretMu
+		if fail {
+			return nil, errors.New("no credentials")
+		}
+		return func(_ context.Context, version string) (string, error) { return "tok-" + version, nil }, nil
+	}
+	if _, err := newTokenAuthProvider(context.Background(), TokenAuthOptions{SecretVersion: "v1"}); err == nil || !strings.Contains(err.Error(), "secret manager client") {
+		t.Fatalf("got %v, want the client creation error", err)
+	}
+	fail = false
+	for _, version := range []string{"v1", "v2", "v1"} {
+		p, err := newTokenAuthProvider(context.Background(), TokenAuthOptions{SecretVersion: version})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := authOnce(t, p).Password; got != "tok-"+version {
+			t.Fatalf("%s: got %q", version, got)
+		}
+	}
+	if created != 2 {
+		t.Fatalf("Secret Manager clients created = %d, want 2 (one failed, then one shared)", created)
 	}
 }

@@ -19,6 +19,7 @@
 * **ACL Usernames:** IAM username `"default"` (the default) or the IAM principal email for ACL policies keyed by email.
 * **Proactive In-Flight Token Rotation:** Automatically rotates tokens 5 minutes before the 60-minute expiration mark over existing TCP connections using Valkey's RESP3 `AUTH` command without dropping connections or interrupting in-flight queries. Refreshes are spread over the first half of that window so connections don't re-AUTH in the same second.
 * **Refresh Failure Tolerance:** If the token source is briefly unreachable, live connections keep the last valid token instead of being closed; `OnCredentialError` reports the failure.
+* **Bounded Setup and Token Fetches:** The constructor's `ctx` bounds credential discovery, impersonation and the first Token Auth read. Each IAM token fetch and each Token Auth read is capped, so a hung endpoint can't block new connections (see [1.4](#14-contexts-timeouts-and-setup-failures)).
 * **IAM Throttling Backoff:** `ERR_IAM_EXHAUSTED` / `ERR_IAM_OTHER` are retried with a longer exponential backoff; optional `MaxAuthPerSecond` pacing.
 * **Defect C1 Resolution:** Wraps token retrieval with `oauth2.ReuseTokenSourceWithExpiry` with a 5-minute buffer, preventing the recursive token halving loop bug.
 * **Enterprise Service Account Impersonation (Gap G6):** Cross-project access via `google.golang.org/api/impersonate`, with optional token lifetimes up to 12 hours.
@@ -115,11 +116,19 @@ client, err := valkeygcp.NewStandaloneClient(ctx, "10.0.0.2:6379", "10.0.0.3:637
 
 Leave `TokenAuthOptions.Username` empty for the default user (`AUTH <token>`); set it for other token-auth users (`AUTH <user> <token>`).
 
-### 1.4 IAM Username and ACL Policies
+### 1.4 Contexts, Timeouts and Setup Failures
+
+* **The constructor's `ctx` bounds setup only.** `NewClient`, `NewClusterClient` and `NewStandaloneClient` pass it to discovery and to every option. Credential discovery, impersonation, the principal-email lookup and the first Token Auth read stop when it is cancelled or its deadline passes, and after 15 seconds if it has no deadline. Token refreshes never use it, because they run for the life of the client.
+* **Token fetches are capped.** Each IAM token fetch waits at most `IAMAuthOptions.FetchTimeout` (default 10s; negative disables the cap), and each Token Auth read at most 5s. A timed-out fetch is handled like any failed fetch: live connections keep the last valid token, and `OnCredentialError` (on `IAMAuthOptions`, `TokenAuthOptions` or `AuthOptions`) reports it. A custom `TokenAuthOptions.Source` must return when its `ctx` ends.
+* **Setup needs working credentials.** valkey-go connects and authenticates while it builds the client, so missing ADC, a denied impersonation or an unreadable secret fails the constructor immediately, with the underlying error. Without ADC, use the explicit path (`DiscoveryEndpoint` or `PrimaryEndpoint`, no control-plane call) with a static or custom Token Auth source, `CustomTokenSource`, `CredentialsJSON`, or no auth.
+* **One Secret Manager client per process.** All Token Auth providers share one Secret Manager client, created on first use, so creating many clients or retrying setup doesn't pile up gRPC connections.
+* **Custom options** for the low-level constructors have the signature `func(ctx context.Context, opt *valkey.ClientOption) error`.
+
+### 1.5 IAM Username and ACL Policies
 
 The IAM username is `"default"` unless you set one. When an ACL policy keys its rules by IAM principal email, set `IAMAuthOptions.UsernameStrategy: valkeygcp.UsernamePrincipalEmail`. The email is resolved from, in order: `ImpersonateSA`, the `client_email` of a service account key, the impersonation URL of a Workload Identity Federation config, then the metadata server (GCE, GKE Workload Identity, Cloud Run). An explicit `IAMAuthOptions.Username` always wins.
 
-### 1.5 Required Roles
+### 1.6 Required Roles
 
 | Mechanism              | Role on the workload identity                                                 |
 | :--------------------- | :---------------------------------------------------------------------------- |
@@ -128,7 +137,7 @@ The IAM username is `"default"` unless you set one. When an ACL policy keys its 
 | Auto-discovery and CAs | `roles/memorystore.viewer` (`memorystore.instances.get`)                      |
 | Impersonation          | `roles/iam.serviceAccountTokenCreator` on the target service account          |
 
-### 1.6 Testing
+### 1.7 Testing
 
 Run unit tests with Go's race detector:
 

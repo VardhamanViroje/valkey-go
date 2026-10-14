@@ -30,79 +30,110 @@ type TokenAuthOptions struct {
 	SecretVersion string
 	// Token is a static token (local development only).
 	Token string
-	// Source is a custom fetcher; it overrides SecretVersion and Token.
+	// Source is a custom fetcher; it overrides SecretVersion and Token. It must return when
+	// ctx ends: reads on the connection path get a 5s deadline, and the first read during
+	// setup gets the caller's deadline (at most 15s).
 	Source func(ctx context.Context) (string, error)
 	// ReloadInterval controls how often the token is re-read so rotated tokens reach
 	// live connections (re-AUTH). Default 5m; negative disables reload.
 	ReloadInterval time.Duration
+	// OnCredentialError receives token read errors absorbed by the last-known-good logic
+	// (U6). NewClient copies AuthOptions.OnCredentialError here when this field is nil.
+	OnCredentialError func(error)
 }
 
 type tokenAuthProvider struct {
 	opt       TokenAuthOptions
 	fetch     func(ctx context.Context) (string, error)
-	closeFn   func() error // releases the Secret Manager client; nil for other sources
-	onErr     func(error)
 	mu        sync.Mutex
 	last      string    // last-known-good token (U6)
 	nextFetch time.Time // cache: one upstream read per half reload interval
 }
 
-// newSecretSource returns a reader for one Secret Manager secret version and a function
-// that releases the client. It is a variable so tests can replace Secret Manager.
-var newSecretSource = func(ctx context.Context, version string) (func(context.Context) (string, error), func() error, error) {
-	// Needs secretmanager.versions.access. The client lives as long as the valkey client,
-	// so it must not inherit ctx's cancellation.
-	sm, err := secretmanager.NewClient(context.WithoutCancel(ctx))
+// newSecretSource returns a reader for one Secret Manager secret version. It is a variable
+// so tests can replace Secret Manager.
+var newSecretSource = func(ctx context.Context, version string) (func(context.Context) (string, error), error) {
+	read, err := sharedSecretReader(ctx)
 	if err != nil {
-		return nil, nil, fmt.Errorf("valkeygcp: secret manager client: %w", err)
+		return nil, err
 	}
-	fetch := func(ctx context.Context) (string, error) {
+	return func(ctx context.Context) (string, error) { return read(ctx, version) }, nil
+}
+
+// newSecretManagerReader creates the Secret Manager client behind sharedSecretReader; tests
+// replace it. Reading a secret needs secretmanager.versions.access.
+var newSecretManagerReader = func(ctx context.Context) (func(ctx context.Context, version string) (string, error), error) {
+	sm, err := secretmanager.NewClient(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return func(ctx context.Context, version string) (string, error) {
 		resp, err := sm.AccessSecretVersion(ctx, &secretmanagerpb.AccessSecretVersionRequest{Name: version})
 		if err != nil {
 			return "", err
 		}
 		return string(resp.GetPayload().GetData()), nil
-	}
-	return fetch, sm.Close, nil
+	}, nil
 }
 
-func newTokenAuthProvider(ctx context.Context, opt TokenAuthOptions, onErr func(error)) (*tokenAuthProvider, error) {
+// One Secret Manager client serves every Token Auth provider in the process. A client per
+// provider would leak, because valkey.Client has no close hook, and wrapping the returned
+// client to add one would hide its concrete type from valkey-go's helpers (helper.go
+// switches on it for MGET/MSET and DisableCache). The client is created on first use and
+// kept for the life of the process; a failed creation is retried on the next call.
+var (
+	secretMu     sync.Mutex
+	secretReader func(ctx context.Context, version string) (string, error)
+)
+
+func sharedSecretReader(ctx context.Context) (func(context.Context, string) (string, error), error) {
+	secretMu.Lock()
+	defer secretMu.Unlock()
+	if secretReader == nil {
+		// The client outlives ctx, so it must not inherit ctx's cancellation.
+		read, err := newSecretManagerReader(context.WithoutCancel(ctx))
+		if err != nil {
+			return nil, fmt.Errorf("valkeygcp: secret manager client: %w", err)
+		}
+		secretReader = read
+	}
+	return secretReader, nil
+}
+
+// newTokenAuthProvider builds the TOKEN_AUTH provider and reads the token once, so a bad
+// secret fails setup instead of the first dial. ctx bounds that first read, capped at 15s
+// when it has no earlier deadline.
+func newTokenAuthProvider(ctx context.Context, opt TokenAuthOptions) (*tokenAuthProvider, error) {
 	if opt.ReloadInterval == 0 {
 		opt.ReloadInterval = DefaultTokenReloadInterval
 	}
-	p := &tokenAuthProvider{opt: opt, onErr: onErr}
+	p := &tokenAuthProvider{opt: opt}
 	switch {
 	case opt.Source != nil:
 		p.fetch = opt.Source
 	case opt.SecretVersion != "":
-		fetch, closeFn, err := newSecretSource(ctx, opt.SecretVersion)
+		fetch, err := newSecretSource(ctx, opt.SecretVersion)
 		if err != nil {
 			return nil, err
 		}
-		p.fetch, p.closeFn = fetch, closeFn
+		p.fetch = fetch
 	case opt.Token != "":
 		p.fetch = func(context.Context) (string, error) { return opt.Token, nil }
 	default:
 		return nil, errNoTokenSource
 	}
-	if _, err := p.token(ctx); err != nil { // fail fast before the first dial
-		p.close()
+	setupCtx, cancel := context.WithTimeout(ctx, setupTimeout)
+	defer cancel()
+	if _, err := p.token(setupCtx); err != nil { // fail fast before the first dial
 		return nil, fmt.Errorf("valkeygcp: initial token fetch: %w", err)
 	}
 	return p, nil
 }
 
-// close releases the Secret Manager client, if any.
-func (p *tokenAuthProvider) close() {
-	if p.closeFn != nil {
-		_ = p.closeFn()
-	}
-}
-
 func (p *tokenAuthProvider) token(ctx context.Context) (string, error) {
 	tok, absorbed, err := p.cachedToken(ctx)
-	if absorbed != nil && p.onErr != nil {
-		p.onErr(absorbed) // outside the lock: the callback may log or block
+	if absorbed != nil && p.opt.OnCredentialError != nil {
+		p.opt.OnCredentialError(absorbed) // outside the lock: the callback may log or block
 	}
 	return tok, err
 }
@@ -136,6 +167,8 @@ func (p *tokenAuthProvider) cachedToken(ctx context.Context) (tok string, absorb
 
 func (p *tokenAuthProvider) AuthCredentialsFn() func(valkey.AuthCredentialsContext) (valkey.AuthCredentials, error) {
 	return func(valkey.AuthCredentialsContext) (valkey.AuthCredentials, error) {
+		// AuthCredentialsContext carries no context (dials and timer-driven refreshes have no
+		// caller to take one from), so each read gets its own deadline.
 		ctx, cancel := context.WithTimeout(context.Background(), tokenFetchTimeout)
 		defer cancel()
 		tok, err := p.token(ctx)
@@ -150,10 +183,11 @@ func (p *tokenAuthProvider) AuthCredentialsFn() func(valkey.AuthCredentialsConte
 	}
 }
 
-// WithTokenAuth wires TOKEN_AUTH into the low-level constructors.
+// WithTokenAuth wires TOKEN_AUTH into the low-level constructors. The constructor's ctx
+// bounds the first token read.
 func WithTokenAuth(opt TokenAuthOptions) GCPOption {
-	return func(o *valkey.ClientOption) error {
-		p, err := newTokenAuthProvider(context.Background(), opt, nil)
+	return func(ctx context.Context, o *valkey.ClientOption) error {
+		p, err := newTokenAuthProvider(ctx, opt)
 		if err != nil {
 			return err
 		}
@@ -161,4 +195,3 @@ func WithTokenAuth(opt TokenAuthOptions) GCPOption {
 		return nil
 	}
 }
-

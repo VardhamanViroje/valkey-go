@@ -162,4 +162,3 @@ func (ca *testCA) leaf(t testing.TB) (tls.Certificate, *x509.Certificate) {
 	}
 	return tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key}, cert
 }
-
