@@ -1,6 +1,7 @@
 package valkeygcp
 
 import (
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
@@ -67,7 +68,7 @@ func errNeedsCA(mode TLSMode) error {
 
 // WithTLS wires TLS with caller-supplied CA material into the low-level constructors.
 func WithTLS(opt TLSOptions) GCPOption {
-	return func(o *valkey.ClientOption) error {
+	return func(_ context.Context, o *valkey.ClientOption) error { // no network call: ctx unused
 		mode := opt.Mode
 		if mode == TLSAuto {
 			mode = TLSCustomCA
@@ -80,4 +81,3 @@ func WithTLS(opt TLSOptions) GCPOption {
 		return nil
 	}
 }
-

@@ -105,7 +105,7 @@ func pscEndpoints(inst *memorystorepb.Instance) []pscEndpoint {
 		}
 	}
 	//lint:ignore SA1019 fallback for instances whose endpoints[] field is empty
-	for _, d := range inst.GetDiscoveryEndpoints() {
+	for _, d := range inst.GetDiscoveryEndpoints() { //nolint:staticcheck // SA1019: same fallback (golangci-lint ignores lint:ignore)
 		add(d.GetAddress(), d.GetPort(), memorystorepb.ConnectionType_CONNECTION_TYPE_DISCOVERY, d.GetNetwork())
 	}
 	return out
@@ -183,7 +183,7 @@ func (r *resolved) discover(ctx context.Context, newReader func(context.Context)
 	if err != nil {
 		return err
 	}
-	defer rd.Close() // control plane is used for resolution only
+	defer func() { _ = rd.Close() }() // control plane is used for resolution only
 
 	inst, err := rd.GetInstance(ctx, r.cfg.Instance)
 	if err != nil {

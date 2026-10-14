@@ -14,10 +14,13 @@ import (
 	"google.golang.org/api/impersonate"
 )
 
+// Defaults applied when the matching IAMAuthOptions field is left empty.
 const (
 	DefaultCloudPlatformScope = "https://www.googleapis.com/auth/cloud-platform"
 	DefaultRefreshBuffer      = 5 * time.Minute
 	DefaultIAMUsername        = "default"
+	// DefaultTokenFetchTimeout caps one upstream IAM token fetch (IAMAuthOptions.FetchTimeout).
+	DefaultTokenFetchTimeout = 10 * time.Second
 )
 
 // credentialRetry is how soon a failed token refresh is retried while the last-known-good
@@ -48,6 +51,10 @@ type IAMAuthOptions struct {
 	// OnCredentialError receives token fetch errors absorbed by the last-known-good logic (U6).
 	// NewClient copies AuthOptions.OnCredentialError here when this field is nil.
 	OnCredentialError func(error)
+	// FetchTimeout caps one upstream token fetch, so a hung token endpoint can't block new
+	// connections. A timed-out fetch is handled like any failed fetch (U6). Zero means
+	// DefaultTokenFetchTimeout; negative disables the cap.
+	FetchTimeout time.Duration
 }
 
 // GCPTokenProvider manages the retrieval, caching, and lifecycle of IAM OAuth2 access tokens.
@@ -70,6 +77,9 @@ type tokenProvider struct {
 var impersonateTokenSource = impersonate.CredentialsTokenSource
 
 // NewGCPTokenProvider creates an IAM token manager with eager refresh margin to prevent halving loops (C1).
+//
+// ctx bounds the one-off setup (credential discovery, impersonation, the principal-email
+// lookup), capped at 15s when it has no earlier deadline. Token refreshes don't use it.
 func NewGCPTokenProvider(ctx context.Context, opt IAMAuthOptions) (GCPTokenProvider, error) {
 	if opt.RefreshBuffer <= 0 {
 		opt.RefreshBuffer = DefaultRefreshBuffer
@@ -77,55 +87,35 @@ func NewGCPTokenProvider(ctx context.Context, opt IAMAuthOptions) (GCPTokenProvi
 	if len(opt.Scopes) == 0 {
 		opt.Scopes = []string{DefaultCloudPlatformScope}
 	}
+	if opt.FetchTimeout == 0 {
+		opt.FetchTimeout = DefaultTokenFetchTimeout
+	}
 	if opt.ImpersonateLifetime < 0 || (opt.ImpersonateLifetime > 0 && opt.ImpersonateLifetime <= opt.RefreshBuffer) {
 		return nil, fmt.Errorf("valkeygcp: ImpersonateLifetime (%v) must be longer than RefreshBuffer (%v)", opt.ImpersonateLifetime, opt.RefreshBuffer)
 	}
 
+	setupCtx, cancel := context.WithTimeout(ctx, setupTimeout)
+	defer cancel()
 	// Token sources refresh for as long as the client lives, so they must not inherit ctx's
-	// cancellation (a NewClient timeout would otherwise break every later refresh). ctx still
-	// bounds the one-off username lookup below.
+	// cancellation (a NewClient timeout would otherwise break every later refresh). The setup
+	// itself still stops when setupCtx ends: callWithContext stops waiting for it.
 	srcCtx := context.WithoutCancel(ctx)
-
-	var baseSource oauth2.TokenSource
-	var credsJSON []byte // feeds the principal-email lookup (U4)
-	if opt.CustomTokenSource != nil {
-		baseSource = opt.CustomTokenSource
-		credsJSON = opt.CredentialsJSON
-	} else if opt.ImpersonateSA != "" {
-		// Gap G6: Cross-project Service Account Impersonation
-		ts, err := newImpersonatedSource(srcCtx, impersonate.CredentialsConfig{
-			TargetPrincipal: opt.ImpersonateSA,
-			Scopes:          opt.Scopes,
-			Delegates:       opt.Delegates,
-			Lifetime:        opt.ImpersonateLifetime,
-		})
-		if err != nil {
-			return nil, fmt.Errorf("valkeygcp: impersonation token source failed: %w", err)
-		}
-		baseSource = ts
-	} else if len(opt.CredentialsJSON) > 0 {
-		// CredentialsFromJSONWithType instead of the deprecated CredentialsFromJSON (V10).
-		creds, err := google.CredentialsFromJSONWithType(srcCtx, opt.CredentialsJSON, credTypeFromJSON(opt.CredentialsJSON), opt.Scopes...)
-		if err != nil {
-			return nil, fmt.Errorf("valkeygcp: invalid credentials JSON: %w", err)
-		}
-		baseSource, credsJSON = creds.TokenSource, opt.CredentialsJSON
-	} else {
-		creds, err := google.FindDefaultCredentials(srcCtx, opt.Scopes...)
-		if err != nil {
-			return nil, fmt.Errorf("valkeygcp: Application Default Credentials not found: %w", err)
-		}
-		baseSource, credsJSON = creds.TokenSource, creds.JSON
+	base, err := callWithContext(setupCtx, "credential setup", func() (baseCreds, error) {
+		return newBaseCreds(srcCtx, opt)
+	})
+	if err != nil {
+		return nil, err
 	}
 
-	username, err := resolveUsername(ctx, opt, credsJSON)
+	username, err := resolveUsername(setupCtx, opt, base.json)
 	if err != nil {
 		return nil, err
 	}
 
 	p := &tokenProvider{
-		// Fix C1: Wrap source with ReuseTokenSourceWithExpiry to prevent redundant halving loop
-		source:        oauth2.ReuseTokenSourceWithExpiry(nil, baseSource, opt.RefreshBuffer),
+		// Fix C1: Wrap source with ReuseTokenSourceWithExpiry to prevent redundant halving loop.
+		// The fetch timeout sits underneath, so it caps upstream fetches, not cache hits.
+		source:        oauth2.ReuseTokenSourceWithExpiry(nil, withFetchTimeout(base.source, opt.FetchTimeout), opt.RefreshBuffer),
 		refreshBuffer: opt.RefreshBuffer,
 		username:      username,
 		disableReauth: opt.DisableProactiveReauth,
@@ -138,12 +128,56 @@ func NewGCPTokenProvider(ctx context.Context, opt IAMAuthOptions) (GCPTokenProvi
 	return p, nil
 }
 
-func (p *tokenProvider) Token(ctx context.Context) (*oauth2.Token, error) {
-	tok, err := p.source.Token()
-	if err == nil {
-		p.lastGood.Store(tok)
+// baseCreds is the upstream token source and, when known, the credentials JSON behind it.
+type baseCreds struct {
+	source oauth2.TokenSource
+	json   []byte // feeds the principal-email lookup (U4)
+}
+
+// newBaseCreds builds the upstream token source. ctx is kept by the source for later
+// refreshes, so the caller passes a context without cancellation.
+func newBaseCreds(ctx context.Context, opt IAMAuthOptions) (baseCreds, error) {
+	switch {
+	case opt.CustomTokenSource != nil:
+		return baseCreds{source: opt.CustomTokenSource, json: opt.CredentialsJSON}, nil
+	case opt.ImpersonateSA != "":
+		// Gap G6: Cross-project Service Account Impersonation
+		ts, err := newImpersonatedSource(ctx, impersonate.CredentialsConfig{
+			TargetPrincipal: opt.ImpersonateSA,
+			Scopes:          opt.Scopes,
+			Delegates:       opt.Delegates,
+			Lifetime:        opt.ImpersonateLifetime,
+		})
+		if err != nil {
+			return baseCreds{}, fmt.Errorf("valkeygcp: impersonation token source failed: %w", err)
+		}
+		return baseCreds{source: ts}, nil
+	case len(opt.CredentialsJSON) > 0:
+		// CredentialsFromJSONWithType instead of the deprecated CredentialsFromJSON (V10).
+		creds, err := google.CredentialsFromJSONWithType(ctx, opt.CredentialsJSON, credTypeFromJSON(opt.CredentialsJSON), opt.Scopes...)
+		if err != nil {
+			return baseCreds{}, fmt.Errorf("valkeygcp: invalid credentials JSON: %w", err)
+		}
+		return baseCreds{source: creds.TokenSource, json: opt.CredentialsJSON}, nil
+	default:
+		creds, err := google.FindDefaultCredentials(ctx, opt.Scopes...)
+		if err != nil {
+			return baseCreds{}, fmt.Errorf("valkeygcp: Application Default Credentials not found: %w", err)
+		}
+		return baseCreds{source: creds.TokenSource, json: creds.JSON}, nil
 	}
-	return tok, err
+}
+
+// Token returns the current token, fetching a new one inside the refresh buffer. ctx bounds
+// how long the caller waits; the upstream fetch is also capped by FetchTimeout.
+func (p *tokenProvider) Token(ctx context.Context) (*oauth2.Token, error) {
+	return callWithContext(ctx, "token fetch", func() (*oauth2.Token, error) {
+		tok, err := p.source.Token()
+		if err == nil {
+			p.lastGood.Store(tok) // also when the caller has stopped waiting
+		}
+		return tok, err
+	})
 }
 
 func (p *tokenProvider) AuthCredentialsFn() func(valkey.AuthCredentialsContext) (valkey.AuthCredentials, error) {
@@ -268,22 +302,99 @@ func (s *lifetimeSource) Token() (*oauth2.Token, error) {
 	return ts.Token()
 }
 
-// WithDefaultIAM configures the client to authenticate using Application Default Credentials.
-func WithDefaultIAM() GCPOption {
-	return func(opt *valkey.ClientOption) error {
-		provider, err := NewGCPTokenProvider(context.Background(), IAMAuthOptions{})
-		if err != nil {
-			return err
-		}
-		opt.AuthCredentialsFn = provider.AuthCredentialsFn()
-		return nil
+// callWithContext runs fn and stops waiting when ctx ends, for calls that take no context
+// or keep the one they get for later refreshes. fn then finishes in the background and its
+// result is dropped.
+func callWithContext[T any](ctx context.Context, what string, fn func() (T, error)) (T, error) {
+	type result struct {
+		v   T
+		err error
+	}
+	ch := make(chan result, 1) // buffered: an abandoned fn never blocks
+	go func() {
+		v, err := fn()
+		ch <- result{v, err}
+	}()
+	select {
+	case r := <-ch:
+		return r.v, r.err
+	case <-ctx.Done():
+		var zero T
+		return zero, fmt.Errorf("valkeygcp: %s: %w", what, ctx.Err())
 	}
 }
 
-// WithIAMOptions configures custom IAM authentication options.
+// withFetchTimeout caps each upstream fetch of src (IAMAuthOptions.FetchTimeout). A negative
+// timeout returns src unchanged.
+func withFetchTimeout(src oauth2.TokenSource, timeout time.Duration) oauth2.TokenSource {
+	if timeout < 0 {
+		return src
+	}
+	return &timeoutSource{src: src, timeout: timeout}
+}
+
+// timeoutSource stops waiting for an upstream fetch after timeout, so a hung token endpoint
+// can't block new connections (nor, through the C1 cache's lock, every other caller).
+// oauth2.TokenSource can't be cancelled, so a timed-out fetch keeps running in the
+// background. Later calls wait for that fetch instead of starting another until it is
+// 3*timeout old, so a hung endpoint costs at most one goroutine per 3*timeout.
+type timeoutSource struct {
+	src     oauth2.TokenSource
+	timeout time.Duration
+
+	mu  sync.Mutex
+	cur *tokenFetch // the latest fetch, shared while it runs
+}
+
+type tokenFetch struct {
+	start time.Time
+	done  chan struct{} // closed when tok and err are set
+	tok   *oauth2.Token
+	err   error
+}
+
+func (f *tokenFetch) finished() bool {
+	select {
+	case <-f.done:
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *timeoutSource) Token() (*oauth2.Token, error) {
+	s.mu.Lock()
+	f := s.cur
+	if f == nil || f.finished() || time.Since(f.start) > 3*s.timeout {
+		f = &tokenFetch{start: time.Now(), done: make(chan struct{})}
+		s.cur = f
+		go func() {
+			f.tok, f.err = s.src.Token()
+			close(f.done)
+		}()
+	}
+	s.mu.Unlock()
+
+	timer := time.NewTimer(s.timeout)
+	defer timer.Stop()
+	select {
+	case <-f.done:
+		return f.tok, f.err
+	case <-timer.C:
+		return nil, fmt.Errorf("token fetch timed out after %v", s.timeout)
+	}
+}
+
+// WithDefaultIAM configures the client to authenticate using Application Default Credentials.
+func WithDefaultIAM() GCPOption {
+	return WithIAMOptions(IAMAuthOptions{})
+}
+
+// WithIAMOptions configures custom IAM authentication options. The constructor's ctx bounds
+// the provider's setup (see NewGCPTokenProvider).
 func WithIAMOptions(iamOpt IAMAuthOptions) GCPOption {
-	return func(opt *valkey.ClientOption) error {
-		provider, err := NewGCPTokenProvider(context.Background(), iamOpt)
+	return func(ctx context.Context, opt *valkey.ClientOption) error {
+		provider, err := NewGCPTokenProvider(ctx, iamOpt)
 		if err != nil {
 			return err
 		}

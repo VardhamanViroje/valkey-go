@@ -1,6 +1,7 @@
 package valkeygcp
 
 import (
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"io"
@@ -124,13 +125,13 @@ func TestWithTLS(t *testing.T) {
 		t.Fatal(err)
 	}
 	var opt valkey.ClientOption
-	if err := WithTLS(TLSOptions{CAFile: path})(&opt); err != nil || opt.TLSConfig == nil || opt.TLSConfig.RootCAs == nil {
+	if err := WithTLS(TLSOptions{CAFile: path})(context.Background(), &opt); err != nil || opt.TLSConfig == nil || opt.TLSConfig.RootCAs == nil {
 		t.Fatalf("WithTLS(CAFile): %v", err)
 	}
-	if err := WithTLS(TLSOptions{})(&valkey.ClientOption{}); err == nil {
+	if err := WithTLS(TLSOptions{})(context.Background(), &valkey.ClientOption{}); err == nil {
 		t.Fatal("WithTLS without CA material must fail")
 	}
-	if err := WithTLS(TLSOptions{Mode: TLSSharedCA})(&valkey.ClientOption{}); err == nil || !strings.Contains(err.Error(), "TLSSharedCA") {
+	if err := WithTLS(TLSOptions{Mode: TLSSharedCA})(context.Background(), &valkey.ClientOption{}); err == nil || !strings.Contains(err.Error(), "TLSSharedCA") {
 		t.Fatalf("shared CA without PEM: %v", err)
 	}
 }

@@ -14,6 +14,7 @@ import (
 // UsernameStrategy selects the username sent with IAM AUTH when IAMAuthOptions.Username is empty (U4).
 type UsernameStrategy int
 
+// UsernameStrategy values.
 const (
 	UsernameDefault        UsernameStrategy = iota // "default": the only IAM username the IAM docs list
 	UsernamePrincipalEmail                         // IAM principal email, for ACL policies keyed by email (Q1)

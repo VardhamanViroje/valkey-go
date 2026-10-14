@@ -35,4 +35,3 @@ func memorystoreRetryDelay(attempts int, _ valkey.Completed, err error) time.Dur
 	}
 	return time.Duration(rand.Int64N(int64(backoff)) + 1)
 }
-

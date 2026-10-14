@@ -11,6 +11,7 @@ import (
 // AuthMode mirrors memorystore.v1.Instance.AuthorizationMode.
 type AuthMode int
 
+// AuthMode values. Each mode except AuthAuto matches one Instance.AuthorizationMode.
 const (
 	// AuthAuto takes the mode from the instance when Config.Instance is set. Otherwise it is
 	// inferred from the options: AuthToken when a token source is set, AuthIAM when an IAM
@@ -38,6 +39,7 @@ func (m AuthMode) String() string {
 // TLSMode mirrors transit_encryption_mode + server_ca_mode.
 type TLSMode int
 
+// TLSMode values. Each mode except TLSAuto matches a transit encryption and server CA mode.
 const (
 	// TLSAuto takes the mode from the instance when Config.Instance is set. Otherwise it is
 	// TLSCustomCA when TLS options are set (CAPEM, CAFile, Base or ServerName), else TLSDisabled.
@@ -67,6 +69,7 @@ func (m TLSMode) String() string {
 // Topology mirrors memorystore.v1.Instance.Mode.
 type Topology int
 
+// Topology values. Each topology except TopologyAuto matches one Instance.Mode.
 const (
 	// TopologyAuto takes the topology from the instance when Config.Instance is set,
 	// otherwise from the endpoint that is set.
@@ -119,7 +122,8 @@ type AuthOptions struct {
 	IAM   IAMAuthOptions   // IAM_AUTH
 	Token TokenAuthOptions // TOKEN_AUTH
 	// OnCredentialError receives token/secret fetch errors absorbed by the
-	// last-known-good logic (U6), for logs and metrics.
+	// last-known-good logic (U6), for logs and metrics. It is copied into IAM and Token
+	// when they leave their own OnCredentialError nil.
 	OnCredentialError func(error)
 }
 
@@ -162,6 +166,9 @@ func callerAuthField(o valkey.ClientOption) string {
 }
 
 // NewClient resolves cfg (§1.5) and returns a ready valkey.Client.
+//
+// ctx bounds discovery and credential setup. valkey-go connects and authenticates while it
+// builds the client, so setup needs working credentials; token refreshes never use ctx.
 func NewClient(ctx context.Context, cfg Config) (valkey.Client, error) {
 	r, err := resolve(ctx, cfg, defaultInstanceReader) // §4.8
 	if err != nil {
@@ -171,12 +178,10 @@ func NewClient(ctx context.Context, cfg Config) (valkey.Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	client, err := valkey.NewClient(opt)
-	if err != nil {
-		r.close() // release the Secret Manager client created for TOKEN_AUTH
+	if err := ctx.Err(); err != nil { // valkey.NewClient takes no context
 		return nil, err
 	}
-	return client, nil
+	return valkey.NewClient(opt)
 }
 
 // ResolveClientOption returns the fully wired valkey.ClientOption without dialing,
@@ -199,15 +204,6 @@ type resolved struct {
 	primary   string
 	reader    string
 	caPEMs    []string // server CA certificates downloaded from the Memorystore API
-	closers   []func()
-}
-
-// close releases resources created by clientOption.
-func (r *resolved) close() {
-	for _, c := range r.closers {
-		c()
-	}
-	r.closers = nil
 }
 
 // clientOption builds the valkey.ClientOption, filling only zero-valued fields of
@@ -272,11 +268,14 @@ func (r *resolved) clientOption(ctx context.Context) (valkey.ClientOption, error
 			}
 			opt.AuthCredentialsFn = p.AuthCredentialsFn()
 		case AuthToken:
-			p, err := newTokenAuthProvider(ctx, r.cfg.Auth.Token, r.cfg.Auth.OnCredentialError)
+			tok := r.cfg.Auth.Token
+			if tok.OnCredentialError == nil {
+				tok.OnCredentialError = r.cfg.Auth.OnCredentialError
+			}
+			p, err := newTokenAuthProvider(ctx, tok)
 			if err != nil {
 				return valkey.ClientOption{}, err
 			}
-			r.closers = append(r.closers, p.close)
 			opt.AuthCredentialsFn = p.AuthCredentialsFn()
 		}
 	}
