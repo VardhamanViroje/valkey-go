@@ -2,9 +2,10 @@ package valkeygcp
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
+	"math/rand/v2"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/valkey-io/valkey-go"
@@ -19,8 +20,9 @@ const (
 	DefaultIAMUsername        = "default"
 )
 
-// GCPOption configures the valkey.ClientOption with Google Cloud specific parameters.
-type GCPOption func(*valkey.ClientOption) error
+// credentialRetry is how soon a failed token refresh is retried while the last-known-good
+// token is served (U6). jitter spreads it over 27-30s.
+const credentialRetry = 30 * time.Second
 
 // IAMAuthOptions configures the GCP IAM OAuth2 token provider.
 type IAMAuthOptions struct {
@@ -31,6 +33,21 @@ type IAMAuthOptions struct {
 	CredentialsJSON   []byte
 	ImpersonateSA     string
 	Delegates         []string
+
+	// UsernameStrategy picks the AUTH username when Username is empty (U4).
+	UsernameStrategy UsernameStrategy
+	// ImpersonateLifetime is the lifetime of impersonated tokens (impersonate.CredentialsConfig.Lifetime).
+	// Zero means 1h. The maximum is 12h; more than 1h needs the org policy
+	// constraints/iam.allowServiceAccountCredentialLifetimeExtension. Must exceed RefreshBuffer.
+	ImpersonateLifetime time.Duration
+	// DisableProactiveReauth turns off re-AUTH on live connections (Q2): every new connection
+	// still gets a fresh token, but RefreshAfter stays zero.
+	DisableProactiveReauth bool
+	// MaxAuthPerSecond paces token-backed AUTHs per process (U5). 0 disables pacing.
+	MaxAuthPerSecond float64
+	// OnCredentialError receives token fetch errors absorbed by the last-known-good logic (U6).
+	// NewClient copies AuthOptions.OnCredentialError here when this field is nil.
+	OnCredentialError func(error)
 }
 
 // GCPTokenProvider manages the retrieval, caching, and lifecycle of IAM OAuth2 access tokens.
@@ -43,98 +60,212 @@ type tokenProvider struct {
 	source        oauth2.TokenSource
 	refreshBuffer time.Duration
 	username      string
-	mu            sync.RWMutex
+	lastGood      atomic.Pointer[oauth2.Token]
+	disableReauth bool
+	limiter       *authLimiter
+	onErr         func(error)
 }
+
+// impersonateTokenSource is impersonate.CredentialsTokenSource; tests replace it.
+var impersonateTokenSource = impersonate.CredentialsTokenSource
 
 // NewGCPTokenProvider creates an IAM token manager with eager refresh margin to prevent halving loops (C1).
 func NewGCPTokenProvider(ctx context.Context, opt IAMAuthOptions) (GCPTokenProvider, error) {
-	if opt.Username == "" {
-		opt.Username = DefaultIAMUsername
-	}
 	if opt.RefreshBuffer <= 0 {
 		opt.RefreshBuffer = DefaultRefreshBuffer
 	}
 	if len(opt.Scopes) == 0 {
 		opt.Scopes = []string{DefaultCloudPlatformScope}
 	}
+	if opt.ImpersonateLifetime < 0 || (opt.ImpersonateLifetime > 0 && opt.ImpersonateLifetime <= opt.RefreshBuffer) {
+		return nil, fmt.Errorf("valkeygcp: ImpersonateLifetime (%v) must be longer than RefreshBuffer (%v)", opt.ImpersonateLifetime, opt.RefreshBuffer)
+	}
+
+	// Token sources refresh for as long as the client lives, so they must not inherit ctx's
+	// cancellation (a NewClient timeout would otherwise break every later refresh). ctx still
+	// bounds the one-off username lookup below.
+	srcCtx := context.WithoutCancel(ctx)
 
 	var baseSource oauth2.TokenSource
+	var credsJSON []byte // feeds the principal-email lookup (U4)
 	if opt.CustomTokenSource != nil {
 		baseSource = opt.CustomTokenSource
+		credsJSON = opt.CredentialsJSON
 	} else if opt.ImpersonateSA != "" {
 		// Gap G6: Cross-project Service Account Impersonation
-		ts, err := impersonate.CredentialsTokenSource(ctx, impersonate.CredentialsConfig{
+		ts, err := newImpersonatedSource(srcCtx, impersonate.CredentialsConfig{
 			TargetPrincipal: opt.ImpersonateSA,
 			Scopes:          opt.Scopes,
 			Delegates:       opt.Delegates,
+			Lifetime:        opt.ImpersonateLifetime,
 		})
 		if err != nil {
 			return nil, fmt.Errorf("valkeygcp: impersonation token source failed: %w", err)
 		}
 		baseSource = ts
 	} else if len(opt.CredentialsJSON) > 0 {
-		var credTypeHeader struct {
-			Type google.CredentialsType `json:"type"`
-		}
-		if err := json.Unmarshal(opt.CredentialsJSON, &credTypeHeader); err != nil {
-			return nil, fmt.Errorf("valkeygcp: invalid credentials JSON: %w", err)
-		}
-		credType := credTypeHeader.Type
-		if credType == "" {
-			credType = google.ServiceAccount
-		}
-		creds, err := google.CredentialsFromJSONWithType(ctx, opt.CredentialsJSON, credType, opt.Scopes...)
+		// CredentialsFromJSONWithType instead of the deprecated CredentialsFromJSON (V10).
+		creds, err := google.CredentialsFromJSONWithType(srcCtx, opt.CredentialsJSON, credTypeFromJSON(opt.CredentialsJSON), opt.Scopes...)
 		if err != nil {
 			return nil, fmt.Errorf("valkeygcp: invalid credentials JSON: %w", err)
 		}
-		baseSource = creds.TokenSource
+		baseSource, credsJSON = creds.TokenSource, opt.CredentialsJSON
 	} else {
-		creds, err := google.FindDefaultCredentials(ctx, opt.Scopes...)
+		creds, err := google.FindDefaultCredentials(srcCtx, opt.Scopes...)
 		if err != nil {
 			return nil, fmt.Errorf("valkeygcp: Application Default Credentials not found: %w", err)
 		}
-		baseSource = creds.TokenSource
+		baseSource, credsJSON = creds.TokenSource, creds.JSON
 	}
 
-	// Fix C1: Wrap source with ReuseTokenSourceWithExpiry to prevent redundant halving loop
-	managedSource := oauth2.ReuseTokenSourceWithExpiry(nil, baseSource, opt.RefreshBuffer)
+	username, err := resolveUsername(ctx, opt, credsJSON)
+	if err != nil {
+		return nil, err
+	}
 
-	return &tokenProvider{
-		source:        managedSource,
+	p := &tokenProvider{
+		// Fix C1: Wrap source with ReuseTokenSourceWithExpiry to prevent redundant halving loop
+		source:        oauth2.ReuseTokenSourceWithExpiry(nil, baseSource, opt.RefreshBuffer),
 		refreshBuffer: opt.RefreshBuffer,
-		username:      opt.Username,
-	}, nil
+		username:      username,
+		disableReauth: opt.DisableProactiveReauth,
+		onErr:         opt.OnCredentialError,
+	}
+	if opt.MaxAuthPerSecond > 0 {
+		interval := min(float64(time.Second)/opt.MaxAuthPerSecond, float64(24*time.Hour)) // clamp: no int64 overflow
+		p.limiter = &authLimiter{interval: time.Duration(interval)}
+	}
+	return p, nil
 }
 
 func (p *tokenProvider) Token(ctx context.Context) (*oauth2.Token, error) {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	return p.source.Token()
+	tok, err := p.source.Token()
+	if err == nil {
+		p.lastGood.Store(tok)
+	}
+	return tok, err
 }
 
 func (p *tokenProvider) AuthCredentialsFn() func(valkey.AuthCredentialsContext) (valkey.AuthCredentials, error) {
-	return func(actx valkey.AuthCredentialsContext) (valkey.AuthCredentials, error) {
-		tok, err := p.Token(context.Background())
+	return func(valkey.AuthCredentialsContext) (valkey.AuthCredentials, error) {
+		p.limiter.wait()             // U5: no-op unless MaxAuthPerSecond > 0
+		tok, err := p.source.Token() // C1: ReuseTokenSourceWithExpiry
+		now := time.Now()
 		if err != nil {
-			return valkey.AuthCredentials{}, fmt.Errorf("valkeygcp: token acquisition failed: %w", err)
+			return p.tolerate(now, err)
 		}
-
-		refreshAt := tok.Expiry.Add(-p.refreshBuffer)
-		if time.Now().After(refreshAt) {
-			remaining := time.Until(tok.Expiry)
-			if remaining > 0 {
-				refreshAt = time.Now().Add(remaining / 2)
-			} else {
-				refreshAt = time.Now().Add(10 * time.Second)
-			}
+		p.lastGood.Store(tok)
+		creds := valkey.AuthCredentials{Username: p.username, Password: tok.AccessToken}
+		// A zero Expiry means the token never expires, so there is nothing to refresh.
+		if !p.disableReauth && !tok.Expiry.IsZero() {
+			creds.RefreshAfter = refreshTime(now, tok.Expiry, p.refreshBuffer)
 		}
-
-		return valkey.AuthCredentials{
-			Username:     p.username,
-			Password:     tok.AccessToken,
-			RefreshAfter: refreshAt,
-		}, nil
+		return creds, nil
 	}
+}
+
+// tolerate applies the refresh-failure rules (U6). refreshAuth closes the connection when
+// AuthCredentialsFn fails (pipe.go refreshAuth -> p._exit), so a short token-source outage
+// must not surface as an error while a live connection can keep working.
+func (p *tokenProvider) tolerate(now time.Time, err error) (valkey.AuthCredentials, error) {
+	last := p.lastGood.Load()
+	lastValid := last != nil && (last.Expiry.IsZero() || last.Expiry.After(now))
+	// Never succeeded: surface the real error. With DisableProactiveReauth the provider only
+	// runs on new dials, so an expired token has no live connection to protect either.
+	if last == nil || (p.disableReauth && !lastValid) {
+		return valkey.AuthCredentials{}, fmt.Errorf("valkeygcp: token acquisition failed: %w", err)
+	}
+	if p.onErr != nil {
+		p.onErr(err)
+	}
+	if p.disableReauth { // dial-only mode: serve the valid token without arming a refresh timer
+		return valkey.AuthCredentials{Username: p.username, Password: last.AccessToken}, nil
+	}
+	retry := now.Add(jitter(credentialRetry))
+	if lastValid { // U6: still valid, keep using it and retry soon
+		return valkey.AuthCredentials{Username: p.username, Password: last.AccessToken, RefreshAfter: retry}, nil
+	}
+	// U6: expired. Empty credentials make refreshAuth skip AUTH (the connection stays
+	// authenticated, V3); a brand-new dial fails with NOAUTH until the source recovers.
+	return valkey.AuthCredentials{RefreshAfter: retry}, nil
+}
+
+// refreshTime schedules the re-AUTH INSIDE the C1 buffer, so the cache always hands out a
+// new token at that moment, spread over the first half of the buffer (U5). Jittering
+// earlier than Expiry-buffer would re-AUTH with the same cached token.
+func refreshTime(now, expiry time.Time, buffer time.Duration) time.Time {
+	start := expiry.Add(-buffer)
+	if now.Before(start) {
+		return start.Add(time.Duration(rand.Int64N(int64(buffer/2) + 1)))
+	}
+	if remaining := expiry.Sub(now); remaining > 0 {
+		return now.Add(remaining / 2) // existing near-expiry fallback
+	}
+	return now.Add(10 * time.Second)
+}
+
+// jitter returns d minus up to 10%, never more than d (shared with the Token Auth provider).
+func jitter(d time.Duration) time.Duration {
+	if d <= 0 {
+		return d
+	}
+	return d - time.Duration(rand.Int64N(int64(d)/10+1))
+}
+
+// authLimiter paces token-backed AUTHs per process (U5). A nil limiter is a no-op.
+type authLimiter struct {
+	mu       sync.Mutex
+	next     time.Time
+	interval time.Duration
+}
+
+func (l *authLimiter) wait() {
+	if l == nil || l.interval <= 0 {
+		return
+	}
+	l.mu.Lock()
+	now := time.Now()
+	if l.next.Before(now) {
+		l.next = now
+	}
+	sleep := l.next.Sub(now)
+	l.next = l.next.Add(l.interval)
+	l.mu.Unlock()
+	time.Sleep(sleep)
+}
+
+// newImpersonatedSource builds the impersonated token source (G6). With a Lifetime set,
+// impersonate.CredentialsTokenSource returns a static source that never refreshes, so it is
+// wrapped to mint a new token whenever the C1 cache asks for one.
+func newImpersonatedSource(ctx context.Context, cfg impersonate.CredentialsConfig) (oauth2.TokenSource, error) {
+	ts, err := impersonateTokenSource(ctx, cfg)
+	if err != nil || cfg.Lifetime == 0 {
+		return ts, err
+	}
+	return &lifetimeSource{ctx: ctx, cfg: cfg, first: ts}, nil
+}
+
+// lifetimeSource refreshes impersonated tokens that use a custom lifetime.
+type lifetimeSource struct {
+	ctx   context.Context
+	cfg   impersonate.CredentialsConfig
+	mu    sync.Mutex
+	first oauth2.TokenSource // the static source from construction, used once
+}
+
+func (s *lifetimeSource) Token() (*oauth2.Token, error) {
+	s.mu.Lock()
+	first := s.first
+	s.first = nil
+	s.mu.Unlock()
+	if first != nil {
+		return first.Token()
+	}
+	ts, err := impersonateTokenSource(s.ctx, s.cfg)
+	if err != nil {
+		return nil, err
+	}
+	return ts.Token()
 }
 
 // WithDefaultIAM configures the client to authenticate using Application Default Credentials.
