@@ -125,6 +125,10 @@ type AuthOptions struct {
 	// last-known-good logic (U6), for logs and metrics. It is copied into IAM and Token
 	// when they leave their own OnCredentialError nil.
 	OnCredentialError func(error)
+	// OnAuth receives an AuthEvent each time credentials are handed to valkey-go: on every
+	// new connection and at every proactive re-AUTH (U9). It must return quickly. It is
+	// copied into IAM and Token when they leave their own OnAuth nil.
+	OnAuth func(AuthEvent)
 }
 
 // TLSOptions configures in-transit encryption.
@@ -134,6 +138,12 @@ type TLSOptions struct {
 	CAFile     string      // alternative to CAPEM
 	ServerName string      // optional verification override
 	Base       *tls.Config // optional base (cloned, never mutated)
+	// FetchCustomCA fetches the server CA certificates (PEM) of a CUSTOMER_MANAGED_CAS_CA
+	// instance from its Certificate Authority Service pool, which the Memorystore API can't
+	// return (U11). NewClient calls it with the instance's server_ca_pool when
+	// Config.Instance is set and no CA material is. cas.FetchPoolCAs, in package
+	// github.com/valkey-io/valkey-go/valkeygcp/cas, implements it.
+	FetchCustomCA func(ctx context.Context, caPool string) ([]string, error)
 }
 
 // hasSource reports whether a Token Auth token source is set.
@@ -167,8 +177,10 @@ func callerAuthField(o valkey.ClientOption) string {
 
 // NewClient resolves cfg (§1.5) and returns a ready valkey.Client.
 //
-// ctx bounds discovery and credential setup. valkey-go connects and authenticates while it
-// builds the client, so setup needs working credentials; token refreshes never use ctx.
+// ctx bounds discovery, credential setup and connecting. valkey-go connects and
+// authenticates while it builds the client, so setup needs working credentials; Memorystore
+// IAM backend errors are retried with backoff until ctx ends (at most 15s when it has no
+// earlier deadline). Token refreshes never use ctx.
 func NewClient(ctx context.Context, cfg Config) (valkey.Client, error) {
 	r, err := resolve(ctx, cfg, defaultInstanceReader) // §4.8
 	if err != nil {
@@ -178,10 +190,7 @@ func NewClient(ctx context.Context, cfg Config) (valkey.Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := ctx.Err(); err != nil { // valkey.NewClient takes no context
-		return nil, err
-	}
-	return valkey.NewClient(opt)
+	return connect(ctx, opt, r.topology == TopologyCluster, r.authUser)
 }
 
 // ResolveClientOption returns the fully wired valkey.ClientOption without dialing,
@@ -204,6 +213,7 @@ type resolved struct {
 	primary   string
 	reader    string
 	caPEMs    []string // server CA certificates downloaded from the Memorystore API
+	authUser  string   // AUTH username wired by clientOption, for error messages
 }
 
 // clientOption builds the valkey.ClientOption, filling only zero-valued fields of
@@ -256,25 +266,40 @@ func (r *resolved) clientOption(ctx context.Context) (valkey.ClientOption, error
 	}
 
 	if opt.AuthCredentialsFn == nil && opt.Password == "" {
+		plaintext := opt.TLSConfig == nil // reported in AuthEvent.Plaintext (U10)
 		switch r.auth {
 		case AuthIAM:
 			iam := r.cfg.Auth.IAM
 			if iam.OnCredentialError == nil {
 				iam.OnCredentialError = r.cfg.Auth.OnCredentialError
 			}
+			if iam.OnAuth == nil {
+				iam.OnAuth = r.cfg.Auth.OnAuth
+			}
 			p, err := NewGCPTokenProvider(ctx, iam)
 			if err != nil {
 				return valkey.ClientOption{}, err
 			}
+			if tp, ok := p.(*tokenProvider); ok {
+				tp.plaintext, r.authUser = plaintext, tp.username
+			}
 			opt.AuthCredentialsFn = p.AuthCredentialsFn()
+			installDialGate(&opt) // U8: space out re-dials after ERR_IAM_*
 		case AuthToken:
 			tok := r.cfg.Auth.Token
 			if tok.OnCredentialError == nil {
 				tok.OnCredentialError = r.cfg.Auth.OnCredentialError
 			}
+			if tok.OnAuth == nil {
+				tok.OnAuth = r.cfg.Auth.OnAuth
+			}
 			p, err := newTokenAuthProvider(ctx, tok)
 			if err != nil {
 				return valkey.ClientOption{}, err
+			}
+			p.plaintext, r.authUser = plaintext, tok.Username
+			if r.authUser == "" {
+				r.authUser = defaultUser
 			}
 			opt.AuthCredentialsFn = p.AuthCredentialsFn()
 		}

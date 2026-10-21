@@ -227,7 +227,7 @@ func TestResolve_DiscoverCustomerManagedCANeedsPEM(t *testing.T) {
 	inst.ServerCaMode = memorystorepb.Instance_CUSTOMER_MANAGED_CAS_CA.Enum()
 	fake := &fakeReader{inst: inst}
 	_, err := resolve(context.Background(), Config{Instance: testInstance}, fake.factory())
-	if err == nil || !strings.Contains(err.Error(), "needs CA certificates") || strings.Contains(err.Error(), "Config.Instance") {
+	if err == nil || !strings.Contains(err.Error(), "needs CA certificates") || !strings.Contains(err.Error(), "TLS.FetchCustomCA") || strings.Contains(err.Error(), "download them") {
 		t.Fatalf("got %v", err)
 	}
 	if fake.perCalls+fake.sharedCalls != 0 {
@@ -340,4 +340,68 @@ func TestResolve_DiscoverEdgeCases(t *testing.T) {
 			}
 		}
 	})
+}
+
+// cmcaInstance is a cluster instance whose server CA is a customer-managed CA Service pool.
+func cmcaInstance(pool string) *memorystorepb.Instance {
+	inst := clusterInstance(memorystorepb.Instance_AUTH_DISABLED)
+	inst.TransitEncryptionMode = memorystorepb.Instance_SERVER_AUTHENTICATION
+	inst.ServerCaMode = memorystorepb.Instance_CUSTOMER_MANAGED_CAS_CA.Enum()
+	if pool != "" {
+		inst.ServerCaPool = &pool
+	}
+	return inst
+}
+
+// T-DISC-12 (U11): with TLS.FetchCustomCA, a customer-managed CA instance is configured from
+// Config.Instance alone: the CA comes from the instance's CA pool.
+func TestResolve_DiscoverCustomerManagedCAFetch(t *testing.T) {
+	const pool = "projects/my-proj/locations/us-west4/caPools/valkey-pool"
+	ca := newTestCA(t, "cas")
+	var gotPool string
+	fetch := func(_ context.Context, p string) ([]string, error) {
+		gotPool = p
+		return []string{string(ca.pem)}, nil
+	}
+	fake := &fakeReader{inst: cmcaInstance(pool)}
+	opt, err := resolveOption(t, Config{Instance: testInstance, TLS: TLSOptions{FetchCustomCA: fetch}}, fake.factory())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotPool != pool {
+		t.Errorf("FetchCustomCA got pool %q, want %q", gotPool, pool)
+	}
+	if opt.TLSConfig == nil || opt.TLSConfig.RootCAs == nil {
+		t.Fatal("TLSConfig with the CA pool's certificates expected")
+	}
+	if fake.perCalls+fake.sharedCalls != 0 {
+		t.Error("no Memorystore CA call expected for a customer-managed CA")
+	}
+
+	// Caller CA material wins: the pool isn't read.
+	gotPool = ""
+	if _, err := resolveOption(t, Config{Instance: testInstance, TLS: TLSOptions{FetchCustomCA: fetch, CAPEM: ca.pem}},
+		(&fakeReader{inst: cmcaInstance(pool)}).factory()); err != nil || gotPool != "" {
+		t.Fatalf("got %v, pool read %q; want CAPEM used without a fetch", err, gotPool)
+	}
+}
+
+func TestResolve_DiscoverCustomerManagedCAFetchErrors(t *testing.T) {
+	const pool = "projects/p/locations/l/caPools/x"
+	cases := []struct {
+		name  string
+		inst  *memorystorepb.Instance
+		fetch func(context.Context, string) ([]string, error)
+		want  string
+	}{
+		{"no pool", cmcaInstance(""), func(context.Context, string) ([]string, error) { return nil, nil }, "no server_ca_pool"},
+		{"fetch error", cmcaInstance(pool), func(context.Context, string) ([]string, error) { return nil, errors.New("403") }, "privateca.caPools.get"},
+		{"empty pool", cmcaInstance(pool), func(context.Context, string) ([]string, error) { return nil, nil }, "returned no CA certificate"},
+	}
+	for _, c := range cases {
+		_, err := resolve(context.Background(), Config{Instance: testInstance, TLS: TLSOptions{FetchCustomCA: c.fetch}}, (&fakeReader{inst: c.inst}).factory())
+		if err == nil || !strings.Contains(err.Error(), c.want) {
+			t.Errorf("%s: got %v, want error containing %q", c.name, err, c.want)
+		}
+	}
 }

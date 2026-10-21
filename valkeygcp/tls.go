@@ -58,10 +58,11 @@ func buildTLSConfig(opt TLSOptions, mode TLSMode, discovered []string) (*tls.Con
 }
 
 // errNeedsCA reports a TLS mode without CA material. Customer-managed CAs (Certificate
-// Authority Service) can't be downloaded from the Memorystore API.
+// Authority Service) can't be downloaded from the Memorystore API; TLS.FetchCustomCA reads
+// them from the CA pool instead (U11).
 func errNeedsCA(mode TLSMode) error {
 	if mode == TLSCustomCA {
-		return fmt.Errorf("valkeygcp: TLS mode %v needs CA certificates: set TLS.CAPEM or TLS.CAFile", mode)
+		return fmt.Errorf("valkeygcp: TLS mode %v needs CA certificates: set TLS.CAPEM or TLS.CAFile, or TLS.FetchCustomCA (package valkeygcp/cas) with Config.Instance", mode)
 	}
 	return fmt.Errorf("valkeygcp: TLS mode %v needs CA certificates: set TLS.CAPEM or TLS.CAFile, or Config.Instance to download them", mode)
 }

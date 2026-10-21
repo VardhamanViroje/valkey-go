@@ -45,6 +45,7 @@ func TestResolve_ExplicitClusterIAM(t *testing.T) {
 	opt, err := resolveOption(t, Config{
 		DiscoveryEndpoint: "10.0.0.15:6379",
 		Auth:              AuthOptions{Mode: AuthIAM, IAM: staticIAM()},
+		TLS:               TLSOptions{Mode: TLSDisabled}, // explicit opt-in to plaintext (U10)
 	}, noReader(t))
 	if err != nil {
 		t.Fatal(err)
@@ -189,7 +190,7 @@ func TestResolve_CallerCredentialsConflict(t *testing.T) {
 }
 
 func TestResolve_AuthAutoInference(t *testing.T) {
-	base := Config{DiscoveryEndpoint: "10.0.0.15:6379"}
+	base := Config{DiscoveryEndpoint: "10.0.0.15:6379", TLS: TLSOptions{Mode: TLSDisabled}}
 	cases := []struct {
 		name string
 		auth AuthOptions
@@ -313,6 +314,7 @@ func TestResolve_TokenAuthGetsOnCredentialError(t *testing.T) {
 	fail, absorbed := false, 0
 	opt, err := resolveOption(t, Config{
 		PrimaryEndpoint: "10.0.0.2:6379",
+		TLS:             TLSOptions{Mode: TLSDisabled},
 		Auth: AuthOptions{
 			Token: TokenAuthOptions{ReloadInterval: 40 * time.Millisecond, Source: func(context.Context) (string, error) {
 				if fail {

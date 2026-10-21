@@ -46,7 +46,8 @@ type IAMAuthOptions struct {
 	// DisableProactiveReauth turns off re-AUTH on live connections (Q2): every new connection
 	// still gets a fresh token, but RefreshAfter stays zero.
 	DisableProactiveReauth bool
-	// MaxAuthPerSecond paces token-backed AUTHs per process (U5). 0 disables pacing.
+	// MaxAuthPerSecond paces token-backed AUTHs per provider, that is per NewClient or
+	// WithIAMOptions call (U5). 0 disables pacing.
 	MaxAuthPerSecond float64
 	// OnCredentialError receives token fetch errors absorbed by the last-known-good logic (U6).
 	// NewClient copies AuthOptions.OnCredentialError here when this field is nil.
@@ -55,6 +56,10 @@ type IAMAuthOptions struct {
 	// connections. A timed-out fetch is handled like any failed fetch (U6). Zero means
 	// DefaultTokenFetchTimeout; negative disables the cap.
 	FetchTimeout time.Duration
+	// OnAuth receives an AuthEvent each time credentials are handed to valkey-go, for logs
+	// and metrics (U9). It runs on the connection path, so it must return quickly. NewClient
+	// copies AuthOptions.OnAuth here when this field is nil.
+	OnAuth func(AuthEvent)
 }
 
 // GCPTokenProvider manages the retrieval, caching, and lifecycle of IAM OAuth2 access tokens.
@@ -71,6 +76,8 @@ type tokenProvider struct {
 	disableReauth bool
 	limiter       *authLimiter
 	onErr         func(error)
+	onAuth        func(AuthEvent)
+	plaintext     bool // set by NewClient when the connections don't use TLS (AuthEvent.Plaintext)
 }
 
 // impersonateTokenSource is impersonate.CredentialsTokenSource; tests replace it.
@@ -111,6 +118,9 @@ func NewGCPTokenProvider(ctx context.Context, opt IAMAuthOptions) (GCPTokenProvi
 	if err != nil {
 		return nil, err
 	}
+	if err := checkIAMUsername(setupCtx, opt, base.json); err != nil {
+		return nil, err
+	}
 
 	p := &tokenProvider{
 		// Fix C1: Wrap source with ReuseTokenSourceWithExpiry to prevent redundant halving loop.
@@ -120,6 +130,7 @@ func NewGCPTokenProvider(ctx context.Context, opt IAMAuthOptions) (GCPTokenProvi
 		username:      username,
 		disableReauth: opt.DisableProactiveReauth,
 		onErr:         opt.OnCredentialError,
+		onAuth:        opt.OnAuth,
 	}
 	if opt.MaxAuthPerSecond > 0 {
 		interval := min(float64(time.Second)/opt.MaxAuthPerSecond, float64(24*time.Hour)) // clamp: no int64 overflow
@@ -181,21 +192,32 @@ func (p *tokenProvider) Token(ctx context.Context) (*oauth2.Token, error) {
 }
 
 func (p *tokenProvider) AuthCredentialsFn() func(valkey.AuthCredentialsContext) (valkey.AuthCredentials, error) {
-	return func(valkey.AuthCredentialsContext) (valkey.AuthCredentials, error) {
-		p.limiter.wait()             // U5: no-op unless MaxAuthPerSecond > 0
-		tok, err := p.source.Token() // C1: ReuseTokenSourceWithExpiry
-		now := time.Now()
-		if err != nil {
-			return p.tolerate(now, err)
+	return func(c valkey.AuthCredentialsContext) (valkey.AuthCredentials, error) {
+		p.limiter.wait() // U5: no-op unless MaxAuthPerSecond > 0
+		creds, fallback, err := p.credentials()
+		if p.onAuth != nil {
+			p.onAuth(authEvent(c, p.username, creds, fallback, p.plaintext, err))
 		}
-		p.lastGood.Store(tok)
-		creds := valkey.AuthCredentials{Username: p.username, Password: tok.AccessToken}
-		// A zero Expiry means the token never expires, so there is nothing to refresh.
-		if !p.disableReauth && !tok.Expiry.IsZero() {
-			creds.RefreshAfter = refreshTime(now, tok.Expiry, p.refreshBuffer)
-		}
-		return creds, nil
+		return creds, err
 	}
+}
+
+// credentials returns the AUTH credentials and whether they came from the last-known-good
+// fallback (U6).
+func (p *tokenProvider) credentials() (valkey.AuthCredentials, bool, error) {
+	tok, err := p.source.Token() // C1: ReuseTokenSourceWithExpiry
+	now := time.Now()
+	if err != nil {
+		creds, err := p.tolerate(now, err)
+		return creds, err == nil, err
+	}
+	p.lastGood.Store(tok)
+	creds := valkey.AuthCredentials{Username: p.username, Password: tok.AccessToken}
+	// A zero Expiry means the token never expires, so there is nothing to refresh.
+	if !p.disableReauth && !tok.Expiry.IsZero() {
+		creds.RefreshAfter = refreshTime(now, tok.Expiry, p.refreshBuffer)
+	}
+	return creds, false, nil
 }
 
 // tolerate applies the refresh-failure rules (U6). refreshAuth closes the connection when
@@ -246,7 +268,7 @@ func jitter(d time.Duration) time.Duration {
 	return d - time.Duration(rand.Int64N(int64(d)/10+1))
 }
 
-// authLimiter paces token-backed AUTHs per process (U5). A nil limiter is a no-op.
+// authLimiter paces token-backed AUTHs for one provider (U5). A nil limiter is a no-op.
 type authLimiter struct {
 	mu       sync.Mutex
 	next     time.Time
@@ -391,7 +413,8 @@ func WithDefaultIAM() GCPOption {
 }
 
 // WithIAMOptions configures custom IAM authentication options. The constructor's ctx bounds
-// the provider's setup (see NewGCPTokenProvider).
+// the provider's setup (see NewGCPTokenProvider). It also spaces out re-dials after an IAM
+// backend error (U8), wrapping any dialer set before it.
 func WithIAMOptions(iamOpt IAMAuthOptions) GCPOption {
 	return func(ctx context.Context, opt *valkey.ClientOption) error {
 		provider, err := NewGCPTokenProvider(ctx, iamOpt)
@@ -399,6 +422,7 @@ func WithIAMOptions(iamOpt IAMAuthOptions) GCPOption {
 			return err
 		}
 		opt.AuthCredentialsFn = provider.AuthCredentialsFn()
+		installDialGate(opt)
 		return nil
 	}
 }

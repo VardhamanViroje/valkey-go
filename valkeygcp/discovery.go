@@ -243,12 +243,15 @@ func (r *resolved) discover(ctx context.Context, newReader func(context.Context)
 	if r.cfg.ClientOption.TLSConfig != nil || hasCAMaterial(r.cfg.TLS) {
 		return nil
 	}
+	if r.tls == TLSCustomCA {
+		return r.fetchCustomCA(ctx, inst)
+	}
 	switch r.tls {
 	case TLSPerInstanceCA:
 		r.caPEMs, err = rd.PerInstanceCA(ctx, r.cfg.Instance)
 	case TLSSharedCA:
 		r.caPEMs, err = rd.SharedRegionalCA(ctx, project, region)
-	default: // TLSDisabled; TLSCustomCA without CA material is reported by validate
+	default: // TLSDisabled
 		return nil
 	}
 	if err != nil {
@@ -257,6 +260,28 @@ func (r *resolved) discover(ctx context.Context, newReader func(context.Context)
 	if len(r.caPEMs) == 0 {
 		return fmt.Errorf("valkeygcp: the Memorystore API returned no server CA certificate for %s", r.cfg.Instance)
 	}
+	return nil
+}
+
+// fetchCustomCA gets a CUSTOMER_MANAGED_CAS_CA instance's server CA from its CA Service pool
+// through TLS.FetchCustomCA (U11). Without the hook, validate reports the missing CA.
+func (r *resolved) fetchCustomCA(ctx context.Context, inst *memorystorepb.Instance) error {
+	fetch := r.cfg.TLS.FetchCustomCA
+	if fetch == nil || inst.GetServerCaMode() != memorystorepb.Instance_CUSTOMER_MANAGED_CAS_CA {
+		return nil
+	}
+	pool := inst.GetServerCaPool()
+	if pool == "" {
+		return fmt.Errorf("valkeygcp: instance %s uses CUSTOMER_MANAGED_CAS_CA but reports no server_ca_pool", r.cfg.Instance)
+	}
+	pems, err := fetch(ctx, pool)
+	if err != nil {
+		return fmt.Errorf("valkeygcp: fetch the CA certificates of %s (needs privateca.caPools.get, for example roles/privateca.poolReader): %w", pool, err)
+	}
+	if len(pems) == 0 {
+		return fmt.Errorf("valkeygcp: CA pool %s returned no CA certificate", pool)
+	}
+	r.caPEMs = pems
 	return nil
 }
 
@@ -327,7 +352,28 @@ func (r *resolved) validate() error {
 	if r.tls != TLSDisabled && r.cfg.ClientOption.TLSConfig == nil && len(r.caPEMs) == 0 && !hasCAMaterial(r.cfg.TLS) {
 		return errNeedsCA(r.tls)
 	}
-	return nil
+	return r.checkPlaintextCredentials(callerAuth)
+}
+
+// checkPlaintextCredentials refuses to send IAM or Token Auth credentials without TLS on the
+// explicit path unless the caller turned TLS off on purpose (U10): TLSAuto infers
+// TLSDisabled when no CA option is set, and the AUTH command then crosses the network in
+// plaintext, even to an instance that only accepts TLS. With Config.Instance the instance's
+// in-transit encryption setting decides.
+func (r *resolved) checkPlaintextCredentials(callerAuth bool) error {
+	if r.cfg.Instance != "" || callerAuth || r.tls != TLSDisabled || r.cfg.TLS.Mode == TLSDisabled || r.cfg.ClientOption.TLSConfig != nil {
+		return nil
+	}
+	var what string
+	switch r.auth {
+	case AuthIAM:
+		what = "IAM access tokens"
+	case AuthToken:
+		what = "Token Auth tokens"
+	default:
+		return nil
+	}
+	return fmt.Errorf("valkeygcp: refusing to send %s without TLS: set TLS.CAFile or TLS.CAPEM to the instance's server CA, or set TLS.Mode = TLSDisabled if the instance has in-transit encryption disabled", what)
 }
 
 func (r *resolved) errMissing(typ memorystorepb.ConnectionType) error {

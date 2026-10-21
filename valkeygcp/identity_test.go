@@ -115,3 +115,68 @@ func TestCredTypeFromJSON(t *testing.T) {
 		}
 	}
 }
+
+// T-ID-8 (U8): an explicit IAM username must be "default" or the principal's email. A
+// mismatch fails setup instead of every dial (ERR_IAM_OTHER); an unknown principal passes.
+func TestCheckIAMUsername(t *testing.T) {
+	fakeMetadata(t, nil) // not on GCE: principal unknown without JSON or impersonation
+	const saKey = `{"type":"service_account","client_email":"key@p.iam.gserviceaccount.com"}`
+	cases := []struct {
+		name    string
+		opt     IAMAuthOptions
+		json    string
+		wantErr bool
+	}{
+		{"empty", IAMAuthOptions{}, saKey, false},
+		{"default", IAMAuthOptions{Username: DefaultIAMUsername}, saKey, false},
+		{"key email", IAMAuthOptions{Username: "key@p.iam.gserviceaccount.com"}, saKey, false},
+		{"key email, other case", IAMAuthOptions{Username: "KEY@p.iam.gserviceaccount.com"}, saKey, false},
+		{"other email", IAMAuthOptions{Username: "other@p.iam.gserviceaccount.com"}, saKey, true},
+		{"not an email", IAMAuthOptions{Username: "app-user"}, saKey, true},
+		{"impersonated email", IAMAuthOptions{Username: "t@p.iam.gserviceaccount.com", ImpersonateSA: "t@p.iam.gserviceaccount.com"}, "", false},
+		{"impersonation mismatch", IAMAuthOptions{Username: "key@p.iam.gserviceaccount.com", ImpersonateSA: "t@p.iam.gserviceaccount.com"}, saKey, true},
+		{"custom source, principal unknown", IAMAuthOptions{Username: "app-user", CustomTokenSource: staticIAM().CustomTokenSource}, "", false},
+		{"principal unresolvable", IAMAuthOptions{Username: "app-user"}, "", false},
+	}
+	for _, c := range cases {
+		err := checkIAMUsername(context.Background(), c.opt, []byte(c.json))
+		if (err != nil) != c.wantErr {
+			t.Errorf("%s: got %v, want error %v", c.name, err, c.wantErr)
+		}
+		if err != nil && !strings.Contains(err.Error(), "isn't valid") {
+			t.Errorf("%s: unexpected message %v", c.name, err)
+		}
+	}
+}
+
+// The check runs in NewGCPTokenProvider, before any token is handed out.
+func TestNewGCPTokenProvider_RejectsInvalidUsername(t *testing.T) {
+	fakeMetadata(t, nil)
+	opt := staticIAM()
+	opt.CredentialsJSON = []byte(`{"type":"service_account","client_email":"key@p.iam.gserviceaccount.com"}`)
+	opt.Username = "someone-else@p.iam.gserviceaccount.com"
+	if _, err := NewGCPTokenProvider(context.Background(), opt); err == nil || !strings.Contains(err.Error(), "key@p.iam.gserviceaccount.com") {
+		t.Fatalf("got %v, want the username error naming the principal", err)
+	}
+}
+
+// T-ID-9: on GKE, a Kubernetes ServiceAccount linked to an IAM service account gets
+// SERVICEACCOUNT_NAME.svc.id.goog from the metadata server unless the
+// iam.gke.io/return-principal-id-as-email annotation is set. That isn't an email, so the
+// principal-email strategy fails with the annotation hint, and the explicit-username check
+// stays silent instead of rejecting a correct email.
+func TestUsername_GKENonEmailIdentifier(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("my-ksa.svc.id.goog"))
+	}))
+	defer srv.Close()
+	fakeMetadata(t, srv)
+
+	_, err := resolveUsername(context.Background(), IAMAuthOptions{UsernameStrategy: UsernamePrincipalEmail}, nil)
+	if err == nil || !strings.Contains(err.Error(), "iam.gke.io/return-principal-id-as-email") {
+		t.Fatalf("got %v, want the GKE annotation hint", err)
+	}
+	if err := checkIAMUsername(context.Background(), IAMAuthOptions{Username: "sa@p.iam.gserviceaccount.com"}, nil); err != nil {
+		t.Fatalf("explicit email rejected although the principal isn't known as an email: %v", err)
+	}
+}

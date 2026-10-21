@@ -299,27 +299,34 @@ func TestWithTokenAuth_OnCredentialError(t *testing.T) {
 	}
 }
 
-// T-TOK-11: one Secret Manager client serves every provider; a failed creation isn't cached.
-func TestSharedSecretReader(t *testing.T) {
+// stubSecretReaders replaces the Secret Manager client factory and empties the shared
+// readers for one test.
+func stubSecretReaders(t *testing.T, factory func(ctx context.Context, location string) (func(context.Context, string) (string, error), error)) {
+	t.Helper()
 	origNew := newSecretManagerReader
 	secretMu.Lock()
-	origReader := secretReader
-	secretReader = nil
+	origReaders := secretReaders
+	secretReaders = map[string]func(context.Context, string) (string, error){}
 	secretMu.Unlock()
+	newSecretManagerReader = factory
 	t.Cleanup(func() {
 		newSecretManagerReader = origNew
 		secretMu.Lock()
-		secretReader = origReader
+		secretReaders = origReaders
 		secretMu.Unlock()
 	})
+}
+
+// T-TOK-11: one Secret Manager client serves every provider; a failed creation isn't cached.
+func TestSharedSecretReader(t *testing.T) {
 	created, fail := 0, true
-	newSecretManagerReader = func(context.Context) (func(context.Context, string) (string, error), error) {
+	stubSecretReaders(t, func(context.Context, string) (func(context.Context, string) (string, error), error) {
 		created++ // called under secretMu
 		if fail {
 			return nil, errors.New("no credentials")
 		}
 		return func(_ context.Context, version string) (string, error) { return "tok-" + version, nil }, nil
-	}
+	})
 	if _, err := newTokenAuthProvider(context.Background(), TokenAuthOptions{SecretVersion: "v1"}); err == nil || !strings.Contains(err.Error(), "secret manager client") {
 		t.Fatalf("got %v, want the client creation error", err)
 	}
@@ -335,5 +342,50 @@ func TestSharedSecretReader(t *testing.T) {
 	}
 	if created != 2 {
 		t.Fatalf("Secret Manager clients created = %d, want 2 (one failed, then one shared)", created)
+	}
+}
+
+// T-TOK-12 (U12): a regional secret is read through a client for its location, shared by
+// every secret in that location; global secrets keep the global client.
+func TestRegionalSecretReader(t *testing.T) {
+	var locations []string
+	stubSecretReaders(t, func(_ context.Context, location string) (func(context.Context, string) (string, error), error) {
+		locations = append(locations, location) // called under secretMu
+		return func(_ context.Context, version string) (string, error) { return location + "|" + version, nil }, nil
+	})
+	versions := []string{
+		"projects/p/locations/us-east1/secrets/a/versions/latest",
+		"projects/p/locations/us-east1/secrets/b/versions/2",
+		"projects/p/secrets/c/versions/latest",
+		"projects/p/locations/europe-west1/secrets/d/versions/1",
+	}
+	for _, v := range versions {
+		p, err := newTokenAuthProvider(context.Background(), TokenAuthOptions{SecretVersion: v})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got, want := authOnce(t, p).Password, secretLocation(v)+"|"+v; got != want {
+			t.Fatalf("%s: got %q, want %q", v, got, want)
+		}
+	}
+	if got := strings.Join(locations, ","); got != "us-east1,,europe-west1" {
+		t.Fatalf("clients created for locations %q, want us-east1, global, europe-west1", got)
+	}
+}
+
+func TestSecretLocation(t *testing.T) {
+	for in, want := range map[string]string{
+		"projects/p/locations/us-east1/secrets/s/versions/latest": "us-east1",
+		"projects/p/secrets/s/versions/latest":                    "",
+		"projects/p/locations//secrets/s/versions/1":              "",
+		"projects/p/locations/us-east1/secrets/s":                 "",
+		"v1": "",
+	} {
+		if got := secretLocation(in); got != want {
+			t.Errorf("secretLocation(%q) = %q, want %q", in, got, want)
+		}
+	}
+	if got := regionalSecretEndpoint("us-east1"); got != "secretmanager.us-east1.rep.googleapis.com:443" {
+		t.Errorf("regionalSecretEndpoint = %q", got)
 	}
 }

@@ -9,7 +9,9 @@
 // Explicit path (no control-plane call): leave VALKEY_GCP_INSTANCE unset and set
 // MEMORYSTORE_TEST_DISCOVERY_ENDPOINT (cluster) or VALKEY_GCP_PRIMARY_ENDPOINT and optionally
 // VALKEY_GCP_READER_ENDPOINT (cluster-disabled), plus VALKEY_GCP_AUTH_MODE (iam, token or
-// disabled) and VALKEY_GCP_TLS_CA_FILE when in-transit encryption is on.
+// disabled) and VALKEY_GCP_TLS_CA_FILE when in-transit encryption is on. For an instance with
+// in-transit encryption disabled, set VALKEY_GCP_TLS_MODE=disabled: valkeygcp refuses to send
+// IAM or Token Auth credentials without TLS unless TLS is turned off explicitly.
 //
 // Both paths read VALKEY_GCP_TOKEN_SECRET and VALKEY_GCP_TOKEN_USERNAME (TOKEN_AUTH) and
 // VALKEY_GCP_USERNAME_STRATEGY=principal-email (IAM username, test L6-B).
@@ -75,6 +77,13 @@ func config() (valkeygcp.Config, error) {
 	}
 	if os.Getenv("VALKEY_GCP_USERNAME_STRATEGY") == "principal-email" {
 		cfg.Auth.IAM.UsernameStrategy = valkeygcp.UsernamePrincipalEmail
+	}
+	switch mode := os.Getenv("VALKEY_GCP_TLS_MODE"); mode {
+	case "":
+	case "disabled":
+		cfg.TLS.Mode = valkeygcp.TLSDisabled
+	default:
+		return valkeygcp.Config{}, fmt.Errorf("VALKEY_GCP_TLS_MODE=%q: want disabled or unset", mode)
 	}
 	switch mode := os.Getenv("VALKEY_GCP_AUTH_MODE"); mode {
 	case "":

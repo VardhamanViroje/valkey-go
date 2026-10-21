@@ -60,9 +60,33 @@ func resolveUsername(ctx context.Context, opt IAMAuthOptions, credsJSON []byte) 
 		if email == "" {
 			return "", errors.New("valkeygcp: the metadata server returned no principal email; set IAMAuthOptions.Username")
 		}
+		if !strings.Contains(email, "@") {
+			// GKE returns SERVICEACCOUNT_NAME.svc.id.goog for Kubernetes ServiceAccounts linked to
+			// IAM service accounts unless iam.gke.io/return-principal-id-as-email is set.
+			return "", fmt.Errorf("valkeygcp: the metadata server returned %q, which isn't an email; on GKE add the annotation iam.gke.io/return-principal-id-as-email: \"true\" to the Kubernetes ServiceAccount, or set IAMAuthOptions.Username", email)
+		}
 		return email, nil
 	}
 	return "", errors.New("valkeygcp: cannot resolve the principal email; set IAMAuthOptions.Username")
+}
+
+// checkIAMUsername rejects an explicit IAM username that Memorystore would refuse with
+// ERR_IAM_OTHER (U8): "If you specify a username, then you must use either the default
+// username or the IAM principal email address". It stays silent when the principal can't
+// be determined (a custom token source without credentials JSON, or user credentials off
+// Google Cloud), because the username may then be right.
+func checkIAMUsername(ctx context.Context, opt IAMAuthOptions, credsJSON []byte) error {
+	if opt.Username == "" || opt.Username == DefaultIAMUsername {
+		return nil
+	}
+	if opt.CustomTokenSource != nil && len(credsJSON) == 0 {
+		return nil
+	}
+	email, err := resolveUsername(ctx, IAMAuthOptions{UsernameStrategy: UsernamePrincipalEmail, ImpersonateSA: opt.ImpersonateSA}, credsJSON)
+	if err != nil || !strings.Contains(email, "@") || strings.EqualFold(email, opt.Username) {
+		return nil // principal unknown, or not an email (resolveUsername rejects those)
+	}
+	return fmt.Errorf("valkeygcp: IAM username %q isn't valid for %s: use %q (or no username) or the principal's email", opt.Username, email, DefaultIAMUsername)
 }
 
 // credTypeFromJSON lets NewGCPTokenProvider call google.CredentialsFromJSONWithType instead of
