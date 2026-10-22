@@ -1,8 +1,11 @@
 package valkeygcp
 
 import (
+	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"sync"
 	"time"
 
 	"github.com/valkey-io/valkey-go"
@@ -19,8 +22,11 @@ type AuthEvent struct {
 	Address string
 	// Username is the AUTH username; "default" for the default user.
 	Username string
-	// Fingerprint is the first 12 hex digits of the token's SHA-256, so a rotation shows up
-	// as a new value. It is empty when no token is handed out (AUTH skipped, or Err set).
+	// Fingerprint is 12 hex digits of an HMAC-SHA256 of the token, so a rotation shows up as
+	// a new value. The HMAC key is random per process: unlike a plain hash, a logged
+	// fingerprint can't be used to check guesses of a weak token offline, and fingerprints
+	// only compare within one process. It is empty when no token is handed out (AUTH
+	// skipped, or Err set).
 	Fingerprint string
 	// RefreshAfter is when the next proactive re-AUTH is due; zero when none is scheduled.
 	RefreshAfter time.Time
@@ -50,9 +56,23 @@ func authEvent(c valkey.AuthCredentialsContext, user string, creds valkey.AuthCr
 		ev.Address = c.Address.String()
 	}
 	if creds.Password != "" {
-		sum := sha256.Sum256([]byte(creds.Password))
-		ev.Fingerprint = hex.EncodeToString(sum[:6])
+		ev.Fingerprint = fingerprint(creds.Password)
 	}
 	return ev
+}
+
+// fingerprintKey is the HMAC key behind AuthEvent.Fingerprint. It is made on first use and
+// never leaves the process.
+var fingerprintKey = sync.OnceValue(func() []byte {
+	key := make([]byte, sha256.Size)
+	rand.Read(key) // never returns an error; crypto/rand crashes the program instead
+	return key
+})
+
+// fingerprint returns the AuthEvent.Fingerprint of token.
+func fingerprint(token string) string {
+	mac := hmac.New(sha256.New, fingerprintKey())
+	mac.Write([]byte(token))
+	return hex.EncodeToString(mac.Sum(nil)[:6])
 }
 

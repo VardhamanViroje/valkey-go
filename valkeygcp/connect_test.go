@@ -254,11 +254,27 @@ func TestNewClient_OnAuthEvents(t *testing.T) {
 	if len(events) == 0 {
 		t.Fatal("no AuthEvent")
 	}
-	sum := sha256.Sum256([]byte("iam-token"))
 	ev := events[0]
-	if ev.Address != srv.addr() || ev.Username != DefaultIAMUsername || ev.Fingerprint != hex.EncodeToString(sum[:6]) ||
+	if ev.Address != srv.addr() || ev.Username != DefaultIAMUsername || ev.Fingerprint != fingerprint("iam-token") ||
 		ev.RefreshAfter.IsZero() || ev.Fallback || ev.Err != nil || !ev.Plaintext {
 		t.Fatalf("event = %+v", ev)
+	}
+}
+
+// U9: the fingerprint is keyed, so a logged value can't be used to check guesses of the
+// token offline the way its plain SHA-256 could; it still tells tokens apart.
+func TestFingerprint_Keyed(t *testing.T) {
+	fp := fingerprint("tok-1")
+	plain := sha256.Sum256([]byte("tok-1"))
+	switch {
+	case len(fp) != 12:
+		t.Fatalf("fingerprint %q: want 12 hex digits", fp)
+	case fp == hex.EncodeToString(plain[:6]):
+		t.Fatal("fingerprint is the token's plain SHA-256")
+	case fp != fingerprint("tok-1"):
+		t.Fatal("the same token got a different fingerprint")
+	case fp == fingerprint("tok-2"):
+		t.Fatal("a rotated token kept its fingerprint")
 	}
 }
 

@@ -3,8 +3,9 @@
 // fingerprint, from valkeygcp's OnAuth events, credential errors absorbed by the
 // last-known-good logic, per-node PINGs and a final machine-readable RESULT line.
 //
-// Run it on a VM in the instance's VPC network. Tokens are never printed, only the first 12
-// hex digits of their SHA-256, so a rotation shows up as a new fingerprint.
+// Run it on a VM in the instance's VPC network. Tokens are never printed, only 12 hex digits
+// of a fingerprint, so a rotation shows up as a new value: AUTH lines carry valkeygcp's
+// (hmac:, keyed per process), -mode=token the token's SHA-256 (sha256:).
 //
 //	livetest -mode=resolve -instance=projects/P/locations/R/instances/I
 //	livetest -mode=token   -impersonate-sa=sa@proj.iam.gserviceaccount.com
@@ -236,7 +237,7 @@ func logAuth(tag string) func(valkeygcp.AuthEvent) {
 		authOK.Add(1)
 		token := "none(AUTH-skipped)" // empty credentials: valkey-go skips AUTH
 		if ev.Fingerprint != "" {
-			token = "sha256:" + ev.Fingerprint
+			token = "hmac:" + ev.Fingerprint // valkeygcp's per-process keyed fingerprint
 		}
 		next := "none"
 		if !ev.RefreshAfter.IsZero() {
