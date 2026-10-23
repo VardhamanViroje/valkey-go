@@ -10,11 +10,12 @@ import (
 
 	memorystore "cloud.google.com/go/memorystore/apiv1"
 	"cloud.google.com/go/memorystore/apiv1/memorystorepb"
+	"github.com/valkey-io/valkey-go"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
 
-var errNoEndpoint = errors.New("valkeygcp: no endpoint: set Instance, DiscoveryEndpoint or PrimaryEndpoint")
+var errNoEndpoint = errors.New("valkeygcp: no endpoint: set ClientOption.InitAddress, or use WithInstance")
 
 // instanceReader is the minimal control-plane surface; tests inject a fake.
 type instanceReader interface {
@@ -140,26 +141,27 @@ func trimNetworkURL(n string) string {
 	return n
 }
 
-// resolve applies §1.5: explicit Config value, then the value discovered from the instance,
-// then a safe default. Contradictions between explicit values and the instance are errors.
-func resolve(ctx context.Context, cfg Config, newReader func(context.Context) (instanceReader, error)) (*resolved, error) {
+// resolve applies §1.5: the caller's ClientOption and Options, then the values discovered from
+// the instance, then a safe default. Contradictions between the caller's settings and the
+// instance are errors.
+func resolve(ctx context.Context, option valkey.ClientOption, cfg config, newReader func(context.Context) (instanceReader, error)) (*resolved, error) {
 	if err := checkEnums(cfg); err != nil {
 		return nil, err
 	}
-	if field := callerAuthField(cfg.ClientOption); field != "" && cfg.Auth.Mode != AuthAuto {
-		return nil, fmt.Errorf("valkeygcp: ClientOption.%s conflicts with Auth.Mode", field)
+	if field := callerAuthField(option); field != "" && (cfg.iam != nil || cfg.token != nil) {
+		return nil, fmt.Errorf("valkeygcp: ClientOption.%s conflicts with %s", field, authOptionName(cfg))
+	}
+	if cfg.network != "" && cfg.instance == "" {
+		return nil, errors.New("valkeygcp: WithNetwork needs WithInstance")
 	}
 	r := &resolved{
-		cfg:       cfg,
-		topology:  cfg.Topology,
-		auth:      cfg.Auth.Mode,
-		tls:       cfg.TLS.Mode,
-		discovery: cfg.DiscoveryEndpoint,
-		primary:   cfg.PrimaryEndpoint,
-		reader:    cfg.ReaderEndpoint,
+		opt:      option,
+		cfg:      cfg,
+		topology: cfg.topology,
+		tls:      cfg.tls.Mode,
 	}
 	var err error
-	if cfg.Instance != "" {
+	if cfg.instance != "" {
 		err = r.discover(ctx, newReader)
 	} else {
 		err = r.infer()
@@ -173,9 +175,20 @@ func resolve(ctx context.Context, cfg Config, newReader func(context.Context) (i
 	return r, nil
 }
 
+// authOptionName names the auth option set in cfg, for error messages.
+func authOptionName(cfg config) string {
+	switch {
+	case cfg.iam != nil && cfg.token != nil:
+		return "WithIAMOptions and WithTokenAuth"
+	case cfg.iam != nil:
+		return "WithIAMOptions"
+	}
+	return "WithTokenAuth"
+}
+
 // discover reads the instance and fills topology, modes, endpoints and the server CA.
 func (r *resolved) discover(ctx context.Context, newReader func(context.Context) (instanceReader, error)) error {
-	project, region, err := parseInstanceName(r.cfg.Instance)
+	project, region, err := parseInstanceName(r.cfg.instance)
 	if err != nil {
 		return err
 	}
@@ -185,9 +198,9 @@ func (r *resolved) discover(ctx context.Context, newReader func(context.Context)
 	}
 	defer func() { _ = rd.Close() }() // control plane is used for resolution only
 
-	inst, err := rd.GetInstance(ctx, r.cfg.Instance)
+	inst, err := rd.GetInstance(ctx, r.cfg.instance)
 	if err != nil {
-		return controlPlaneError("read instance "+r.cfg.Instance, err)
+		return controlPlaneError("read instance "+r.cfg.instance, err)
 	}
 	topology, err := topologyOf(inst)
 	if err != nil {
@@ -203,13 +216,10 @@ func (r *resolved) discover(ctx context.Context, newReader func(context.Context)
 	}
 
 	// Explicit values must agree with the instance: fail here, not later at HELLO.
-	if r.cfg.Topology != TopologyAuto && r.cfg.Topology != topology {
-		return fmt.Errorf("valkeygcp: instance mode is %v but Topology is %v", inst.GetMode(), r.cfg.Topology)
+	if r.cfg.topology != TopologyAuto && r.cfg.topology != topology {
+		return fmt.Errorf("valkeygcp: instance mode is %v but WithTopology is %v", inst.GetMode(), r.cfg.topology)
 	}
-	if r.cfg.Auth.Mode != AuthAuto && r.cfg.Auth.Mode != auth {
-		return fmt.Errorf("valkeygcp: instance uses %v but Auth.Mode is %v", inst.GetAuthorizationMode(), r.cfg.Auth.Mode)
-	}
-	if err := checkTLSMode(r.cfg, inst, tlsMode); err != nil {
+	if err := checkTLSMode(r.opt, r.cfg.tls, inst, tlsMode); err != nil {
 		return err
 	}
 	r.topology, r.auth = topology, auth
@@ -218,29 +228,23 @@ func (r *resolved) discover(ctx context.Context, newReader func(context.Context)
 	}
 
 	eps := pscEndpoints(inst)
-	hasInit := len(r.cfg.ClientOption.InitAddress) > 0
+	hasInit := len(r.opt.InitAddress) > 0
 	switch topology {
 	case TopologyCluster:
-		if r.discovery == "" {
-			r.discovery = pickEndpoint(eps, memorystorepb.ConnectionType_CONNECTION_TYPE_DISCOVERY, r.cfg.Network)
-		}
+		r.discovery = pickEndpoint(eps, memorystorepb.ConnectionType_CONNECTION_TYPE_DISCOVERY, r.cfg.network)
 		if r.discovery == "" && !hasInit {
 			return r.errMissing(memorystorepb.ConnectionType_CONNECTION_TYPE_DISCOVERY)
 		}
 	case TopologyClusterDisabled:
-		if r.primary == "" {
-			r.primary = pickEndpoint(eps, memorystorepb.ConnectionType_CONNECTION_TYPE_PRIMARY, r.cfg.Network)
-		}
-		if r.reader == "" {
-			r.reader = pickEndpoint(eps, memorystorepb.ConnectionType_CONNECTION_TYPE_READER, r.cfg.Network)
-		}
+		r.primary = pickEndpoint(eps, memorystorepb.ConnectionType_CONNECTION_TYPE_PRIMARY, r.cfg.network)
+		r.reader = pickEndpoint(eps, memorystorepb.ConnectionType_CONNECTION_TYPE_READER, r.cfg.network)
 		if r.primary == "" && !hasInit {
 			return r.errMissing(memorystorepb.ConnectionType_CONNECTION_TYPE_PRIMARY)
 		}
 	}
 
 	// Download the server CA only when it will be used.
-	if r.cfg.ClientOption.TLSConfig != nil || hasCAMaterial(r.cfg.TLS) {
+	if r.opt.TLSConfig != nil || hasCAMaterial(r.cfg.tls) {
 		return nil
 	}
 	if r.tls == TLSCustomCA {
@@ -248,31 +252,31 @@ func (r *resolved) discover(ctx context.Context, newReader func(context.Context)
 	}
 	switch r.tls {
 	case TLSPerInstanceCA:
-		r.caPEMs, err = rd.PerInstanceCA(ctx, r.cfg.Instance)
+		r.caPEMs, err = rd.PerInstanceCA(ctx, r.cfg.instance)
 	case TLSSharedCA:
 		r.caPEMs, err = rd.SharedRegionalCA(ctx, project, region)
 	default: // TLSDisabled
 		return nil
 	}
 	if err != nil {
-		return controlPlaneError("download the server CA for "+r.cfg.Instance, err)
+		return controlPlaneError("download the server CA for "+r.cfg.instance, err)
 	}
 	if len(r.caPEMs) == 0 {
-		return fmt.Errorf("valkeygcp: the Memorystore API returned no server CA certificate for %s", r.cfg.Instance)
+		return fmt.Errorf("valkeygcp: the Memorystore API returned no server CA certificate for %s", r.cfg.instance)
 	}
 	return nil
 }
 
 // fetchCustomCA gets a CUSTOMER_MANAGED_CAS_CA instance's server CA from its CA Service pool
-// through TLS.FetchCustomCA (U11). Without the hook, validate reports the missing CA.
+// through TLSOptions.FetchCustomCA (U11). Without the hook, validate reports the missing CA.
 func (r *resolved) fetchCustomCA(ctx context.Context, inst *memorystorepb.Instance) error {
-	fetch := r.cfg.TLS.FetchCustomCA
+	fetch := r.cfg.tls.FetchCustomCA
 	if fetch == nil || inst.GetServerCaMode() != memorystorepb.Instance_CUSTOMER_MANAGED_CAS_CA {
 		return nil
 	}
 	pool := inst.GetServerCaPool()
 	if pool == "" {
-		return fmt.Errorf("valkeygcp: instance %s uses CUSTOMER_MANAGED_CAS_CA but reports no server_ca_pool", r.cfg.Instance)
+		return fmt.Errorf("valkeygcp: instance %s uses CUSTOMER_MANAGED_CAS_CA but reports no server_ca_pool", r.cfg.instance)
 	}
 	pems, err := fetch(ctx, pool)
 	if err != nil {
@@ -285,34 +289,23 @@ func (r *resolved) fetchCustomCA(ctx context.Context, inst *memorystorepb.Instan
 	return nil
 }
 
-// infer settles the Auto values without an instance, from the options that are set.
+// infer settles the Auto values without an instance, from the options that are set. The
+// topology stays TopologyAuto unless WithTopology sets it: valkey-go detects it when it
+// connects.
 func (r *resolved) infer() error {
-	if r.topology == TopologyAuto {
-		switch {
-		case r.discovery != "" && r.primary != "":
-			return errors.New("valkeygcp: both DiscoveryEndpoint and PrimaryEndpoint are set; set Topology")
-		case r.discovery != "":
-			r.topology = TopologyCluster
-		case r.primary != "":
-			r.topology = TopologyClusterDisabled
-		}
-	}
-	if r.auth == AuthAuto && callerAuthField(r.cfg.ClientOption) == "" {
-		tok, iam := r.cfg.Auth.Token.hasSource(), r.cfg.Auth.IAM.hasIdentity()
-		switch {
-		case tok && iam:
-			return errors.New("valkeygcp: both Auth.Token and Auth.IAM are configured; set Auth.Mode")
-		case tok:
-			r.auth = AuthToken
-		case iam:
-			r.auth = AuthIAM
-		default:
-			r.auth = AuthDisabled
-		}
+	switch {
+	case r.cfg.iam != nil && r.cfg.token != nil:
+		return errors.New("valkeygcp: both WithIAMOptions and WithTokenAuth are set; without WithInstance, pass only one")
+	case r.cfg.iam != nil:
+		r.auth = authIAM
+	case r.cfg.token != nil:
+		r.auth = authToken
+	default:
+		r.auth = authDisabled
 	}
 	if r.tls == TLSAuto {
 		r.tls = TLSDisabled
-		if t := r.cfg.TLS; len(t.CAPEM) > 0 || t.CAFile != "" || t.Base != nil || t.ServerName != "" {
+		if t := r.cfg.tls; len(t.CAPEM) > 0 || t.CAFile != "" || t.Base != nil || t.ServerName != "" {
 			r.tls = TLSCustomCA
 		}
 	}
@@ -321,66 +314,60 @@ func (r *resolved) infer() error {
 
 // validate checks the settled values before anything is dialed or created.
 func (r *resolved) validate() error {
-	hasInit := len(r.cfg.ClientOption.InitAddress) > 0
+	hasInit := len(r.opt.InitAddress) > 0
 	switch r.topology {
 	case TopologyCluster:
-		if r.cfg.PrimaryEndpoint != "" || r.cfg.ReaderEndpoint != "" {
-			return errors.New("valkeygcp: PrimaryEndpoint and ReaderEndpoint are for cluster-disabled instances, but the topology is cluster")
+		if len(r.opt.Standalone.ReplicaAddress) > 0 {
+			return errors.New("valkeygcp: ClientOption.Standalone.ReplicaAddress is for cluster-disabled instances, but the topology is cluster")
 		}
 		if r.discovery == "" && !hasInit {
 			return errNoEndpoint
 		}
 	case TopologyClusterDisabled:
-		if r.cfg.DiscoveryEndpoint != "" {
-			return errors.New("valkeygcp: DiscoveryEndpoint is for cluster-mode instances, but the topology is cluster-disabled")
-		}
 		if r.primary == "" && !hasInit {
 			return errNoEndpoint
 		}
-	default: // only ClientOption.InitAddress can stand in for an endpoint
-		if r.reader != "" {
-			return errors.New("valkeygcp: ReaderEndpoint needs PrimaryEndpoint")
-		}
+	default: // no instance: only ClientOption.InitAddress can name the endpoint
 		if !hasInit {
 			return errNoEndpoint
 		}
 	}
-	callerAuth := callerAuthField(r.cfg.ClientOption) != ""
-	if r.auth == AuthToken && !callerAuth && !r.cfg.Auth.Token.hasSource() {
+	callerAuth := callerAuthField(r.opt) != ""
+	if r.auth == authToken && !callerAuth && (r.cfg.token == nil || !r.cfg.token.hasSource()) {
 		return errNoTokenSource
 	}
-	if r.tls != TLSDisabled && r.cfg.ClientOption.TLSConfig == nil && len(r.caPEMs) == 0 && !hasCAMaterial(r.cfg.TLS) {
+	if r.tls != TLSDisabled && r.opt.TLSConfig == nil && len(r.caPEMs) == 0 && !hasCAMaterial(r.cfg.tls) {
 		return errNeedsCA(r.tls)
 	}
 	return r.checkPlaintextCredentials(callerAuth)
 }
 
-// checkPlaintextCredentials refuses to send IAM or Token Auth credentials without TLS on the
-// explicit path unless the caller turned TLS off on purpose (U10): TLSAuto infers
+// checkPlaintextCredentials refuses to send IAM or Token Auth credentials without TLS when
+// there is no instance, unless the caller turned TLS off on purpose (U10): TLSAuto infers
 // TLSDisabled when no CA option is set, and the AUTH command then crosses the network in
-// plaintext, even to an instance that only accepts TLS. With Config.Instance the instance's
+// plaintext, even to an instance that only accepts TLS. With WithInstance the instance's
 // in-transit encryption setting decides.
 func (r *resolved) checkPlaintextCredentials(callerAuth bool) error {
-	if r.cfg.Instance != "" || callerAuth || r.tls != TLSDisabled || r.cfg.TLS.Mode == TLSDisabled || r.cfg.ClientOption.TLSConfig != nil {
+	if r.cfg.instance != "" || callerAuth || r.tls != TLSDisabled || r.cfg.tls.Mode == TLSDisabled || r.opt.TLSConfig != nil {
 		return nil
 	}
 	var what string
 	switch r.auth {
-	case AuthIAM:
+	case authIAM:
 		what = "IAM access tokens"
-	case AuthToken:
+	case authToken:
 		what = "Token Auth tokens"
 	default:
 		return nil
 	}
-	return fmt.Errorf("valkeygcp: refusing to send %s without TLS: set TLS.CAFile or TLS.CAPEM to the instance's server CA, or set TLS.Mode = TLSDisabled if the instance has in-transit encryption disabled", what)
+	return fmt.Errorf("valkeygcp: refusing to send %s without TLS: pass WithTLS with the instance's server CA (TLSOptions.CAFile or CAPEM) or set ClientOption.TLSConfig, or pass WithTLS(TLSOptions{Mode: TLSDisabled}) if the instance has in-transit encryption disabled", what)
 }
 
 func (r *resolved) errMissing(typ memorystorepb.ConnectionType) error {
-	if r.cfg.Network != "" {
-		return fmt.Errorf("valkeygcp: instance %s has no %v endpoint in network %q", r.cfg.Instance, typ, r.cfg.Network)
+	if r.cfg.network != "" {
+		return fmt.Errorf("valkeygcp: instance %s has no %v endpoint in network %q", r.cfg.instance, typ, r.cfg.network)
 	}
-	return fmt.Errorf("valkeygcp: instance %s has no %v endpoint yet (is its PSC connection created?)", r.cfg.Instance, typ)
+	return fmt.Errorf("valkeygcp: instance %s has no %v endpoint yet (is its PSC connection created?)", r.cfg.instance, typ)
 }
 
 func topologyOf(inst *memorystorepb.Instance) (Topology, error) {
@@ -397,16 +384,16 @@ func topologyOf(inst *memorystorepb.Instance) (Topology, error) {
 	}
 }
 
-func authModeOf(inst *memorystorepb.Instance) (AuthMode, error) {
+func authModeOf(inst *memorystorepb.Instance) (authMode, error) {
 	switch m := inst.GetAuthorizationMode(); m {
 	case memorystorepb.Instance_AUTH_DISABLED, memorystorepb.Instance_AUTHORIZATION_MODE_UNSPECIFIED:
-		return AuthDisabled, nil
+		return authDisabled, nil
 	case memorystorepb.Instance_IAM_AUTH:
-		return AuthIAM, nil
+		return authIAM, nil
 	case memorystorepb.Instance_TOKEN_AUTH:
-		return AuthToken, nil
+		return authToken, nil
 	default:
-		return AuthAuto, fmt.Errorf("valkeygcp: unsupported authorization mode %v", m)
+		return authAuto, fmt.Errorf("valkeygcp: unsupported authorization mode %v", m)
 	}
 }
 
@@ -431,11 +418,11 @@ func tlsModeOf(inst *memorystorepb.Instance) (TLSMode, error) {
 	}
 }
 
-// checkTLSMode reports an explicit TLS setting that contradicts the instance.
-func checkTLSMode(cfg Config, inst *memorystorepb.Instance, discovered TLSMode) error {
-	explicit := cfg.TLS.Mode
+// checkTLSMode reports a caller TLS setting that contradicts the instance.
+func checkTLSMode(opt valkey.ClientOption, t TLSOptions, inst *memorystorepb.Instance, discovered TLSMode) error {
+	explicit := t.Mode
 	switch {
-	case discovered == TLSDisabled && cfg.ClientOption.TLSConfig != nil:
+	case discovered == TLSDisabled && opt.TLSConfig != nil:
 		return errors.New("valkeygcp: instance has in-transit encryption disabled, but ClientOption.TLSConfig is set")
 	case explicit == TLSAuto || explicit == discovered:
 		return nil
@@ -446,18 +433,15 @@ func checkTLSMode(cfg Config, inst *memorystorepb.Instance, discovered TLSMode) 
 	if inst.GetTransitEncryptionMode() == memorystorepb.Instance_SERVER_AUTHENTICATION {
 		desc += " with " + inst.GetServerCaMode().String()
 	}
-	return fmt.Errorf("valkeygcp: instance uses %s but TLS.Mode is %v", desc, explicit)
+	return fmt.Errorf("valkeygcp: instance uses %s but WithTLS sets Mode %v", desc, explicit)
 }
 
-func checkEnums(cfg Config) error {
-	if cfg.Auth.Mode < AuthAuto || cfg.Auth.Mode > AuthToken {
-		return fmt.Errorf("valkeygcp: unknown Auth.Mode %v", cfg.Auth.Mode)
+func checkEnums(cfg config) error {
+	if cfg.tls.Mode < TLSAuto || cfg.tls.Mode > TLSCustomCA {
+		return fmt.Errorf("valkeygcp: unknown TLSOptions.Mode %v", cfg.tls.Mode)
 	}
-	if cfg.TLS.Mode < TLSAuto || cfg.TLS.Mode > TLSCustomCA {
-		return fmt.Errorf("valkeygcp: unknown TLS.Mode %v", cfg.TLS.Mode)
-	}
-	if cfg.Topology < TopologyAuto || cfg.Topology > TopologyClusterDisabled {
-		return fmt.Errorf("valkeygcp: unknown Topology %v", cfg.Topology)
+	if cfg.topology < TopologyAuto || cfg.topology > TopologyClusterDisabled {
+		return fmt.Errorf("valkeygcp: unknown Topology %v", cfg.topology)
 	}
 	return nil
 }
@@ -466,7 +450,7 @@ func checkEnums(cfg Config) error {
 func controlPlaneError(action string, err error) error {
 	switch status.Code(err) {
 	case codes.PermissionDenied, codes.Unauthenticated:
-		return fmt.Errorf("valkeygcp: %s: needs memorystore.instances.get (roles/memorystore.viewer), or set explicit endpoints and modes without Instance: %w", action, err)
+		return fmt.Errorf("valkeygcp: %s: needs memorystore.instances.get (roles/memorystore.viewer), or connect without WithInstance: set ClientOption.InitAddress and the auth and TLS options yourself: %w", action, err)
 	}
 	return fmt.Errorf("valkeygcp: %s: %w", action, err)
 }

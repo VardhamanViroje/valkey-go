@@ -8,40 +8,22 @@ import (
 	"github.com/valkey-io/valkey-go"
 )
 
-// AuthMode mirrors memorystore.v1.Instance.AuthorizationMode.
-type AuthMode int
+// authMode mirrors memorystore.v1.Instance.AuthorizationMode.
+type authMode int
 
-// AuthMode values. Each mode except AuthAuto matches one Instance.AuthorizationMode.
 const (
-	// AuthAuto takes the mode from the instance when Config.Instance is set. Otherwise it is
-	// inferred from the options: AuthToken when a token source is set, AuthIAM when an IAM
-	// identity option is set, AuthDisabled when neither is.
-	AuthAuto     AuthMode = iota
-	AuthDisabled          // AUTH_DISABLED
-	AuthIAM               // IAM_AUTH
-	AuthToken             // TOKEN_AUTH
+	authAuto     authMode = iota // not settled yet
+	authDisabled                 // AUTH_DISABLED
+	authIAM                      // IAM_AUTH
+	authToken                    // TOKEN_AUTH
 )
-
-func (m AuthMode) String() string {
-	switch m {
-	case AuthAuto:
-		return "AuthAuto"
-	case AuthDisabled:
-		return "AuthDisabled"
-	case AuthIAM:
-		return "AuthIAM"
-	case AuthToken:
-		return "AuthToken"
-	}
-	return "AuthMode(" + strconv.Itoa(int(m)) + ")"
-}
 
 // TLSMode mirrors transit_encryption_mode + server_ca_mode.
 type TLSMode int
 
 // TLSMode values. Each mode except TLSAuto matches a transit encryption and server CA mode.
 const (
-	// TLSAuto takes the mode from the instance when Config.Instance is set. Otherwise it is
+	// TLSAuto takes the mode from the instance with WithInstance. Otherwise it is
 	// TLSCustomCA when TLS options are set (CAPEM, CAFile, Base or ServerName), else TLSDisabled.
 	TLSAuto          TLSMode = iota
 	TLSDisabled              // TRANSIT_ENCRYPTION_DISABLED
@@ -71,11 +53,11 @@ type Topology int
 
 // Topology values. Each topology except TopologyAuto matches one Instance.Mode.
 const (
-	// TopologyAuto takes the topology from the instance when Config.Instance is set,
-	// otherwise from the endpoint that is set.
+	// TopologyAuto takes the topology from the instance with WithInstance; otherwise
+	// valkey-go detects it when it connects.
 	TopologyAuto            Topology = iota
-	TopologyCluster                  // CLUSTER: discovery endpoint
-	TopologyClusterDisabled          // CLUSTER_DISABLED: primary (+ reader) endpoint
+	TopologyCluster                  // CLUSTER: InitAddress is the discovery endpoint
+	TopologyClusterDisabled          // CLUSTER_DISABLED: InitAddress is the primary endpoint
 )
 
 func (t Topology) String() string {
@@ -90,48 +72,7 @@ func (t Topology) String() string {
 	return "Topology(" + strconv.Itoa(int(t)) + ")"
 }
 
-// Config is the single top-level entry point for every GCP auth mechanism.
-type Config struct {
-	// Instance is "projects/P/locations/R/instances/I". When set, NewClient reads the
-	// instance (memorystore.instances.get) and fills every *Auto field and endpoint.
-	// The instance's auth mode then decides which of Auth.IAM / Auth.Token is used, so one
-	// Config can carry both for different environments.
-	Instance string
-	// Network selects the PSC endpoint group when the instance is reachable from several
-	// VPCs ("projects/P/global/networks/N", or just N). Optional.
-	Network string
-
-	// Explicit endpoints: no control-plane call needed. With Instance set they override the
-	// discovered endpoints.
-	DiscoveryEndpoint string // cluster mode
-	PrimaryEndpoint   string // cluster-disabled
-	ReaderEndpoint    string // cluster-disabled, optional
-	Topology          Topology
-
-	Auth AuthOptions
-	TLS  TLSOptions
-
-	// ClientOption is copied first; valkeygcp only fills fields left at their zero value.
-	// Credentials set here (AuthCredentialsFn or Password) or a TLSConfig are used as is.
-	ClientOption valkey.ClientOption
-}
-
-// AuthOptions selects and configures the authentication mechanism.
-type AuthOptions struct {
-	Mode  AuthMode
-	IAM   IAMAuthOptions   // IAM_AUTH
-	Token TokenAuthOptions // TOKEN_AUTH
-	// OnCredentialError receives token/secret fetch errors absorbed by the
-	// last-known-good logic (U6), for logs and metrics. It is copied into IAM and Token
-	// when they leave their own OnCredentialError nil.
-	OnCredentialError func(error)
-	// OnAuth receives an AuthEvent each time credentials are handed to valkey-go: on every
-	// new connection and at every proactive re-AUTH (U9). It must return quickly. It is
-	// copied into IAM and Token when they leave their own OnAuth nil.
-	OnAuth func(AuthEvent)
-}
-
-// TLSOptions configures in-transit encryption.
+// TLSOptions configures in-transit encryption (WithTLS).
 type TLSOptions struct {
 	Mode       TLSMode
 	CAPEM      []byte      // TLSCustomCA, or an offline bundle for any mode
@@ -140,22 +81,56 @@ type TLSOptions struct {
 	Base       *tls.Config // optional base (cloned, never mutated)
 	// FetchCustomCA fetches the server CA certificates (PEM) of a CUSTOMER_MANAGED_CAS_CA
 	// instance from its Certificate Authority Service pool, which the Memorystore API can't
-	// return (U11). NewClient calls it with the instance's server_ca_pool when
-	// Config.Instance is set and no CA material is. cas.FetchPoolCAs, in package
+	// return (U11). NewClient calls it with the instance's server_ca_pool when WithInstance
+	// is used and no CA material is set. cas.FetchPoolCAs, in package
 	// github.com/valkey-io/valkey-go/valkeygcp/cas, implements it.
 	FetchCustomCA func(ctx context.Context, caPool string) ([]string, error)
+}
+
+// WithInstance makes NewClient read the instance "projects/P/locations/R/instances/I"
+// (memorystore.instances.get, roles/memorystore.viewer) and take from it what the
+// valkey.ClientOption leaves empty: the endpoint (InitAddress), the reader endpoint of a
+// cluster-disabled instance (Standalone.ReplicaAddress) and the server CA (TLSConfig). The
+// instance's cluster mode, auth mode and TLS mode are used too: the auth mode decides which of
+// WithIAMOptions and WithTokenAuth is used, so one call can carry both for different
+// environments, and an IAM_AUTH instance uses Application Default Credentials when
+// WithIAMOptions isn't given. The Memorystore API is only used while NewClient runs.
+func WithInstance(name string) Option {
+	return func(c *config) { c.instance = name }
+}
+
+// WithNetwork selects the PSC endpoint group of one VPC network ("projects/P/global/networks/N",
+// or just N) when the instance is reachable from several networks. It needs WithInstance.
+func WithNetwork(network string) Option {
+	return func(c *config) { c.network = network }
+}
+
+// WithTopology states the instance's cluster mode. With WithInstance it must match the
+// instance. TopologyCluster makes NewClient fail instead of returning a single-node client
+// when valkey-go can't use cluster mode (U7), for example because an ACL rule doesn't allow
+// CLUSTER SHARDS; WithInstance does the same for cluster-mode instances.
+// TopologyClusterDisabled leaves out the cluster defaults.
+func WithTopology(t Topology) Option {
+	return func(c *config) { c.topology = t }
+}
+
+// OnAuth receives an AuthEvent each time credentials are handed to valkey-go: on every new
+// connection and at every proactive re-AUTH (U9). It must return quickly. It is used for IAM
+// and Token Auth when IAMAuthOptions.OnAuth or TokenAuthOptions.OnAuth is nil.
+func OnAuth(fn func(AuthEvent)) Option {
+	return func(c *config) { c.onAuth = fn }
+}
+
+// OnCredentialError receives token and secret fetch errors absorbed by the last-known-good
+// logic (U6), for logs and metrics. It is used for IAM and Token Auth when
+// IAMAuthOptions.OnCredentialError or TokenAuthOptions.OnCredentialError is nil.
+func OnCredentialError(fn func(error)) Option {
+	return func(c *config) { c.onCredentialError = fn }
 }
 
 // hasSource reports whether a Token Auth token source is set.
 func (o TokenAuthOptions) hasSource() bool {
 	return o.Source != nil || o.SecretVersion != "" || o.Token != ""
-}
-
-// hasIdentity reports whether an IAM identity option is set (AuthAuto inference). Tuning
-// knobs such as RefreshBuffer or Scopes don't count: plain ADC needs Auth.Mode = AuthIAM.
-func (o IAMAuthOptions) hasIdentity() bool {
-	return o.CustomTokenSource != nil || len(o.CredentialsJSON) > 0 || o.ImpersonateSA != "" ||
-		o.Username != "" || o.UsernameStrategy != UsernameDefault
 }
 
 // hasCAMaterial reports whether the caller supplied CA certificates.
@@ -164,7 +139,7 @@ func hasCAMaterial(o TLSOptions) bool {
 }
 
 // callerAuthField names the ClientOption credential field the caller set, if any.
-// Caller-managed credentials are used as is (with AuthAuto) or rejected (with Auth.Mode).
+// Caller-managed credentials are used as is; an auth option next to them is an error.
 func callerAuthField(o valkey.ClientOption) string {
 	switch {
 	case o.AuthCredentialsFn != nil:
@@ -175,72 +150,49 @@ func callerAuthField(o valkey.ClientOption) string {
 	return ""
 }
 
-// NewClient resolves cfg (§1.5) and returns a ready valkey.Client.
-//
-// ctx bounds discovery, credential setup and connecting. valkey-go connects and
-// authenticates while it builds the client, so setup needs working credentials; Memorystore
-// IAM backend errors are retried with backoff until ctx ends (at most 15s when it has no
-// earlier deadline). Token refreshes never use ctx.
-func NewClient(ctx context.Context, cfg Config) (valkey.Client, error) {
-	r, err := resolve(ctx, cfg, defaultInstanceReader) // §4.8
-	if err != nil {
-		return nil, err
-	}
-	opt, err := r.clientOption(ctx)
-	if err != nil {
-		return nil, err
-	}
-	return connect(ctx, opt, r.topology == TopologyCluster, r.authUser)
-}
-
-// ResolveClientOption returns the fully wired valkey.ClientOption without dialing,
-// for callers who want to inspect or adjust it before valkey.NewClient.
-func ResolveClientOption(ctx context.Context, cfg Config) (valkey.ClientOption, error) {
-	r, err := resolve(ctx, cfg, defaultInstanceReader) // §4.8
-	if err != nil {
-		return valkey.ClientOption{}, err
-	}
-	return r.clientOption(ctx)
-}
-
-// resolved is a Config with every Auto value and endpoint settled by resolve.
+// resolved is the caller's ClientOption and Options with every Auto value and instance
+// endpoint settled by resolve.
 type resolved struct {
-	cfg       Config
-	topology  Topology // TopologyAuto only when the caller supplied ClientOption.InitAddress
-	auth      AuthMode
+	opt       valkey.ClientOption // the caller's option; clientOption fills its zero fields
+	cfg       config
+	topology  Topology // TopologyAuto when neither the instance nor WithTopology tells
+	auth      authMode
 	tls       TLSMode
-	discovery string
-	primary   string
-	reader    string
+	discovery string   // discovery endpoint read from a cluster-mode instance
+	primary   string   // primary endpoint read from a cluster-disabled instance
+	reader    string   // reader endpoint read from a cluster-disabled instance, if any
 	caPEMs    []string // server CA certificates downloaded from the Memorystore API
 	authUser  string   // AUTH username wired by clientOption, for error messages
 }
 
-// clientOption builds the valkey.ClientOption, filling only zero-valued fields of
-// cfg.ClientOption (§4.7).
+// clientOption builds the valkey.ClientOption, filling only zero-valued fields of the
+// caller's option (§4.7).
 func (r *resolved) clientOption(ctx context.Context) (valkey.ClientOption, error) {
-	opt := r.cfg.ClientOption
-	switch r.topology {
-	case TopologyCluster:
-		if len(opt.InitAddress) == 0 {
+	opt := r.opt
+	if len(opt.InitAddress) == 0 { // validate let this through only with an instance endpoint
+		switch r.topology {
+		case TopologyCluster:
 			opt.InitAddress = []string{r.discovery}
+		case TopologyClusterDisabled:
+			opt.InitAddress = []string{r.primary}
 		}
-		// Same defaults as NewClusterClient.
-		opt.ClusterOption.PreferInitAddressRefresh = true
+	}
+	// The reader endpoint can't be combined with EnableRedirect (valkey.NewClient rejects it).
+	if r.reader != "" && len(opt.Standalone.ReplicaAddress) == 0 && !opt.Standalone.EnableRedirect {
+		opt.Standalone.ReplicaAddress = []string{r.reader}
+	}
+	if len(opt.Standalone.ReplicaAddress) > 0 {
+		if opt.SendToReplicas == nil {
+			opt.SendToReplicas = sendReadsToReplicas
+		}
+	} else if r.topology != TopologyClusterDisabled {
+		// Cluster mode, or not known before connecting. valkey-go reads these only in its
+		// cluster client, so they are harmless when it falls back to a single-node client.
+		// A false bool can't be told apart from an unset one, so the bools are always on.
+		opt.ClusterOption.PreferInitAddressRefresh = true // topology only through InitAddress
 		opt.ClusterOption.PreferClusterShards = true
 		if opt.ClusterOption.ShardsRefreshInterval == 0 {
 			opt.ClusterOption.ShardsRefreshInterval = defaultShardsRefreshInterval
-		}
-	case TopologyClusterDisabled:
-		if len(opt.InitAddress) == 0 {
-			opt.InitAddress = []string{r.primary}
-		}
-		// The reader endpoint can't be combined with EnableRedirect (valkey.NewClient rejects it).
-		if r.reader != "" && len(opt.Standalone.ReplicaAddress) == 0 && !opt.Standalone.EnableRedirect {
-			opt.Standalone.ReplicaAddress = []string{r.reader}
-		}
-		if len(opt.Standalone.ReplicaAddress) > 0 && opt.SendToReplicas == nil {
-			opt.SendToReplicas = sendReadsToReplicas
 		}
 	}
 	if opt.Dialer.Timeout == 0 {
@@ -258,7 +210,7 @@ func (r *resolved) clientOption(ctx context.Context) (valkey.ClientOption, error
 
 	// TLS before auth: it can fail, and the auth providers may hold resources.
 	if opt.TLSConfig == nil {
-		cfg, err := buildTLSConfig(r.cfg.TLS, r.tls, r.caPEMs)
+		cfg, err := buildTLSConfig(r.cfg.tls, r.tls, r.caPEMs)
 		if err != nil {
 			return valkey.ClientOption{}, err
 		}
@@ -268,13 +220,16 @@ func (r *resolved) clientOption(ctx context.Context) (valkey.ClientOption, error
 	if opt.AuthCredentialsFn == nil && opt.Password == "" {
 		plaintext := opt.TLSConfig == nil // reported in AuthEvent.Plaintext (U10)
 		switch r.auth {
-		case AuthIAM:
-			iam := r.cfg.Auth.IAM
+		case authIAM:
+			var iam IAMAuthOptions // an IAM_AUTH instance without WithIAMOptions uses ADC
+			if r.cfg.iam != nil {
+				iam = *r.cfg.iam
+			}
 			if iam.OnCredentialError == nil {
-				iam.OnCredentialError = r.cfg.Auth.OnCredentialError
+				iam.OnCredentialError = r.cfg.onCredentialError
 			}
 			if iam.OnAuth == nil {
-				iam.OnAuth = r.cfg.Auth.OnAuth
+				iam.OnAuth = r.cfg.onAuth
 			}
 			p, err := NewGCPTokenProvider(ctx, iam)
 			if err != nil {
@@ -285,13 +240,13 @@ func (r *resolved) clientOption(ctx context.Context) (valkey.ClientOption, error
 			}
 			opt.AuthCredentialsFn = p.AuthCredentialsFn()
 			installDialGate(&opt) // U8: space out re-dials after ERR_IAM_*
-		case AuthToken:
-			tok := r.cfg.Auth.Token
+		case authToken:
+			tok := *r.cfg.token // validate checked that WithTokenAuth set a source
 			if tok.OnCredentialError == nil {
-				tok.OnCredentialError = r.cfg.Auth.OnCredentialError
+				tok.OnCredentialError = r.cfg.onCredentialError
 			}
 			if tok.OnAuth == nil {
-				tok.OnAuth = r.cfg.Auth.OnAuth
+				tok.OnAuth = r.cfg.onAuth
 			}
 			p, err := newTokenAuthProvider(ctx, tok)
 			if err != nil {

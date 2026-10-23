@@ -3,10 +3,10 @@
 // Memorystore API can't return those certificates, so plug FetchPoolCAs into
 // valkeygcp.TLSOptions.FetchCustomCA:
 //
-//	client, err := valkeygcp.NewClient(ctx, valkeygcp.Config{
-//		Instance: "projects/P/locations/R/instances/I",
-//		TLS:      valkeygcp.TLSOptions{FetchCustomCA: cas.FetchPoolCAs},
-//	})
+//	client, err := valkeygcp.NewClient(ctx, valkey.ClientOption{},
+//		valkeygcp.WithInstance("projects/P/locations/R/instances/I"),
+//		valkeygcp.WithTLS(valkeygcp.TLSOptions{FetchCustomCA: cas.FetchPoolCAs}),
+//	)
 //
 // It is a separate package so that only programs that use it link the CA Service client.
 package cas

@@ -2,20 +2,41 @@ package valkeygcp
 
 import (
 	"context"
-	"net"
 	"time"
 
 	"github.com/valkey-io/valkey-go"
 )
 
-// GCPOption configures the valkey.ClientOption built by NewClusterClient and
-// NewStandaloneClient. ctx is the constructor's context: options that call Google APIs while
-// the client is set up (credential discovery, impersonation, the first Token Auth read) stop
-// when it is cancelled or its deadline passes. Token refreshes never use it, because they run
-// for the life of the client.
-type GCPOption func(ctx context.Context, opt *valkey.ClientOption) error
+// Option configures what NewClient and ResolveClientOption add to a valkey.ClientOption:
+// Memorystore discovery (WithInstance), IAM or Token Auth credentials (WithIAMOptions,
+// WithDefaultIAM, WithTokenAuth) and TLS from CA material (WithTLS). Settings valkey-go
+// already has a field for, such as addresses, TLSConfig and timeouts, are set on the
+// valkey.ClientOption itself. Later options override earlier ones of the same kind.
+type Option func(*config)
 
-// Connection defaults shared by the constructors and NewClient.
+// config collects the Options of one NewClient or ResolveClientOption call.
+type config struct {
+	instance          string            // WithInstance
+	network           string            // WithNetwork
+	topology          Topology          // WithTopology
+	iam               *IAMAuthOptions   // WithIAMOptions, WithDefaultIAM; nil when not given
+	token             *TokenAuthOptions // WithTokenAuth; nil when not given
+	tls               TLSOptions        // WithTLS
+	onAuth            func(AuthEvent)   // OnAuth
+	onCredentialError func(error)       // OnCredentialError
+}
+
+func newConfig(opts []Option) config {
+	var c config
+	for _, o := range opts {
+		if o != nil {
+			o(&c)
+		}
+	}
+	return c
+}
+
+// Connection defaults NewClient fills into the valkey.ClientOption fields left at zero.
 const (
 	defaultDialTimeout           = 2 * time.Second
 	defaultKeepAlive             = 1 * time.Second
@@ -26,61 +47,39 @@ const (
 	setupTimeout = 15 * time.Second
 )
 
-// NewClusterClient creates a Memorystore Cluster Mode client with discovery pinning,
-// fast failover reconnection, and optional IAM authentication.
+// NewClient returns a valkey.Client for Memorystore for Valkey. It takes the same
+// valkey.ClientOption as valkey.NewClient: InitAddress holds the discovery endpoint (cluster
+// mode) or the primary endpoint (cluster mode disabled), and Standalone.ReplicaAddress the
+// reader endpoint, if any. NewClient fills the Memorystore defaults into the fields left at
+// their zero value, adds what opts ask for, and connects.
 //
-// ctx bounds the setup done by opts (see GCPOption) and connecting. valkey-go connects and
+// ctx bounds discovery, credential setup and connecting. valkey-go connects and
 // authenticates while it builds the client, so setup needs working credentials; Memorystore
 // IAM backend errors are retried with backoff until ctx ends (at most 15s when it has no
-// earlier deadline).
-func NewClusterClient(ctx context.Context, discoveryEndpoint string, opts ...GCPOption) (valkey.Client, error) {
-	clientOpt := valkey.ClientOption{
-		InitAddress: []string{discoveryEndpoint},
-		ClusterOption: valkey.ClusterOption{
-			PreferInitAddressRefresh: true,
-			ShardsRefreshInterval:    defaultShardsRefreshInterval,
-			PreferClusterShards:      true,
-		},
-		Dialer: net.Dialer{
-			KeepAlive: defaultKeepAlive,
-			Timeout:   defaultDialTimeout,
-		},
-		ConnWriteTimeout: defaultConnWriteTimeout,
-		RetryDelay:       memorystoreRetryDelay, // Correction V9: defined in retry.go
+// earlier deadline). Token refreshes never use ctx.
+func NewClient(ctx context.Context, option valkey.ClientOption, opts ...Option) (valkey.Client, error) {
+	r, err := resolve(ctx, option, newConfig(opts), defaultInstanceReader) // §4.8
+	if err != nil {
+		return nil, err
 	}
-	return newClient(ctx, clientOpt, opts, true)
+	opt, err := r.clientOption(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return connect(ctx, opt, r.topology == TopologyCluster, r.authUser)
 }
 
-// NewStandaloneClient creates a Memorystore Standalone (Cluster Disabled) client with
-// automatic read/write splitting between Primary and Reader Endpoints.
-//
-// ctx bounds the setup done by opts (see GCPOption) and connecting, as for NewClusterClient.
-func NewStandaloneClient(ctx context.Context, primaryEndpoint, readerEndpoint string, opts ...GCPOption) (valkey.Client, error) {
-	clientOpt := valkey.ClientOption{
-		InitAddress: []string{primaryEndpoint},
-		Standalone: valkey.StandaloneOption{
-			ReplicaAddress: []string{readerEndpoint},
-		},
-		SendToReplicas: sendReadsToReplicas,
-		Dialer: net.Dialer{
-			KeepAlive: defaultKeepAlive,
-			Timeout:   defaultDialTimeout,
-		},
-		ConnWriteTimeout: defaultConnWriteTimeout,
-		RetryDelay:       memorystoreRetryDelay, // Correction V9: defined in retry.go
+// ResolveClientOption returns the valkey.ClientOption NewClient would connect with, without
+// connecting, for callers who build the client themselves (valkey.NewClient,
+// valkeyotel.NewClient) or want to inspect it. Building the client that way skips NewClient's
+// connect-time handling: the retries of Memorystore IAM backend errors during the handshake
+// and the cluster mode check (see WithTopology).
+func ResolveClientOption(ctx context.Context, option valkey.ClientOption, opts ...Option) (valkey.ClientOption, error) {
+	r, err := resolve(ctx, option, newConfig(opts), defaultInstanceReader) // §4.8
+	if err != nil {
+		return valkey.ClientOption{}, err
 	}
-	return newClient(ctx, clientOpt, opts, false)
-}
-
-// newClient applies opts with the constructor's ctx and connects (see connect). cluster
-// asks connect to check that valkey-go really built a cluster client (U7).
-func newClient(ctx context.Context, clientOpt valkey.ClientOption, opts []GCPOption, cluster bool) (valkey.Client, error) {
-	for _, opt := range opts {
-		if err := opt(ctx, &clientOpt); err != nil {
-			return nil, err
-		}
-	}
-	return connect(ctx, clientOpt, cluster, "")
+	return r.clientOption(ctx)
 }
 
 // sendReadsToReplicas routes read-only commands to the reader endpoint.

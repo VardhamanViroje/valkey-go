@@ -20,7 +20,7 @@ const DefaultTokenReloadInterval = 5 * time.Minute
 // tokenFetchTimeout bounds one token read on the connection path.
 const tokenFetchTimeout = 5 * time.Second
 
-var errNoTokenSource = errors.New("valkeygcp: TOKEN_AUTH needs Auth.Token.SecretVersion, Token or Source")
+var errNoTokenSource = errors.New("valkeygcp: TOKEN_AUTH needs WithTokenAuth with TokenAuthOptions.SecretVersion, Token or Source")
 
 // TokenAuthOptions configures TOKEN_AUTH (basic token-based authentication).
 type TokenAuthOptions struct {
@@ -41,11 +41,11 @@ type TokenAuthOptions struct {
 	// live connections (re-AUTH). Default 5m; negative disables reload.
 	ReloadInterval time.Duration
 	// OnCredentialError receives token read errors absorbed by the last-known-good logic
-	// (U6). NewClient copies AuthOptions.OnCredentialError here when this field is nil.
+	// (U6). The OnCredentialError option is used when this field is nil.
 	OnCredentialError func(error)
 	// OnAuth receives an AuthEvent each time credentials are handed to valkey-go (U9). It
-	// runs on the connection path, so it must return quickly. NewClient copies
-	// AuthOptions.OnAuth here when this field is nil.
+	// runs on the connection path, so it must return quickly. The OnAuth option is used when
+	// this field is nil.
 	OnAuth func(AuthEvent)
 }
 
@@ -224,15 +224,8 @@ func (p *tokenAuthProvider) credentials() (valkey.AuthCredentials, bool, error) 
 	return creds, fallback, nil
 }
 
-// WithTokenAuth wires TOKEN_AUTH into the low-level constructors. The constructor's ctx
-// bounds the first token read.
-func WithTokenAuth(opt TokenAuthOptions) GCPOption {
-	return func(ctx context.Context, o *valkey.ClientOption) error {
-		p, err := newTokenAuthProvider(ctx, opt)
-		if err != nil {
-			return err
-		}
-		o.AuthCredentialsFn = p.AuthCredentialsFn()
-		return nil
-	}
+// WithTokenAuth authenticates with a TOKEN_AUTH token from opt. NewClient reads the token once
+// during setup, bounded by its ctx, so a bad secret fails NewClient instead of the first dial.
+func WithTokenAuth(opt TokenAuthOptions) Option {
+	return func(c *config) { c.token = &opt }
 }

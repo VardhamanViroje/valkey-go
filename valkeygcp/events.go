@@ -33,10 +33,10 @@ type AuthEvent struct {
 	// Fallback reports that a token fetch failed and the last-known-good token (or, once it
 	// has expired, no token) was handed out instead (U6). OnCredentialError gets the error.
 	Fallback bool
-	// Plaintext reports that NewClient wired these credentials for connections without TLS:
-	// the instance has in-transit encryption disabled, or TLS.Mode is TLSDisabled (U10). The
-	// low-level options (WithIAMOptions, WithTokenAuth) don't know the transport and leave it
-	// false.
+	// Plaintext reports that NewClient wired these credentials for connections without TLS
+	// (no ClientOption.TLSConfig): the instance has in-transit encryption disabled, or WithTLS
+	// set TLSDisabled (U10). A provider made directly with NewGCPTokenProvider doesn't know
+	// the transport and leaves it false.
 	Plaintext bool
 	// Err is set when no credentials could be handed out. valkey-go then fails the dial, or
 	// closes the connection on a re-AUTH.
@@ -75,4 +75,3 @@ func fingerprint(token string) string {
 	mac.Write([]byte(token))
 	return hex.EncodeToString(mac.Sum(nil)[:6])
 }
-

@@ -25,6 +25,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -41,7 +42,8 @@ import (
 var (
 	mode = flag.String("mode", "once", "resolve | token | once | soak | storm")
 
-	// Instance and endpoints (valkeygcp.Config).
+	// Instance (valkeygcp.WithInstance, WithNetwork) and endpoints (ClientOption.InitAddress,
+	// Standalone.ReplicaAddress).
 	instance  = flag.String("instance", "", "projects/P/locations/R/instances/I: auto-discovery path")
 	network   = flag.String("network", "", "VPC network of the PSC endpoint group (optional)")
 	discovery = flag.String("discovery", "", "discovery endpoint IP:port (cluster mode, explicit path)")
@@ -50,7 +52,7 @@ var (
 	authMode  = flag.String("auth", "auto", "auto | disabled | iam | token")
 	tlsMode   = flag.String("tls", "auto", "auto | disabled | per-instance | shared | custom")
 	caFile    = flag.String("ca-file", "", "server CA PEM bundle (explicit path or customer-managed CA)")
-	casFetch  = flag.Bool("cas-fetch", false, "read a customer-managed CA from the instance's CA Service pool (TLS.FetchCustomCA)")
+	casFetch  = flag.Bool("cas-fetch", false, "read a customer-managed CA from the instance's CA Service pool (TLSOptions.FetchCustomCA)")
 
 	// IAM (valkeygcp.IAMAuthOptions).
 	iamUser       = flag.String("iam-username", "", "explicit IAM AUTH username (wins over -username-strategy)")
@@ -69,7 +71,7 @@ var (
 	tokenUser   = flag.String("token-user", "", "token-auth username (empty = default user)")
 	tokenReload = flag.Duration("token-reload", 0, "token re-read interval (0 = 5m, negative = never)")
 
-	// valkey-go option passed through valkeygcp.Config.ClientOption.
+	// valkey-go option set on the valkey.ClientOption passed to valkeygcp.NewClient.
 	disableCache = flag.Bool("disable-cache", false, "set ClientOption.DisableCache: no CLIENT TRACKING in the handshake (ACL workaround)")
 
 	// Run control.
@@ -130,54 +132,67 @@ func logStart() {
 	log.Printf("START host=%s flags=%s", host, strings.Join(set, " "))
 }
 
-func buildConfig() (valkeygcp.Config, error) {
-	cfg := valkeygcp.Config{
-		Instance:          *instance,
-		Network:           *network,
-		DiscoveryEndpoint: *discovery,
-		PrimaryEndpoint:   *primary,
-		ReaderEndpoint:    *reader,
-		TLS:               valkeygcp.TLSOptions{CAFile: *caFile},
-		Auth: valkeygcp.AuthOptions{
-			OnCredentialError: func(err error) {
+// config is what the run modes hand to valkeygcp, built from the flags.
+type config struct {
+	option valkey.ClientOption      // for NewClient and ResolveClientOption
+	opts   []valkeygcp.Option       // for NewClient and ResolveClientOption
+	iam    valkeygcp.IAMAuthOptions // the IAM flags, also used alone by -mode=token
+}
+
+func buildConfig() (config, error) {
+	cfg := config{
+		// The name shows up in CLIENT LIST (name=valkeygcp-livetest) on every node.
+		option: valkey.ClientOption{ClientName: "valkeygcp-livetest", DisableCache: *disableCache},
+		opts: []valkeygcp.Option{
+			valkeygcp.OnCredentialError(func(err error) {
 				credErr.Add(1)
 				log.Printf("CREDENTIAL_ERROR absorbed (last-known-good token kept): %v", err)
-			},
+			}),
 		},
-		// The name shows up in CLIENT LIST (name=valkeygcp-livetest) on every node.
-		ClientOption: valkey.ClientOption{ClientName: "valkeygcp-livetest", DisableCache: *disableCache},
 	}
 
-	switch *authMode {
-	case "auto":
-	case "disabled":
-		cfg.Auth.Mode = valkeygcp.AuthDisabled
-	case "iam":
-		cfg.Auth.Mode = valkeygcp.AuthIAM
-	case "token":
-		cfg.Auth.Mode = valkeygcp.AuthToken
-	default:
-		return cfg, fmt.Errorf("-auth=%q: want auto, disabled, iam or token", *authMode)
+	if *instance != "" {
+		cfg.opts = append(cfg.opts, valkeygcp.WithInstance(*instance))
+		if *network != "" { // -network picks the instance's endpoint group: ignored without -instance
+			cfg.opts = append(cfg.opts, valkeygcp.WithNetwork(*network))
+		}
+	}
+	// Explicit endpoints override the ones read from -instance. WithTopology keeps the checks
+	// that go with the endpoint's cluster mode, including that it matches the instance.
+	switch {
+	case *discovery != "" && *primary != "":
+		return cfg, errors.New("-discovery and -primary are both set: want one")
+	case *discovery != "":
+		cfg.option.InitAddress = []string{*discovery}
+		cfg.opts = append(cfg.opts, valkeygcp.WithTopology(valkeygcp.TopologyCluster))
+	case *primary != "":
+		cfg.option.InitAddress = []string{*primary}
+		cfg.opts = append(cfg.opts, valkeygcp.WithTopology(valkeygcp.TopologyClusterDisabled))
+	}
+	if *reader != "" {
+		cfg.option.Standalone.ReplicaAddress = []string{*reader}
 	}
 
+	tlsOpt := valkeygcp.TLSOptions{CAFile: *caFile}
 	if *casFetch {
-		cfg.TLS.FetchCustomCA = cas.FetchPoolCAs
+		tlsOpt.FetchCustomCA = cas.FetchPoolCAs
 	}
 	switch *tlsMode {
 	case "auto":
 	case "disabled":
-		cfg.TLS.Mode = valkeygcp.TLSDisabled
+		tlsOpt.Mode = valkeygcp.TLSDisabled
 	case "per-instance":
-		cfg.TLS.Mode = valkeygcp.TLSPerInstanceCA
+		tlsOpt.Mode = valkeygcp.TLSPerInstanceCA
 	case "shared":
-		cfg.TLS.Mode = valkeygcp.TLSSharedCA
+		tlsOpt.Mode = valkeygcp.TLSSharedCA
 	case "custom":
-		cfg.TLS.Mode = valkeygcp.TLSCustomCA
+		tlsOpt.Mode = valkeygcp.TLSCustomCA
 	default:
 		return cfg, fmt.Errorf("-tls=%q: want auto, disabled, per-instance, shared or custom", *tlsMode)
 	}
+	cfg.opts = append(cfg.opts, valkeygcp.WithTLS(tlsOpt))
 
-	iam := valkeygcp.IAMAuthOptions{
+	cfg.iam = valkeygcp.IAMAuthOptions{
 		Username:               *iamUser,
 		ImpersonateSA:          *impersonateSA,
 		ImpersonateLifetime:    *impLifetime,
@@ -189,7 +204,7 @@ func buildConfig() (valkeygcp.Config, error) {
 	switch *userStrategy {
 	case "default":
 	case "principal-email":
-		iam.UsernameStrategy = valkeygcp.UsernamePrincipalEmail
+		cfg.iam.UsernameStrategy = valkeygcp.UsernamePrincipalEmail
 	default:
 		return cfg, fmt.Errorf("-username-strategy=%q: want default or principal-email", *userStrategy)
 	}
@@ -198,27 +213,55 @@ func buildConfig() (valkeygcp.Config, error) {
 		if err != nil {
 			return cfg, fmt.Errorf("-credentials-json: %w", err)
 		}
-		iam.CredentialsJSON = b
+		cfg.iam.CredentialsJSON = b
 	}
-	cfg.Auth.IAM = iam
 
-	if *tokenSecret != "" || *tokenStatic != "" {
-		cfg.Auth.Token = valkeygcp.TokenAuthOptions{
-			SecretVersion:  *tokenSecret,
-			Token:          *tokenStatic,
-			Username:       *tokenUser,
-			ReloadInterval: *tokenReload,
+	token := valkeygcp.TokenAuthOptions{
+		SecretVersion:  *tokenSecret,
+		Token:          *tokenStatic,
+		Username:       *tokenUser,
+		ReloadInterval: *tokenReload,
+	}
+	hasToken := *tokenSecret != "" || *tokenStatic != ""
+	// Without IAM flags, WithIAMOptions(cfg.iam) is WithDefaultIAM: Application Default Credentials.
+	switch *authMode {
+	case "auto":
+		// With -instance, the instance's auth mode picks one of the options passed. Without
+		// it, the flags decide: a token source means Token Auth, an IAM identity flag IAM, and
+		// both is an error.
+		if *instance != "" || hasIAMIdentity(cfg.iam) {
+			cfg.opts = append(cfg.opts, valkeygcp.WithIAMOptions(cfg.iam))
 		}
+		if hasToken {
+			cfg.opts = append(cfg.opts, valkeygcp.WithTokenAuth(token))
+		}
+	case "disabled":
+		// No auth option.
+	case "iam":
+		cfg.opts = append(cfg.opts, valkeygcp.WithIAMOptions(cfg.iam))
+	case "token":
+		cfg.opts = append(cfg.opts, valkeygcp.WithTokenAuth(token)) // TOKEN_AUTH fails without -token-secret or -token
+	default:
+		return cfg, fmt.Errorf("-auth=%q: want auto, disabled, iam or token", *authMode)
 	}
 	return cfg, nil
 }
 
+// hasIAMIdentity reports whether an IAM identity flag is set: -credentials-json,
+// -impersonate-sa, -iam-username or -username-strategy. Tuning flags such as -refresh-buffer
+// don't count, so without -instance, plain ADC needs -auth=iam.
+func hasIAMIdentity(o valkeygcp.IAMAuthOptions) bool {
+	return len(o.CredentialsJSON) > 0 || o.ImpersonateSA != "" || o.Username != "" ||
+		o.UsernameStrategy != valkeygcp.UsernameDefault
+}
+
 // connect builds the client with valkeygcp.NewClient and logs every credential hand-out
-// through Auth.OnAuth: valkey-go asks for credentials on every new connection and again at
-// RefreshAfter for the proactive re-AUTH. tag prefixes the log lines in storm mode.
-func connect(ctx context.Context, cfg valkeygcp.Config, tag string) (valkey.Client, error) {
-	cfg.Auth.OnAuth = logAuth(tag)
-	client, err := valkeygcp.NewClient(ctx, cfg)
+// through the OnAuth option: valkey-go asks for credentials on every new connection and again
+// at RefreshAfter for the proactive re-AUTH. tag prefixes the log lines in storm mode.
+func connect(ctx context.Context, cfg config, tag string) (valkey.Client, error) {
+	// Clipped so that the concurrent calls of storm mode never append to a shared array.
+	opts := append(slices.Clip(cfg.opts), valkeygcp.OnAuth(logAuth(tag)))
+	client, err := valkeygcp.NewClient(ctx, cfg.option, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -287,11 +330,11 @@ func fail(stage string, err error, start time.Time) bool {
 
 // runResolve settles the configuration without dialing. With IAM it also runs credential
 // setup; with Token Auth it reads the token once, as valkeygcp.NewClient would.
-func runResolve(cfg valkeygcp.Config) bool {
+func runResolve(cfg config) bool {
 	start := time.Now()
 	ctx, cancel := context.WithTimeout(context.Background(), *setupTimeout)
 	defer cancel()
-	opt, err := valkeygcp.ResolveClientOption(ctx, cfg)
+	opt, err := valkeygcp.ResolveClientOption(ctx, cfg.option, cfg.opts...)
 	if err != nil {
 		return fail("SETUP_ERROR", err, start)
 	}
@@ -306,11 +349,11 @@ func runResolve(cfg valkeygcp.Config) bool {
 
 // runToken builds only the IAM token provider and fetches one token: ADC, a credentials
 // file, or impersonation, plus the resolved AUTH username.
-func runToken(cfg valkeygcp.Config) bool {
+func runToken(cfg config) bool {
 	start := time.Now()
 	ctx, cancel := context.WithTimeout(context.Background(), *setupTimeout)
 	defer cancel()
-	p, err := valkeygcp.NewGCPTokenProvider(ctx, cfg.Auth.IAM)
+	p, err := valkeygcp.NewGCPTokenProvider(ctx, cfg.iam)
 	if err != nil {
 		return fail("SETUP_ERROR", err, start)
 	}
@@ -332,7 +375,7 @@ func runToken(cfg valkeygcp.Config) bool {
 
 // runOnce connects, PINGs every node (each node is a separate connection and AUTH, and with
 // TLS a separate certificate check against that node's IP), then runs SET and GET.
-func runOnce(cfg valkeygcp.Config) bool {
+func runOnce(cfg config) bool {
 	start := time.Now()
 	ctx, cancel := context.WithTimeout(context.Background(), *setupTimeout)
 	defer cancel()
@@ -361,7 +404,7 @@ func runOnce(cfg valkeygcp.Config) bool {
 
 // runSoak keeps SET/GET traffic going for -duration (or until Ctrl+C) and logs STATS, so
 // proactive re-AUTH, token rotation and forced reconnects can be watched in the log.
-func runSoak(cfg valkeygcp.Config) bool {
+func runSoak(cfg config) bool {
 	start := time.Now()
 	setupCtx, cancelSetup := context.WithTimeout(context.Background(), *setupTimeout)
 	client, err := connect(setupCtx, cfg, "")
@@ -421,7 +464,7 @@ func logStats(start time.Time) {
 
 // runStorm creates -clients clients at the same moment, each with its own token provider,
 // like that many processes restarting at once, and summarises how they connected.
-func runStorm(cfg valkeygcp.Config) bool {
+func runStorm(cfg config) bool {
 	ctx, cancel := context.WithTimeout(context.Background(), *setupTimeout)
 	defer cancel()
 

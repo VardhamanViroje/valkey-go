@@ -142,15 +142,17 @@ func readCommand(r *bufio.Reader) ([]string, error) {
 	return args, nil
 }
 
-// cfg is the explicit path with a static IAM token. The fake server has no TLS, so TLS is
-// turned off on purpose (valkeygcp refuses to send credentials in plaintext otherwise).
-func cfg(addr string) valkeygcp.Config {
-	return valkeygcp.Config{
-		PrimaryEndpoint: addr,
-		TLS:             valkeygcp.TLSOptions{Mode: valkeygcp.TLSDisabled},
-		Auth: valkeygcp.AuthOptions{Mode: valkeygcp.AuthIAM, IAM: valkeygcp.IAMAuthOptions{
+// options is the explicit path with a static IAM token, for a valkey.ClientOption whose
+// InitAddress is the fake server in place of a cluster-disabled instance's primary endpoint.
+// The fake server has no TLS, so TLS is turned off on purpose (valkeygcp refuses to send
+// credentials in plaintext otherwise).
+func options() []valkeygcp.Option {
+	return []valkeygcp.Option{
+		valkeygcp.WithTopology(valkeygcp.TopologyClusterDisabled),
+		valkeygcp.WithTLS(valkeygcp.TLSOptions{Mode: valkeygcp.TLSDisabled}),
+		valkeygcp.WithIAMOptions(valkeygcp.IAMAuthOptions{
 			CustomTokenSource: oauth2.StaticTokenSource(&oauth2.Token{AccessToken: "tok", Expiry: time.Now().Add(time.Hour)}),
-		}},
+		}),
 	}
 }
 
@@ -159,7 +161,7 @@ func main() {
 	a := newServer(func(int64) bool { return true })
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	start := time.Now()
-	_, err := valkeygcp.NewClient(ctx, cfg(a.addr()))
+	_, err := valkeygcp.NewClient(ctx, valkey.ClientOption{InitAddress: []string{a.addr()}}, options()...)
 	cancel()
 	fmt.Printf("A NewClient (2s ctx): err=%v\n  connections=%d elapsed=%s arrivals=[%s]\n",
 		err, a.conns(), time.Since(start).Round(time.Millisecond), a.arrivals())
@@ -167,7 +169,7 @@ func main() {
 	// B: the first two handshakes are throttled.
 	b := newServer(func(id int64) bool { return id <= 2 })
 	start = time.Now()
-	client, err := valkeygcp.NewClient(context.Background(), cfg(b.addr()))
+	client, err := valkeygcp.NewClient(context.Background(), valkey.ClientOption{InitAddress: []string{b.addr()}}, options()...)
 	fmt.Printf("B NewClient: err=%v\n  connections=%d elapsed=%s arrivals=[%s]\n",
 		err, b.conns(), time.Since(start).Round(time.Millisecond), b.arrivals())
 	if err == nil {
@@ -178,8 +180,8 @@ func main() {
 	c := newServer(func(id int64) bool { return id >= 2 && id <= 4 })
 	c.dropConn1.Store(true)
 	var retryCalls atomic.Int64
-	cc := cfg(c.addr())
-	cc.ClientOption = valkey.ClientOption{
+	cc := valkey.ClientOption{
+		InitAddress:       []string{c.addr()},
 		PipelineMultiplex: -1, // one connection, so each re-dial is visible
 		RetryDelay: func(attempts int, _ valkey.Completed, err error) time.Duration {
 			retryCalls.Add(1)
@@ -187,7 +189,7 @@ func main() {
 			return 20 * time.Millisecond
 		},
 	}
-	client, err = valkeygcp.NewClient(context.Background(), cc)
+	client, err = valkeygcp.NewClient(context.Background(), cc, options()...)
 	if err != nil {
 		log.Fatalf("C NewClient: %v", err)
 	}

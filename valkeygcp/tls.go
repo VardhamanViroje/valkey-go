@@ -1,15 +1,12 @@
 package valkeygcp
 
 import (
-	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
 	"fmt"
 	"os"
 	"strings"
-
-	"github.com/valkey-io/valkey-go"
 )
 
 // buildTLSConfig turns the resolved mode plus CA material into a *tls.Config.
@@ -58,27 +55,19 @@ func buildTLSConfig(opt TLSOptions, mode TLSMode, discovered []string) (*tls.Con
 }
 
 // errNeedsCA reports a TLS mode without CA material. Customer-managed CAs (Certificate
-// Authority Service) can't be downloaded from the Memorystore API; TLS.FetchCustomCA reads
-// them from the CA pool instead (U11).
+// Authority Service) can't be downloaded from the Memorystore API; TLSOptions.FetchCustomCA
+// reads them from the CA pool instead (U11).
 func errNeedsCA(mode TLSMode) error {
 	if mode == TLSCustomCA {
-		return fmt.Errorf("valkeygcp: TLS mode %v needs CA certificates: set TLS.CAPEM or TLS.CAFile, or TLS.FetchCustomCA (package valkeygcp/cas) with Config.Instance", mode)
+		return fmt.Errorf("valkeygcp: TLS mode %v needs CA certificates: pass WithTLS with TLSOptions.CAPEM or CAFile, or TLSOptions.FetchCustomCA (package valkeygcp/cas) with WithInstance", mode)
 	}
-	return fmt.Errorf("valkeygcp: TLS mode %v needs CA certificates: set TLS.CAPEM or TLS.CAFile, or Config.Instance to download them", mode)
+	return fmt.Errorf("valkeygcp: TLS mode %v needs CA certificates: pass WithTLS with TLSOptions.CAPEM or CAFile, or use WithInstance to download them", mode)
 }
 
-// WithTLS wires TLS with caller-supplied CA material into the low-level constructors.
-func WithTLS(opt TLSOptions) GCPOption {
-	return func(_ context.Context, o *valkey.ClientOption) error { // no network call: ctx unused
-		mode := opt.Mode
-		if mode == TLSAuto {
-			mode = TLSCustomCA
-		}
-		cfg, err := buildTLSConfig(opt, mode, nil)
-		if err != nil {
-			return err
-		}
-		o.TLSConfig = cfg
-		return nil
-	}
+// WithTLS turns on TLS with the CA material in opt (CAPEM, CAFile, Base.RootCAs, or
+// FetchCustomCA with WithInstance). With Mode TLSDisabled it states that the instance has
+// in-transit encryption disabled, which lets IAM and Token Auth credentials be sent without
+// TLS when there is no instance (U10). A ClientOption.TLSConfig is used as is instead.
+func WithTLS(opt TLSOptions) Option {
+	return func(c *config) { c.tls = opt }
 }

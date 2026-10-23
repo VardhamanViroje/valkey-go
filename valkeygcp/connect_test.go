@@ -119,13 +119,14 @@ func standaloneReply(_ int64, args []string) (string, bool) {
 	return "+OK\r\n", false
 }
 
-// iamConfig is an explicit-path Config with a static IAM token and TLS off on purpose.
-func iamConfig(primary string) Config {
-	return Config{
-		PrimaryEndpoint: primary,
-		TLS:             TLSOptions{Mode: TLSDisabled},
-		Auth:            AuthOptions{Mode: AuthIAM, IAM: staticIAM()},
-	}
+// iamOptions are Options with a static IAM token and TLS off on purpose, for a
+// cluster-disabled node. extra comes last, so it can override them.
+func iamOptions(extra ...Option) []Option {
+	return append([]Option{
+		WithTopology(TopologyClusterDisabled),
+		WithIAMOptions(staticIAM()),
+		WithTLS(TLSOptions{Mode: TLSDisabled}),
+	}, extra...)
 }
 
 // T-CONN-1 (U8): NewClient retries ERR_IAM_* during the handshake with backoff.
@@ -138,7 +139,7 @@ func TestNewClient_RetriesIAMBackendErrors(t *testing.T) {
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	client, err := NewClient(ctx, iamConfig(srv.addr()))
+	client, err := NewClient(ctx, initOption(srv.addr()), iamOptions()...)
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}
@@ -162,7 +163,7 @@ func TestNewClient_IAMRetriesStopAtDeadline(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 700*time.Millisecond)
 	defer cancel()
 	start := time.Now()
-	_, err := NewClient(ctx, iamConfig(srv.addr()))
+	_, err := NewClient(ctx, initOption(srv.addr()), iamOptions()...)
 	if err == nil || !strings.Contains(err.Error(), "ERR_IAM_EXHAUSTED") || !strings.Contains(err.Error(), "gave up after") ||
 		!errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("got %v, want the IAM error after giving up at the deadline", err)
@@ -183,7 +184,7 @@ func TestNewClient_OtherHandshakeErrorsNotRetried(t *testing.T) {
 		}
 		return standaloneReply(conn, args)
 	})
-	_, err := NewClient(context.Background(), iamConfig(srv.addr()))
+	_, err := NewClient(context.Background(), initOption(srv.addr()), iamOptions()...)
 	if err == nil || !strings.Contains(err.Error(), "WRONGPASS") {
 		t.Fatalf("got %v, want WRONGPASS", err)
 	}
@@ -200,7 +201,7 @@ func TestNewClient_ClientTrackingNOPERMHint(t *testing.T) {
 		}
 		return standaloneReply(conn, args)
 	})
-	_, err := NewClient(context.Background(), iamConfig(srv.addr()))
+	_, err := NewClient(context.Background(), initOption(srv.addr()), iamOptions()...)
 	if err == nil || !strings.Contains(err.Error(), `ACL rule for user "default" must allow CLIENT TRACKING (+client|tracking)`) ||
 		!errors.Is(err, valkey.ErrNoCache) {
 		t.Fatalf("got %v, want the ACL hint wrapping ErrNoCache", err)
@@ -216,19 +217,29 @@ func TestNewClient_ClusterFallbackRejected(t *testing.T) {
 		}
 		return standaloneReply(conn, args)
 	})
-	cfg := iamConfig("")
-	cfg.PrimaryEndpoint, cfg.DiscoveryEndpoint = "", srv.addr()
-	_, err := NewClient(context.Background(), cfg)
+	cluster := iamOptions(WithTopology(TopologyCluster))
+	_, err := NewClient(context.Background(), initOption(srv.addr()), cluster...)
 	if err == nil || !strings.Contains(err.Error(), "fell back to a single-node client") ||
 		!strings.Contains(err.Error(), "+cluster|shards") || !strings.Contains(err.Error(), "NOPERM") {
 		t.Fatalf("got %v, want the cluster fallback error with the CLUSTER SHARDS reply", err)
 	}
 
 	// ForceSingleClient is the caller's choice: no error.
-	cfg.ClientOption.ForceSingleClient = true
-	client, err := NewClient(context.Background(), cfg)
+	option := initOption(srv.addr())
+	option.ForceSingleClient = true
+	client, err := NewClient(context.Background(), option, cluster...)
 	if err != nil {
 		t.Fatalf("ForceSingleClient: %v", err)
+	}
+	client.Close()
+
+	// The check needs TopologyCluster: with TopologyAuto, what valkey-go detects stands.
+	client, err = NewClient(context.Background(), initOption(srv.addr()), iamOptions(WithTopology(TopologyAuto))...)
+	if err != nil {
+		t.Fatalf("TopologyAuto: %v", err)
+	}
+	if mode := client.Mode(); mode != valkey.ClientModeStandalone {
+		t.Errorf("TopologyAuto: mode = %v, want the single-node client valkey-go fell back to", mode)
 	}
 	client.Close()
 }
@@ -238,13 +249,12 @@ func TestNewClient_OnAuthEvents(t *testing.T) {
 	srv := newFakeValkey(t, standaloneReply)
 	var mu sync.Mutex
 	var events []AuthEvent
-	cfg := iamConfig(srv.addr())
-	cfg.Auth.OnAuth = func(ev AuthEvent) {
+	onAuth := OnAuth(func(ev AuthEvent) {
 		mu.Lock()
 		events = append(events, ev)
 		mu.Unlock()
-	}
-	client, err := NewClient(context.Background(), cfg)
+	})
+	client, err := NewClient(context.Background(), initOption(srv.addr()), iamOptions(onAuth)...)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -325,25 +335,36 @@ func TestOnAuth_FallbackAndError(t *testing.T) {
 func TestResolve_PlaintextCredentials(t *testing.T) {
 	ca := newTestCA(t, "ca")
 	noTLSInstance := clusterInstance(memorystorepb.Instance_IAM_AUTH)
+	withTLSConfig := initOption("10.0.0.15:6379")
+	withTLSConfig.TLSConfig = &tls.Config{}
+	withPassword := initOption("10.0.0.15:6379")
+	withPassword.Password = "p"
+	iam, token := WithIAMOptions(staticIAM()), WithTokenAuth(TokenAuthOptions{Token: "t"})
 	cases := []struct {
 		name    string
-		cfg     Config
+		option  valkey.ClientOption
+		opts    []Option
 		reader  func(context.Context) (instanceReader, error)
 		refused bool
 	}{
-		{"IAM, no TLS option", Config{DiscoveryEndpoint: "10.0.0.15:6379", Auth: AuthOptions{Mode: AuthIAM, IAM: staticIAM()}}, noReader(t), true},
-		{"Token Auth, no TLS option", Config{PrimaryEndpoint: "10.0.0.2:6379", Auth: AuthOptions{Token: TokenAuthOptions{Token: "t"}}}, noReader(t), true},
-		{"IAM, TLS off on purpose", Config{DiscoveryEndpoint: "10.0.0.15:6379", Auth: AuthOptions{Mode: AuthIAM, IAM: staticIAM()}, TLS: TLSOptions{Mode: TLSDisabled}}, noReader(t), false},
-		{"IAM with a CA", Config{DiscoveryEndpoint: "10.0.0.15:6379", Auth: AuthOptions{Mode: AuthIAM, IAM: staticIAM()}, TLS: TLSOptions{CAPEM: ca.pem}}, noReader(t), false},
-		{"IAM with a caller TLSConfig", Config{DiscoveryEndpoint: "10.0.0.15:6379", Auth: AuthOptions{Mode: AuthIAM, IAM: staticIAM()}, ClientOption: valkey.ClientOption{TLSConfig: &tls.Config{}}}, noReader(t), false},
-		{"auth disabled", Config{DiscoveryEndpoint: "10.0.0.15:6379"}, noReader(t), false},
-		{"caller password", Config{DiscoveryEndpoint: "10.0.0.15:6379", ClientOption: valkey.ClientOption{Password: "p"}}, noReader(t), false},
-		{"instance without TLS decides", Config{Instance: testInstance, Auth: AuthOptions{IAM: staticIAM()}}, (&fakeReader{inst: noTLSInstance}).factory(), false},
+		{"IAM, no TLS option", initOption("10.0.0.15:6379"), []Option{iam}, noReader(t), true},
+		{"IAM with ADC, no TLS option", initOption("10.0.0.15:6379"), []Option{WithDefaultIAM()}, noReader(t), true},
+		{"Token Auth, no TLS option", initOption("10.0.0.2:6379"), []Option{token}, noReader(t), true},
+		{"IAM, TLS off on purpose", initOption("10.0.0.15:6379"), []Option{iam, WithTLS(TLSOptions{Mode: TLSDisabled})}, noReader(t), false},
+		{"IAM with a CA", initOption("10.0.0.15:6379"), []Option{iam, WithTLS(TLSOptions{CAPEM: ca.pem})}, noReader(t), false},
+		{"IAM with a caller TLSConfig", withTLSConfig, []Option{iam}, noReader(t), false},
+		{"Token Auth with a caller TLSConfig", withTLSConfig, []Option{token}, noReader(t), false},
+		{"auth disabled", initOption("10.0.0.15:6379"), nil, noReader(t), false},
+		{"caller password", withPassword, nil, noReader(t), false},
+		{"instance without TLS decides", valkey.ClientOption{}, []Option{WithInstance(testInstance), iam}, (&fakeReader{inst: noTLSInstance}).factory(), false},
 	}
 	for _, c := range cases {
-		_, err := resolve(context.Background(), c.cfg, c.reader)
+		_, err := resolveWith(c.option, c.reader, c.opts...)
 		if refused := err != nil && strings.Contains(err.Error(), "refusing to send"); refused != c.refused {
 			t.Errorf("%s: got %v, want refused=%v", c.name, err, c.refused)
+		}
+		if c.refused && err != nil && !strings.Contains(err.Error(), "pass WithTLS") {
+			t.Errorf("%s: %v does not say how to pass TLS options", c.name, err)
 		}
 		if !c.refused && err != nil {
 			t.Errorf("%s: unexpected error %v", c.name, err)
@@ -519,5 +540,105 @@ func TestInstallDialGate_KeepsCallerDialer(t *testing.T) {
 	installDialGate(&opt)
 	if _, err := opt.DialCtxFn(context.Background(), "a:1", &net.Dialer{}, nil); !errors.Is(err, errDial) || plainCalls != 1 {
 		t.Fatalf("DialFn: got %v, calls %d", err, plainCalls)
+	}
+}
+
+// T-CONN-10: a primary endpoint alone, without a reader endpoint, gives a working client
+// (NewStandaloneClient(ctx, primary, "") failed: it configured an empty reader address).
+// Without WithTopology(TopologyClusterDisabled), valkey-go finds that cluster mode is
+// disabled and falls back to a single-node client.
+func TestNewClient_PrimaryEndpointOnly(t *testing.T) {
+	srv := newFakeValkey(t, standaloneReply)
+	for _, topology := range []Topology{TopologyAuto, TopologyClusterDisabled} {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		client, err := NewClient(ctx, initOption(srv.addr()), WithTopology(topology))
+		if err != nil {
+			cancel()
+			t.Fatalf("%v: %v", topology, err)
+		}
+		v, err := client.Do(ctx, client.B().Get().Key("k").Build()).ToString()
+		mode := client.Mode()
+		client.Close()
+		cancel()
+		if err != nil || v != "ok" || mode != valkey.ClientModeStandalone {
+			t.Fatalf("%v: GET = %q, %v (mode %v); want ok from a single-node client", topology, v, err, mode)
+		}
+	}
+}
+
+// T-CONN-11: with Standalone.ReplicaAddress, NewClient connects to the primary and the
+// reader endpoint, and the default routing sends reads to the reader and writes to the
+// primary.
+func TestNewClient_ReaderEndpointRouting(t *testing.T) {
+	node := func(name string, writes *atomic.Int32) func(int64, []string) (string, bool) {
+		return func(conn int64, args []string) (string, bool) {
+			switch strings.ToUpper(args[0]) {
+			case "GET":
+				return fmt.Sprintf("$%d\r\n%s\r\n", len(name), name), false
+			case "SET":
+				writes.Add(1)
+			}
+			return standaloneReply(conn, args)
+		}
+	}
+	var primaryWrites, readerWrites atomic.Int32
+	primary := newFakeValkey(t, node("primary", &primaryWrites))
+	reader := newFakeValkey(t, node("reader", &readerWrites))
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	client, err := NewClient(ctx, valkey.ClientOption{
+		InitAddress: []string{primary.addr()},
+		Standalone:  valkey.StandaloneOption{ReplicaAddress: []string{reader.addr()}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	if v, err := client.Do(ctx, client.B().Get().Key("k").Build()).ToString(); err != nil || v != "reader" {
+		t.Fatalf("GET = %q, %v; want the reader endpoint's reply", v, err)
+	}
+	if err := client.Do(ctx, client.B().Set().Key("k").Value("v").Build()).Error(); err != nil {
+		t.Fatal(err)
+	}
+	if primaryWrites.Load() != 1 || readerWrites.Load() != 0 {
+		t.Fatalf("SET reached the primary %d times and the reader %d times, want the primary once", primaryWrites.Load(), readerWrites.Load())
+	}
+}
+
+// T-CONN-12 (U8): only IAM puts the dial gate in front of new connections, and the gate
+// keeps the caller's DialCtxFn underneath.
+func TestResolve_DialGateForIAMOnly(t *testing.T) {
+	plaintext := WithTLS(TLSOptions{Mode: TLSDisabled})
+	cases := []struct {
+		name  string
+		opts  []Option
+		gated bool
+	}{
+		{"IAM", []Option{WithIAMOptions(staticIAM()), plaintext}, true},
+		{"Token Auth", []Option{WithTokenAuth(TokenAuthOptions{Token: "t"}), plaintext}, false},
+		{"no auth", nil, false},
+	}
+	for _, c := range cases {
+		dials := 0
+		local, remote := net.Pipe()
+		option := initOption("10.0.0.2:6379")
+		option.DialCtxFn = func(context.Context, string, *net.Dialer, *tls.Config) (net.Conn, error) {
+			dials++
+			return local, nil
+		}
+		opt, err := resolveOption(t, option, noReader(t), c.opts...)
+		if err != nil {
+			t.Fatalf("%s: %v", c.name, err)
+		}
+		conn, err := opt.DialCtxFn(context.Background(), "10.0.0.2:6379", &net.Dialer{}, nil)
+		if err != nil || dials != 1 {
+			t.Fatalf("%s: dial = %v, the caller's DialCtxFn ran %d times, want once", c.name, err, dials)
+		}
+		_, gated := conn.(*gatedConn)
+		_ = conn.Close()
+		_ = remote.Close()
+		if gated != c.gated {
+			t.Errorf("%s: gated = %v, want %v", c.name, gated, c.gated)
+		}
 	}
 }

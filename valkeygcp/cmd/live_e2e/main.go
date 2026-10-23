@@ -10,6 +10,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/valkey-io/valkey-go"
 	"github.com/valkey-io/valkey-go/valkeygcp"
 )
 
@@ -22,8 +23,13 @@ func main() {
 	ctx := context.Background()
 	log.Printf("Connecting to Memorystore at %s with Native IAM Auth...", endpoint)
 
-	client, err := valkeygcp.NewClusterClient(ctx, endpoint,
+	client, err := valkeygcp.NewClient(ctx, valkey.ClientOption{InitAddress: []string{endpoint}},
+		valkeygcp.WithTopology(valkeygcp.TopologyCluster), // the discovery endpoint of a cluster-mode instance
 		valkeygcp.WithDefaultIAM(),
+		// This test has always connected without TLS, to an instance with in-transit encryption
+		// disabled. valkeygcp refuses to send IAM tokens in plaintext unless TLS is turned off
+		// explicitly.
+		valkeygcp.WithTLS(valkeygcp.TLSOptions{Mode: valkeygcp.TLSDisabled}),
 	)
 	if err != nil {
 		log.Fatalf("Failed to create Memorystore client: %v", err)
