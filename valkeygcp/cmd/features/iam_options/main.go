@@ -4,18 +4,14 @@
 //
 //	go run ./cmd/features/iam_options -addr 10.0.0.15:6379
 //
-// Memorystore accepts "default" or the email of the IAM principal as the username. Add -ca
-// server-ca.pem for in-transit encryption, or -local-token TOKEN to try against a local Valkey
-// started with --requirepass.
+// Memorystore accepts "default" or the email of the IAM principal as the username. Add
+// -local-token TOKEN to try against a local Valkey started with --requirepass.
 package main
 
 import (
 	"context"
-	"crypto/tls"
-	"crypto/x509"
 	"flag"
 	"log"
-	"os"
 	"time"
 
 	"github.com/valkey-io/valkey-go"
@@ -26,7 +22,6 @@ import (
 func main() {
 	addr := flag.String("addr", "", "discovery endpoint (cluster mode) or primary endpoint, host:port")
 	username := flag.String("username", valkeygcp.DefaultIAMUsername, `AUTH username: "default" or the principal's email`)
-	ca := flag.String("ca", "", "server CA file, for in-transit encryption")
 	localToken := flag.String("local-token", "", "password of a local Valkey, to try without Memorystore")
 	flag.Parse()
 	if *addr == "" {
@@ -35,9 +30,6 @@ func main() {
 	ctx := context.Background()
 
 	option := valkey.ClientOption{InitAddress: []string{*addr}}
-	if *ca != "" {
-		option.TLSConfig = loadCA(*ca)
-	}
 
 	iam := valkeygcp.IAMAuthOptions{
 		// The AUTH username. Default: "default".
@@ -85,17 +77,4 @@ func main() {
 		log.Fatalf("PING: %v", err)
 	}
 	log.Printf("connected as %q, PING ok", *username)
-}
-
-// loadCA returns a TLS configuration that trusts the instance's server CA.
-func loadCA(file string) *tls.Config {
-	pem, err := os.ReadFile(file)
-	if err != nil {
-		log.Fatal(err)
-	}
-	pool := x509.NewCertPool()
-	if !pool.AppendCertsFromPEM(pem) {
-		log.Fatalf("no certificate in %s", file)
-	}
-	return &tls.Config{RootCAs: pool}
 }

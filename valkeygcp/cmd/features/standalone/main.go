@@ -3,17 +3,14 @@
 //
 //	go run ./cmd/features/standalone -primary 10.0.0.2:6379 -reader 10.0.0.3:6379
 //
-// Leave out -reader for an instance without replicas. Add -ca server-ca.pem for in-transit
-// encryption, or -local-token TOKEN to try against a local Valkey started with --requirepass.
+// Leave out -reader for an instance without replicas. Add -local-token TOKEN to try against a
+// local Valkey started with --requirepass.
 package main
 
 import (
 	"context"
-	"crypto/tls"
-	"crypto/x509"
 	"flag"
 	"log"
-	"os"
 	"time"
 
 	"github.com/valkey-io/valkey-go"
@@ -24,7 +21,6 @@ import (
 func main() {
 	primary := flag.String("primary", "", "primary endpoint, host:port")
 	reader := flag.String("reader", "", "reader endpoint, host:port (optional)")
-	ca := flag.String("ca", "", "server CA file, for in-transit encryption")
 	localToken := flag.String("local-token", "", "password of a local Valkey, to try without Memorystore")
 	flag.Parse()
 	if *primary == "" {
@@ -36,9 +32,6 @@ func main() {
 	if *reader != "" {
 		// Read-only commands that don't block are sent here.
 		option.Standalone.ReplicaAddress = []string{*reader}
-	}
-	if *ca != "" {
-		option.TLSConfig = loadCA(*ca)
 	}
 
 	auth := valkeygcp.WithDefaultIAM()
@@ -76,17 +69,4 @@ func main() {
 	default:
 		log.Printf("GET %s = %q", key, val)
 	}
-}
-
-// loadCA returns a TLS configuration that trusts the instance's server CA.
-func loadCA(file string) *tls.Config {
-	pem, err := os.ReadFile(file)
-	if err != nil {
-		log.Fatal(err)
-	}
-	pool := x509.NewCertPool()
-	if !pool.AppendCertsFromPEM(pem) {
-		log.Fatalf("no certificate in %s", file)
-	}
-	return &tls.Config{RootCAs: pool}
 }

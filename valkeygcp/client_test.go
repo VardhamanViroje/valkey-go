@@ -113,14 +113,12 @@ func TestResolveClientOption_NoEndpoint(t *testing.T) {
 // Values set on the ClientOption beat the Memorystore defaults.
 func TestResolveClientOption_CallerValuesWin(t *testing.T) {
 	retry := func(int, valkey.Completed, error) time.Duration { return time.Second }
-	own := &tls.Config{ServerName: "mine"}
 	opt, err := ResolveClientOption(context.Background(), valkey.ClientOption{
 		InitAddress:      []string{"10.0.0.15:6379"},
 		Dialer:           net.Dialer{Timeout: 7 * time.Second, KeepAlive: 9 * time.Second},
 		ConnWriteTimeout: 11 * time.Second,
 		ClusterOption:    valkey.ClusterOption{ShardsRefreshInterval: time.Minute},
 		RetryDelay:       retry,
-		TLSConfig:        own,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -134,8 +132,6 @@ func TestResolveClientOption_CallerValuesWin(t *testing.T) {
 		t.Errorf("ShardsRefreshInterval = %v", opt.ClusterOption.ShardsRefreshInterval)
 	case opt.RetryDelay(0, valkey.Completed{}, nil) != time.Second:
 		t.Error("RetryDelay replaced")
-	case opt.TLSConfig != own:
-		t.Error("TLSConfig replaced")
 	}
 
 	everything := func(valkey.Completed) bool { return true }

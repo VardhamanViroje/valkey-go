@@ -6,18 +6,14 @@
 //	go run ./cmd/features/resolve_option -addr 10.0.0.15:6379
 //	go run ./cmd/features/resolve_option -addr 10.0.0.2:6379 -reader 10.0.0.3:6379
 //
-// Add -ca server-ca.pem for in-transit encryption, or -local-token TOKEN to try against a
-// local Valkey started with --requirepass.
+// Add -local-token TOKEN to try against a local Valkey started with --requirepass.
 package main
 
 import (
 	"context"
-	"crypto/tls"
-	"crypto/x509"
 	"flag"
 	"fmt"
 	"log"
-	"os"
 	"time"
 
 	"github.com/valkey-io/valkey-go"
@@ -28,7 +24,6 @@ import (
 func main() {
 	addr := flag.String("addr", "", "discovery endpoint (cluster mode) or primary endpoint, host:port")
 	reader := flag.String("reader", "", "reader endpoint, host:port (cluster mode disabled, optional)")
-	ca := flag.String("ca", "", "server CA file, for in-transit encryption")
 	localToken := flag.String("local-token", "", "password of a local Valkey, to try without Memorystore")
 	flag.Parse()
 	if *addr == "" {
@@ -43,9 +38,6 @@ func main() {
 	}
 	if *reader != "" {
 		option.Standalone.ReplicaAddress = []string{*reader}
-	}
-	if *ca != "" {
-		option.TLSConfig = loadCA(*ca)
 	}
 	auth := valkeygcp.WithDefaultIAM()
 	if *localToken != "" {
@@ -69,7 +61,6 @@ func main() {
 	fmt.Println("SendToReplicas set:                   ", resolved.SendToReplicas != nil)
 	fmt.Println("RetryDelay set:                       ", resolved.RetryDelay != nil)
 	fmt.Println("AuthCredentialsFn set (IAM):          ", resolved.AuthCredentialsFn != nil)
-	fmt.Println("TLSConfig set:                        ", resolved.TLSConfig != nil)
 
 	// Build the client yourself from the resolved option.
 	client, err := valkey.NewClient(resolved)
@@ -81,17 +72,4 @@ func main() {
 		log.Fatalf("PING: %v", err)
 	}
 	log.Printf("valkey.NewClient connected with the resolved option, %s mode, PING ok", client.Mode())
-}
-
-// loadCA returns a TLS configuration that trusts the instance's server CA.
-func loadCA(file string) *tls.Config {
-	pem, err := os.ReadFile(file)
-	if err != nil {
-		log.Fatal(err)
-	}
-	pool := x509.NewCertPool()
-	if !pool.AppendCertsFromPEM(pem) {
-		log.Fatalf("no certificate in %s", file)
-	}
-	return &tls.Config{RootCAs: pool}
 }

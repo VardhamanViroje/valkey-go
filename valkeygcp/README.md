@@ -62,7 +62,7 @@ func main() {
 }
 ```
 
-`InitAddress` holds the discovery endpoint of a cluster-mode instance, or the primary endpoint of a cluster-disabled instance; valkey-go detects which one it is when it connects. Any other `valkey.ClientOption` field works as with `valkey.NewClient`. For an instance with in-transit encryption, set `TLSConfig` with the instance's server CA.
+`InitAddress` holds the discovery endpoint of a cluster-mode instance, or the primary endpoint of a cluster-disabled instance; valkey-go detects which one it is when it connects. Any other `valkey.ClientOption` field works as with `valkey.NewClient`.
 
 #### Cluster Mode Disabled with a Reader Endpoint
 

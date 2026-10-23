@@ -14,18 +14,14 @@
 // but a new connection can't authenticate until the source works again. That's why every
 // command here uses one key, and so one connection.
 //
-// Add -ca server-ca.pem for in-transit encryption, or -local-token TOKEN to try against a
-// local Valkey started with --requirepass.
+// Add -local-token TOKEN to try against a local Valkey started with --requirepass.
 package main
 
 import (
 	"context"
-	"crypto/tls"
-	"crypto/x509"
 	"errors"
 	"flag"
 	"log"
-	"os"
 	"sync/atomic"
 	"time"
 
@@ -40,7 +36,6 @@ func main() {
 	lifetime := flag.Duration("lifetime", 30*time.Second, "token lifetime this example reports")
 	duration := flag.Duration("duration", 90*time.Second, "how long to run")
 	hang := flag.Bool("hang", false, "make the token source hang instead of failing")
-	ca := flag.String("ca", "", "server CA file, for in-transit encryption")
 	localToken := flag.String("local-token", "", "password of a local Valkey, to try without Memorystore")
 	flag.Parse()
 	if *addr == "" {
@@ -60,9 +55,6 @@ func main() {
 	source := &breakableSource{base: base, lifetime: *lifetime, hang: *hang}
 
 	option := valkey.ClientOption{InitAddress: []string{*addr}}
-	if *ca != "" {
-		option.TLSConfig = loadCA(*ca)
-	}
 	client, err := valkeygcp.NewClient(ctx, option, valkeygcp.WithIAMOptions(valkeygcp.IAMAuthOptions{
 		CustomTokenSource: source,
 		RefreshBuffer:     *lifetime / 2,
@@ -128,17 +120,4 @@ func (s *breakableSource) Token() (*oauth2.Token, error) {
 	t.Expiry = time.Now().Add(s.lifetime)
 	log.Printf("token source: new token, reported to expire at %s", t.Expiry.Format("15:04:05"))
 	return &t, nil
-}
-
-// loadCA returns a TLS configuration that trusts the instance's server CA.
-func loadCA(file string) *tls.Config {
-	pem, err := os.ReadFile(file)
-	if err != nil {
-		log.Fatal(err)
-	}
-	pool := x509.NewCertPool()
-	if !pool.AppendCertsFromPEM(pem) {
-		log.Fatalf("no certificate in %s", file)
-	}
-	return &tls.Config{RootCAs: pool}
 }

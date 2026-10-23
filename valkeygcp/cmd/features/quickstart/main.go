@@ -6,17 +6,14 @@
 //
 //	go run ./cmd/features/quickstart -addr 10.0.0.15:6379
 //
-// Add -ca server-ca.pem if the instance uses in-transit encryption. To try it without
-// Memorystore, start a local Valkey with --requirepass TOKEN and add -local-token TOKEN.
+// To try it without Memorystore, start a local Valkey with --requirepass TOKEN and add
+// -local-token TOKEN.
 package main
 
 import (
 	"context"
-	"crypto/tls"
-	"crypto/x509"
 	"flag"
 	"log"
-	"os"
 	"time"
 
 	"github.com/valkey-io/valkey-go"
@@ -26,7 +23,6 @@ import (
 
 func main() {
 	addr := flag.String("addr", "", "discovery endpoint of the instance, host:port")
-	ca := flag.String("ca", "", "server CA file, for in-transit encryption")
 	localToken := flag.String("local-token", "", "password of a local Valkey, to try without Memorystore")
 	flag.Parse()
 	if *addr == "" {
@@ -36,9 +32,6 @@ func main() {
 
 	// The same valkey.ClientOption you would pass to valkey.NewClient.
 	option := valkey.ClientOption{InitAddress: []string{*addr}}
-	if *ca != "" {
-		option.TLSConfig = loadCA(*ca)
-	}
 
 	// IAM access tokens from Application Default Credentials (ADC) instead of a password.
 	auth := valkeygcp.WithDefaultIAM()
@@ -65,17 +58,4 @@ func main() {
 		log.Fatalf("GET: %v", err)
 	}
 	log.Printf("GET valkeygcp:quickstart = %q", val)
-}
-
-// loadCA returns a TLS configuration that trusts the instance's server CA.
-func loadCA(file string) *tls.Config {
-	pem, err := os.ReadFile(file)
-	if err != nil {
-		log.Fatal(err)
-	}
-	pool := x509.NewCertPool()
-	if !pool.AppendCertsFromPEM(pem) {
-		log.Fatalf("no certificate in %s", file)
-	}
-	return &tls.Config{RootCAs: pool}
 }

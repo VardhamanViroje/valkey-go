@@ -10,17 +10,14 @@
 //	go run ./cmd/features/token_refresh -addr 10.0.0.15:6379 -disable-reauth
 //
 // With -disable-reauth (IAMAuthOptions.DisableProactiveReauth) the connection keeps its
-// first token and no new token is fetched. Add -ca server-ca.pem for in-transit encryption,
-// or -local-token TOKEN to try against a local Valkey started with --requirepass.
+// first token and no new token is fetched. Add -local-token TOKEN to try against a local
+// Valkey started with --requirepass.
 package main
 
 import (
 	"context"
-	"crypto/tls"
-	"crypto/x509"
 	"flag"
 	"log"
-	"os"
 	"time"
 
 	"github.com/valkey-io/valkey-go"
@@ -34,7 +31,6 @@ func main() {
 	lifetime := flag.Duration("lifetime", time.Minute, "token lifetime this example reports")
 	duration := flag.Duration("duration", 2*time.Minute, "how long to run")
 	disable := flag.Bool("disable-reauth", false, "set IAMAuthOptions.DisableProactiveReauth")
-	ca := flag.String("ca", "", "server CA file, for in-transit encryption")
 	localToken := flag.String("local-token", "", "password of a local Valkey, to try without Memorystore")
 	flag.Parse()
 	if *addr == "" {
@@ -53,9 +49,6 @@ func main() {
 	}
 
 	option := valkey.ClientOption{InitAddress: []string{*addr}}
-	if *ca != "" {
-		option.TLSConfig = loadCA(*ca)
-	}
 	client, err := valkeygcp.NewClient(ctx, option, valkeygcp.WithIAMOptions(valkeygcp.IAMAuthOptions{
 		CustomTokenSource: shortLived{base: base, lifetime: *lifetime},
 		// Replace a token this long before it expires. Live connections re-AUTH with the new
@@ -104,17 +97,4 @@ func (s shortLived) Token() (*oauth2.Token, error) {
 	t.Expiry = time.Now().Add(s.lifetime)
 	log.Printf("token source: new token, reported to expire at %s", t.Expiry.Format("15:04:05"))
 	return &t, nil
-}
-
-// loadCA returns a TLS configuration that trusts the instance's server CA.
-func loadCA(file string) *tls.Config {
-	pem, err := os.ReadFile(file)
-	if err != nil {
-		log.Fatal(err)
-	}
-	pool := x509.NewCertPool()
-	if !pool.AppendCertsFromPEM(pem) {
-		log.Fatalf("no certificate in %s", file)
-	}
-	return &tls.Config{RootCAs: pool}
 }

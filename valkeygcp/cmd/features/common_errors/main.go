@@ -4,14 +4,12 @@
 //
 //	go run ./cmd/features/common_errors -addr 10.0.0.15:6379
 //
-// The rejected-token case sends one invalid token. Add -ca server-ca.pem for in-transit
-// encryption, or -local-token TOKEN to try against a local Valkey started with --requirepass.
+// The rejected-token case sends one invalid token. Add -local-token TOKEN to try against a
+// local Valkey started with --requirepass.
 package main
 
 import (
 	"context"
-	"crypto/tls"
-	"crypto/x509"
 	"flag"
 	"log"
 	"os"
@@ -25,7 +23,6 @@ import (
 
 func main() {
 	addr := flag.String("addr", "", "discovery endpoint (cluster mode) or primary endpoint, host:port")
-	ca := flag.String("ca", "", "server CA file, for in-transit encryption")
 	localToken := flag.String("local-token", "", "password of a local Valkey, to try without Memorystore")
 	flag.Parse()
 	if *addr == "" {
@@ -34,9 +31,6 @@ func main() {
 	ctx := context.Background()
 
 	option := valkey.ClientOption{InitAddress: []string{*addr}}
-	if *ca != "" {
-		option.TLSConfig = loadCA(*ca)
-	}
 	auth := valkeygcp.WithDefaultIAM()
 	if *localToken != "" {
 		auth = valkeygcp.WithIAMOptions(valkeygcp.IAMAuthOptions{
@@ -98,16 +92,3 @@ func show(mistake string, run func() error) {
 type hangingSource struct{}
 
 func (hangingSource) Token() (*oauth2.Token, error) { select {} }
-
-// loadCA returns a TLS configuration that trusts the instance's server CA.
-func loadCA(file string) *tls.Config {
-	pem, err := os.ReadFile(file)
-	if err != nil {
-		log.Fatal(err)
-	}
-	pool := x509.NewCertPool()
-	if !pool.AppendCertsFromPEM(pem) {
-		log.Fatalf("no certificate in %s", file)
-	}
-	return &tls.Config{RootCAs: pool}
-}

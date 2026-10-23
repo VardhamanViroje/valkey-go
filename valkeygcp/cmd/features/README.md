@@ -8,7 +8,6 @@ These examples are what you would write when trying valkeygcp for the first time
 2. A machine in the instance's VPC network, such as a Compute Engine VM or a GKE pod.
 3. An identity with `roles/memorystore.dbConnectionUser` on the instance. On Google Cloud this is usually the service account of the VM or pod, which valkeygcp finds through Application Default Credentials (ADC).
 4. The instance's endpoints: the discovery endpoint for cluster mode, or the primary and reader endpoints with cluster mode disabled.
-5. If the instance uses in-transit encryption, its server CA certificate in a PEM file. Pass it to any example with `-ca server-ca.pem`.
 
 ## The examples
 

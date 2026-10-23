@@ -11,7 +11,7 @@ import (
 
 // Option configures what NewClient and ResolveClientOption add to a valkey.ClientOption:
 // IAM credentials (WithIAMOptions, WithDefaultIAM). Settings valkey-go already has a field
-// for, such as addresses, TLSConfig and timeouts, are set on the valkey.ClientOption itself.
+// for, such as addresses and timeouts, are set on the valkey.ClientOption itself.
 // Later options override earlier ones of the same kind.
 type Option func(*config)
 
