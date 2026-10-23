@@ -6,6 +6,7 @@ import (
 	"strconv"
 
 	"github.com/valkey-io/valkey-go"
+	"google.golang.org/api/option"
 )
 
 // authMode mirrors memorystore.v1.Instance.AuthorizationMode.
@@ -82,9 +83,10 @@ type TLSOptions struct {
 	// FetchCustomCA fetches the server CA certificates (PEM) of a CUSTOMER_MANAGED_CAS_CA
 	// instance from its Certificate Authority Service pool, which the Memorystore API can't
 	// return (U11). NewClient calls it with the instance's server_ca_pool when WithInstance
-	// is used and no CA material is set. cas.FetchPoolCAs, in package
-	// github.com/valkey-io/valkey-go/valkeygcp/cas, implements it.
-	FetchCustomCA func(ctx context.Context, caPool string) ([]string, error)
+	// is used and no CA material is set, and with opts for the CA Service client: the setup
+	// identity (see IAMAuthOptions) followed by WithGoogleAPIOptions. cas.FetchPoolCAs, in
+	// package github.com/valkey-io/valkey-go/valkeygcp/cas, implements it.
+	FetchCustomCA func(ctx context.Context, caPool string, opts ...option.ClientOption) ([]string, error)
 }
 
 // WithInstance makes NewClient read the instance "projects/P/locations/R/instances/I"
@@ -103,6 +105,15 @@ func WithInstance(name string) Option {
 // or just N) when the instance is reachable from several networks. It needs WithInstance.
 func WithNetwork(network string) Option {
 	return func(c *config) { c.network = network }
+}
+
+// WithGoogleAPIOptions adds options for the Google API clients NewClient creates during
+// setup: the Memorystore API client of WithInstance and the CA Service client of
+// TLSOptions.FetchCustomCA. They follow the setup identity (see IAMAuthOptions), so they can
+// replace its credentials, or add an endpoint, quota project or universe domain. Each call
+// adds to the options of earlier calls. It needs WithInstance.
+func WithGoogleAPIOptions(opts ...option.ClientOption) Option {
+	return func(c *config) { c.googleAPI = append(c.googleAPI, opts...) }
 }
 
 // WithTopology states the instance's cluster mode. With WithInstance it must match the
@@ -158,11 +169,45 @@ type resolved struct {
 	topology  Topology // TopologyAuto when neither the instance nor WithTopology tells
 	auth      authMode
 	tls       TLSMode
-	discovery string   // discovery endpoint read from a cluster-mode instance
-	primary   string   // primary endpoint read from a cluster-disabled instance
-	reader    string   // reader endpoint read from a cluster-disabled instance, if any
-	caPEMs    []string // server CA certificates downloaded from the Memorystore API
-	authUser  string   // AUTH username wired by clientOption, for error messages
+	discovery string    // discovery endpoint read from a cluster-mode instance
+	primary   string    // primary endpoint read from a cluster-disabled instance
+	reader    string    // reader endpoint read from a cluster-disabled instance, if any
+	caPEMs    []string  // server CA certificates downloaded from the Memorystore API
+	authUser  string    // AUTH username wired by clientOption, for error messages
+	api       googleAPI // how the setup API calls authenticate (setupIdentity)
+	// iamBase holds the upstream credentials of WithIAMOptions when resolve built them for
+	// the instance lookup; the IAM token provider reuses them.
+	iamBase *baseCreds
+}
+
+// iamProvider builds the IAM token provider from WithIAMOptions, or from Application Default
+// Credentials for an IAM_AUTH instance without it, reusing the credentials built for the
+// instance lookup.
+func (r *resolved) iamProvider(ctx context.Context) (*tokenProvider, error) {
+	var iam IAMAuthOptions
+	if r.cfg.iam != nil {
+		iam = *r.cfg.iam
+	}
+	if iam.OnCredentialError == nil {
+		iam.OnCredentialError = r.cfg.onCredentialError
+	}
+	if iam.OnAuth == nil {
+		iam.OnAuth = r.cfg.onAuth
+	}
+	iam, err := withIAMDefaults(iam)
+	if err != nil {
+		return nil, err
+	}
+	setupCtx, cancel := context.WithTimeout(ctx, setupTimeout)
+	defer cancel()
+	if r.iamBase == nil {
+		base, err := setupBaseCreds(setupCtx, iam)
+		if err != nil {
+			return nil, err
+		}
+		r.iamBase = &base
+	}
+	return newTokenProvider(setupCtx, iam, *r.iamBase)
 }
 
 // clientOption builds the valkey.ClientOption, filling only zero-valued fields of the
@@ -221,23 +266,11 @@ func (r *resolved) clientOption(ctx context.Context) (valkey.ClientOption, error
 		plaintext := opt.TLSConfig == nil // reported in AuthEvent.Plaintext (U10)
 		switch r.auth {
 		case authIAM:
-			var iam IAMAuthOptions // an IAM_AUTH instance without WithIAMOptions uses ADC
-			if r.cfg.iam != nil {
-				iam = *r.cfg.iam
-			}
-			if iam.OnCredentialError == nil {
-				iam.OnCredentialError = r.cfg.onCredentialError
-			}
-			if iam.OnAuth == nil {
-				iam.OnAuth = r.cfg.onAuth
-			}
-			p, err := NewGCPTokenProvider(ctx, iam)
+			p, err := r.iamProvider(ctx)
 			if err != nil {
 				return valkey.ClientOption{}, err
 			}
-			if tp, ok := p.(*tokenProvider); ok {
-				tp.plaintext, r.authUser = plaintext, tp.username
-			}
+			p.plaintext, r.authUser = plaintext, p.username
 			opt.AuthCredentialsFn = p.AuthCredentialsFn()
 			installDialGate(&opt) // U8: space out re-dials after ERR_IAM_*
 		case authToken:

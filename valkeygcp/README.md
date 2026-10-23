@@ -13,7 +13,7 @@
 ### 1.1 Key Features
 
 * **The valkey-go Way:** `valkeygcp.NewClient(ctx, valkey.ClientOption{...}, opts...)` takes a regular `valkey.ClientOption`: endpoints in `InitAddress` and `Standalone.ReplicaAddress`, and any other valkey-go setting. Memorystore defaults only fill the fields you leave at zero. Options add what valkey-go has no field for: `WithInstance`, `WithIAMOptions` or `WithDefaultIAM`, `WithTokenAuth` and `WithTLS`.
-* **Auto-Discovery:** `WithInstance` reads the instance (auth mode, TLS mode, server CA, cluster mode, PSC endpoints) and fills in the endpoints, TLS and credentials the `ClientOption` leaves empty. Settings that contradict the instance fail before any connection is made.
+* **Auto-Discovery:** `WithInstance` reads the instance (auth mode, TLS mode, server CA, cluster mode, PSC endpoints) and fills in the endpoints, TLS and credentials the `ClientOption` leaves empty. It reads the instance as the identity `WithIAMOptions` names, or as ADC. Settings that contradict the instance fail before any connection is made.
 * **Zero-Password IAM Authentication:** Authenticate using Google Cloud IAM OAuth2 access tokens via Application Default Credentials (ADC), GKE Workload Identity, VM Metadata Server, or Service Account keys.
 * **Token Auth (`TOKEN_AUTH`):** Tokens from Secret Manager (recommended; global or regional secrets), a static value or a custom source; reloaded periodically so rotated tokens reach live connections.
 * **In-Transit Encryption:** Per-instance, shared regional and customer-managed (CAS) server CAs, TLS 1.2+, every CA chain loaded for overlap during CA rotation. Customer-managed CAs are read from their CA Service pool with `TLSOptions.FetchCustomCA` and the `valkeygcp/cas` package.
@@ -87,7 +87,7 @@ client, err := valkeygcp.NewClient(ctx, valkey.ClientOption{},
 )
 ```
 
-`WithInstance` fills in what the `ClientOption` leaves empty: the endpoint, the reader endpoint of a cluster-disabled instance, the server CA, and the credentials that match the instance's auth mode. An `IAM_AUTH` instance uses ADC unless you pass `WithIAMOptions`. It needs `memorystore.instances.get` (`roles/memorystore.viewer`) at startup; the Memorystore API is only used while `NewClient` runs. Add `WithNetwork` when the instance has endpoints in several VPC networks. `valkeygcp.ResolveClientOption` returns the wired `valkey.ClientOption` without connecting, so you can inspect or adjust it first.
+`WithInstance` fills in what the `ClientOption` leaves empty: the endpoint, the reader endpoint of a cluster-disabled instance, the server CA, and the credentials that match the instance's auth mode. An `IAM_AUTH` instance uses ADC unless you pass `WithIAMOptions`. The instance is read once, while `NewClient` runs, as the identity `WithIAMOptions` names (`CustomTokenSource`, `ImpersonateSA` or `CredentialsJSON`), or as ADC without one; that identity needs `memorystore.instances.get` (`roles/memorystore.viewer`). `WithGoogleAPIOptions` sets other credentials, an endpoint or a quota project for that call. Add `WithNetwork` when the instance has endpoints in several VPC networks. `valkeygcp.ResolveClientOption` returns the wired `valkey.ClientOption` without connecting, so you can inspect or adjust it first.
 
 #### Cluster Mode Disabled with a Reader Endpoint and Token Auth
 
@@ -116,6 +116,8 @@ client, err := valkeygcp.NewClient(ctx, valkey.ClientOption{InitAddress: []strin
 )
 ```
 
+The identity that impersonates is ADC, or the key or credential configuration in `CredentialsJSON` when you set it. The impersonated account is also used to read the instance with `WithInstance`.
+
 #### Customer-Managed CA (CA Service)
 
 ```go
@@ -127,7 +129,7 @@ client, err := valkeygcp.NewClient(ctx, valkey.ClientOption{},
 )
 ```
 
-The Memorystore API can't return a customer-managed CA, so `cas.FetchPoolCAs` reads the certificates of the instance's CA pool (`server_ca_pool`) from Certificate Authority Service. It needs `privateca.caPools.get` on the pool (`roles/privateca.poolReader`). Without it, pass the CA with `TLSOptions.CAFile` or `TLSOptions.CAPEM`.
+The Memorystore API can't return a customer-managed CA, so `cas.FetchPoolCAs` reads the certificates of the instance's CA pool (`server_ca_pool`) from Certificate Authority Service, as the same identity as the instance lookup (and with `WithGoogleAPIOptions`). That identity needs `privateca.caPools.get` on the pool (`roles/privateca.poolReader`). Without it, pass the CA with `TLSOptions.CAFile` or `TLSOptions.CAPEM`.
 
 #### Use with Other valkey-go Modules
 
@@ -168,7 +170,7 @@ The cluster settings are left out when `Standalone.ReplicaAddress` is set or the
 
 * **`NewClient`'s `ctx` bounds setup only.** Discovery, credential discovery, impersonation, the principal-email lookup, the first Token Auth read and connecting stop when it is cancelled or its deadline passes, and after 15 seconds if it has no deadline. Memorystore IAM backend errors during the connection handshake are retried with backoff within that time. Token refreshes never use it, because they run for the life of the client.
 * **Token fetches are capped.** Each IAM token fetch waits at most `IAMAuthOptions.FetchTimeout` (default 10s; negative disables the cap), and each Token Auth read at most 5s. A timed-out fetch is handled like any failed fetch: live connections keep the last valid token, and `OnCredentialError` (the `IAMAuthOptions` or `TokenAuthOptions` field, or the `OnCredentialError` option) reports it. A custom `TokenAuthOptions.Source` must return when its `ctx` ends.
-* **Setup needs working credentials.** valkey-go connects and authenticates while it builds the client, so missing ADC, a denied impersonation or an unreadable secret fails `NewClient` immediately, with the underlying error. Without ADC, leave out `WithInstance` (set `InitAddress` yourself; no control-plane call) and use a static or custom Token Auth source, `CustomTokenSource`, `CredentialsJSON`, or no auth.
+* **Setup needs working credentials.** valkey-go connects and authenticates while it builds the client, so missing ADC, a denied impersonation or an unreadable secret fails `NewClient` immediately, with the underlying error. Without ADC, name an identity in `WithIAMOptions` (`CustomTokenSource` or `CredentialsJSON`), which `WithInstance` also uses, or leave out `WithInstance` and set `InitAddress` yourself. Token Auth secrets are read with ADC; use `TokenAuthOptions.Source` or `Token` without it.
 * **Cluster mode is checked.** valkey-go falls back to a single-node client when `CLUSTER SHARDS` fails, for example because an ACL rule doesn't allow it. When the instance (`WithInstance`) or `WithTopology(valkeygcp.TopologyCluster)` says cluster mode, `NewClient` fails instead, naming the missing permission.
 * **One Secret Manager client per location.** All Token Auth providers share one Secret Manager client per location (global, or each region of a regional secret), created on first use, so creating many clients or retrying setup doesn't pile up gRPC connections. Regional secrets use their regional endpoint, `secretmanager.LOCATION.rep.googleapis.com`, which isn't reachable through Private Google Access.
 * **A rejected re-AUTH closes the connection.** If Memorystore rejects a proactive re-AUTH (for example with `ERR_IAM_EXHAUSTED`), valkey-go closes that connection and the next command dials again (`pipe.go` `refreshAuth`), although Memorystore would keep the authenticated connection working.
@@ -181,13 +183,15 @@ ACL rules must allow the commands valkey-go sends on every new connection: `clie
 
 ### 1.7 Required Roles
 
-| Mechanism              | Role on the workload identity                                                 |
+| Mechanism              | Role                                                                          |
 | :--------------------- | :---------------------------------------------------------------------------- |
 | IAM Auth               | `roles/memorystore.dbConnectionUser` (`memorystore.instances.connect`)        |
 | Token Auth             | `roles/secretmanager.secretAccessor` on the token secret                      |
 | Auto-discovery and CAs | `roles/memorystore.viewer` (`memorystore.instances.get`)                      |
 | Impersonation          | `roles/iam.serviceAccountTokenCreator` on the target service account          |
 | Customer-managed CA    | `roles/privateca.poolReader` (`privateca.caPools.get`) on the CA pool          |
+
+Grant them to the identity `WithIAMOptions` names (`CustomTokenSource`, `ImpersonateSA` or `CredentialsJSON`), or to the ADC identity without one: valkeygcp uses that one identity for IAM Auth, the instance lookup and the CA fetch. `WithGoogleAPIOptions` can choose other credentials for the lookup and the CA fetch. With `ImpersonateSA`, the other roles go to the impersonated account, and the identity that impersonates it (ADC, or `CredentialsJSON`) needs `roles/iam.serviceAccountTokenCreator` on it. The Token Auth secret is read with ADC.
 
 ### 1.8 Testing
 

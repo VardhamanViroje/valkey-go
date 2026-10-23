@@ -344,7 +344,7 @@ func TestResolve_PlaintextCredentials(t *testing.T) {
 		name    string
 		option  valkey.ClientOption
 		opts    []Option
-		reader  func(context.Context) (instanceReader, error)
+		reader  readerFactory
 		refused bool
 	}{
 		{"IAM, no TLS option", initOption("10.0.0.15:6379"), []Option{iam}, noReader(t), true},

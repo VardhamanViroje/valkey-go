@@ -26,8 +26,32 @@ func testServer(t *testing.T, status int, body string) *httptest.Server {
 	return srv
 }
 
-func fetcherFor(srv *httptest.Server) func(context.Context, string) ([]string, error) {
-	return Fetcher(option.WithEndpoint(srv.URL+"/"), option.WithoutAuthentication(), option.WithHTTPClient(srv.Client()))
+// serverOptions point a CA Service client at srv.
+func serverOptions(srv *httptest.Server) []option.ClientOption {
+	return []option.ClientOption{option.WithEndpoint(srv.URL + "/"), option.WithoutAuthentication(), option.WithHTTPClient(srv.Client())}
+}
+
+func fetcherFor(srv *httptest.Server) func(context.Context, string, ...option.ClientOption) ([]string, error) {
+	return Fetcher(serverOptions(srv)...)
+}
+
+// FetchPoolCAs builds its client with the options of the call: valkeygcp passes its setup
+// identity and WithGoogleAPIOptions there.
+func TestFetchPoolCAs_CallOptions(t *testing.T) {
+	srv := testServer(t, http.StatusOK, `{"caCerts":[{"certificates":["A"]}]}`)
+	got, err := FetchPoolCAs(context.Background(), "projects/p/locations/l/caPools/pool", serverOptions(srv)...)
+	if err != nil || strings.Join(got, ",") != "A" {
+		t.Fatalf("got %q, %v", got, err)
+	}
+}
+
+// A Fetcher's own options come after the options of the call, so they win.
+func TestFetcher_OwnOptionsWin(t *testing.T) {
+	srv := testServer(t, http.StatusOK, `{"caCerts":[{"certificates":["A"]}]}`)
+	got, err := fetcherFor(srv)(context.Background(), "projects/p/locations/l/caPools/pool", option.WithEndpoint("http://127.0.0.1:1/"))
+	if err != nil || strings.Join(got, ",") != "A" {
+		t.Fatalf("got %q, %v; want the Fetcher's endpoint to win", got, err)
+	}
 }
 
 // Every certificate of every chain is returned, in order.
@@ -49,4 +73,3 @@ func TestFetcher_Error(t *testing.T) {
 		t.Fatalf("got %v, want the 403 naming the pool", err)
 	}
 }
-

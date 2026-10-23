@@ -674,6 +674,41 @@ func TestImpersonateLifetime(t *testing.T) {
 	}
 }
 
+// G6: with CredentialsJSON, the key is the identity that impersonates ImpersonateSA; without
+// it, ADC is. With a custom lifetime, every new token is minted with the same identity.
+func TestImpersonation_SourceIdentity(t *testing.T) {
+	orig := impersonateTokenSource
+	defer func() { impersonateTokenSource = orig }()
+	var mu sync.Mutex
+	var calls []int // options passed to each impersonation call
+	impersonateTokenSource = func(_ context.Context, _ impersonate.CredentialsConfig, opts ...option.ClientOption) (oauth2.TokenSource, error) {
+		mu.Lock()
+		calls = append(calls, len(opts))
+		mu.Unlock()
+		return oauth2.StaticTokenSource(&oauth2.Token{AccessToken: "imp", Expiry: time.Now().Add(time.Minute)}), nil
+	}
+	const sa = "reader@db-proj.iam.gserviceaccount.com"
+	key := []byte(`{"type":"service_account","client_email":"key@p.iam.gserviceaccount.com"}`)
+
+	if _, err := NewGCPTokenProvider(context.Background(), IAMAuthOptions{ImpersonateSA: sa}); err != nil {
+		t.Fatal(err)
+	}
+	p, err := NewGCPTokenProvider(context.Background(), IAMAuthOptions{ImpersonateSA: sa, CredentialsJSON: key, ImpersonateLifetime: 2 * time.Hour})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range 2 { // inside the refresh buffer, the second fetch mints a new token
+		if _, err := p.Token(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(calls) != 3 || calls[0] != 0 || calls[1] != 1 || calls[2] != 1 {
+		t.Fatalf("options per impersonation call = %v, want [0 1 1] (ADC, then the key for every mint)", calls)
+	}
+}
+
 // 13. Context and timeouts: setup honors the caller's ctx; upstream fetches are capped.
 
 // T-CTX-3: impersonation setup errors surface from the provider and the option.

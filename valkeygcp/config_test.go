@@ -18,8 +18,8 @@ import (
 )
 
 // noReader fails the test if resolution touches the control plane.
-func noReader(t *testing.T) func(context.Context) (instanceReader, error) {
-	return func(context.Context) (instanceReader, error) {
+func noReader(t *testing.T) readerFactory {
+	return func(context.Context, googleAPI) (instanceReader, error) {
 		t.Fatal("this resolution must not call the Memorystore API")
 		return nil, nil
 	}
@@ -32,13 +32,13 @@ func initOption(addrs ...string) valkey.ClientOption {
 }
 
 // resolveWith runs resolve with opts, using newReader in place of the Memorystore API.
-func resolveWith(option valkey.ClientOption, newReader func(context.Context) (instanceReader, error), opts ...Option) (*resolved, error) {
+func resolveWith(option valkey.ClientOption, newReader readerFactory, opts ...Option) (*resolved, error) {
 	return resolve(context.Background(), option, newConfig(opts), newReader)
 }
 
 // resolveOption returns the ClientOption NewClient would connect with, like
 // ResolveClientOption, using newReader in place of the Memorystore API.
-func resolveOption(t *testing.T, option valkey.ClientOption, newReader func(context.Context) (instanceReader, error), opts ...Option) (valkey.ClientOption, error) {
+func resolveOption(t *testing.T, option valkey.ClientOption, newReader readerFactory, opts ...Option) (valkey.ClientOption, error) {
 	t.Helper()
 	r, err := resolveWith(option, newReader, opts...)
 	if err != nil {
@@ -244,7 +244,7 @@ func TestResolve_CallerCredentialsConflict(t *testing.T) {
 	kept := []struct {
 		name   string
 		option valkey.ClientOption
-		reader func(context.Context) (instanceReader, error)
+		reader readerFactory
 		opts   []Option
 	}{
 		{"Password", withPassword, noReader(t), nil},

@@ -12,6 +12,7 @@ import (
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
 	"google.golang.org/api/impersonate"
+	"google.golang.org/api/option"
 )
 
 // Defaults applied when the matching IAMAuthOptions field is left empty.
@@ -28,14 +29,30 @@ const (
 const credentialRetry = 30 * time.Second
 
 // IAMAuthOptions configures the GCP IAM OAuth2 token provider.
+//
+// The identity it names (CustomTokenSource, ImpersonateSA or CredentialsJSON, otherwise
+// Application Default Credentials) is also the identity NewClient uses for the Google API
+// calls it makes during setup: the instance lookup of WithInstance and
+// TLSOptions.FetchCustomCA. WithGoogleAPIOptions can choose other credentials for those calls.
 type IAMAuthOptions struct {
-	Username          string
-	RefreshBuffer     time.Duration
+	Username      string
+	RefreshBuffer time.Duration
+	// CustomTokenSource supplies the access tokens. It wins over ImpersonateSA and
+	// CredentialsJSON.
 	CustomTokenSource oauth2.TokenSource
-	Scopes            []string
-	CredentialsJSON   []byte
-	ImpersonateSA     string
-	Delegates         []string
+	// Scopes are requested for the access tokens; DefaultCloudPlatformScope when empty. The
+	// setup API calls use the same tokens, so keep a scope the Memorystore API accepts, such
+	// as the default.
+	Scopes []string
+	// CredentialsJSON is a service account key or a credential configuration (for example
+	// Workload Identity Federation), used instead of Application Default Credentials. With
+	// ImpersonateSA, it is the identity that impersonates.
+	CredentialsJSON []byte
+	// ImpersonateSA is the service account whose tokens are used (G6). The identity that
+	// impersonates it is CredentialsJSON when set, otherwise Application Default Credentials.
+	ImpersonateSA string
+	// Delegates is the delegation chain for ImpersonateSA.
+	Delegates []string
 
 	// UsernameStrategy picks the AUTH username when Username is empty (U4).
 	UsernameStrategy UsernameStrategy
@@ -88,6 +105,26 @@ var impersonateTokenSource = impersonate.CredentialsTokenSource
 // ctx bounds the one-off setup (credential discovery, impersonation, the principal-email
 // lookup), capped at 15s when it has no earlier deadline. Token refreshes don't use it.
 func NewGCPTokenProvider(ctx context.Context, opt IAMAuthOptions) (GCPTokenProvider, error) {
+	opt, err := withIAMDefaults(opt)
+	if err != nil {
+		return nil, err
+	}
+	setupCtx, cancel := context.WithTimeout(ctx, setupTimeout)
+	defer cancel()
+	base, err := setupBaseCreds(setupCtx, opt)
+	if err != nil {
+		return nil, err
+	}
+	p, err := newTokenProvider(setupCtx, opt, base)
+	if err != nil {
+		return nil, err // not p: a nil *tokenProvider would make a non-nil interface
+	}
+	return p, nil
+}
+
+// withIAMDefaults fills the defaults of the IAMAuthOptions fields left empty and checks the
+// options.
+func withIAMDefaults(opt IAMAuthOptions) (IAMAuthOptions, error) {
 	if opt.RefreshBuffer <= 0 {
 		opt.RefreshBuffer = DefaultRefreshBuffer
 	}
@@ -98,27 +135,31 @@ func NewGCPTokenProvider(ctx context.Context, opt IAMAuthOptions) (GCPTokenProvi
 		opt.FetchTimeout = DefaultTokenFetchTimeout
 	}
 	if opt.ImpersonateLifetime < 0 || (opt.ImpersonateLifetime > 0 && opt.ImpersonateLifetime <= opt.RefreshBuffer) {
-		return nil, fmt.Errorf("valkeygcp: ImpersonateLifetime (%v) must be longer than RefreshBuffer (%v)", opt.ImpersonateLifetime, opt.RefreshBuffer)
+		return IAMAuthOptions{}, fmt.Errorf("valkeygcp: ImpersonateLifetime (%v) must be longer than RefreshBuffer (%v)", opt.ImpersonateLifetime, opt.RefreshBuffer)
 	}
+	return opt, nil
+}
 
-	setupCtx, cancel := context.WithTimeout(ctx, setupTimeout)
-	defer cancel()
+// setupBaseCreds builds the upstream credentials of opt (filled by withIAMDefaults), waiting
+// until ctx ends at most.
+func setupBaseCreds(ctx context.Context, opt IAMAuthOptions) (baseCreds, error) {
 	// Token sources refresh for as long as the client lives, so they must not inherit ctx's
 	// cancellation (a NewClient timeout would otherwise break every later refresh). The setup
-	// itself still stops when setupCtx ends: callWithContext stops waiting for it.
+	// itself still stops when ctx ends: callWithContext stops waiting for it.
 	srcCtx := context.WithoutCancel(ctx)
-	base, err := callWithContext(setupCtx, "credential setup", func() (baseCreds, error) {
+	return callWithContext(ctx, "credential setup", func() (baseCreds, error) {
 		return newBaseCreds(srcCtx, opt)
 	})
-	if err != nil {
-		return nil, err
-	}
+}
 
-	username, err := resolveUsername(setupCtx, opt, base.json)
+// newTokenProvider builds the token provider on base, the upstream credentials of opt
+// (setupBaseCreds). ctx bounds the principal-email lookup.
+func newTokenProvider(ctx context.Context, opt IAMAuthOptions, base baseCreds) (*tokenProvider, error) {
+	username, err := resolveUsername(ctx, opt, base.json)
 	if err != nil {
 		return nil, err
 	}
-	if err := checkIAMUsername(setupCtx, opt, base.json); err != nil {
+	if err := checkIAMUsername(ctx, opt, base.json); err != nil {
 		return nil, err
 	}
 
@@ -152,13 +193,24 @@ func newBaseCreds(ctx context.Context, opt IAMAuthOptions) (baseCreds, error) {
 	case opt.CustomTokenSource != nil:
 		return baseCreds{source: opt.CustomTokenSource, json: opt.CredentialsJSON}, nil
 	case opt.ImpersonateSA != "":
-		// Gap G6: Cross-project Service Account Impersonation
+		// Gap G6: Cross-project Service Account Impersonation. The identity that impersonates is
+		// CredentialsJSON when set, otherwise ADC (impersonate's default).
+		var source []option.ClientOption
+		if len(opt.CredentialsJSON) > 0 {
+			// The IAM Credentials API needs the cloud-platform scope, whatever opt.Scopes asks of
+			// the impersonated tokens.
+			creds, err := google.CredentialsFromJSONWithType(ctx, opt.CredentialsJSON, credTypeFromJSON(opt.CredentialsJSON), DefaultCloudPlatformScope)
+			if err != nil {
+				return baseCreds{}, fmt.Errorf("valkeygcp: invalid credentials JSON: %w", err)
+			}
+			source = append(source, option.WithTokenSource(creds.TokenSource))
+		}
 		ts, err := newImpersonatedSource(ctx, impersonate.CredentialsConfig{
 			TargetPrincipal: opt.ImpersonateSA,
 			Scopes:          opt.Scopes,
 			Delegates:       opt.Delegates,
 			Lifetime:        opt.ImpersonateLifetime,
-		})
+		}, source...)
 		if err != nil {
 			return baseCreds{}, fmt.Errorf("valkeygcp: impersonation token source failed: %w", err)
 		}
@@ -290,21 +342,23 @@ func (l *authLimiter) wait() {
 	time.Sleep(sleep)
 }
 
-// newImpersonatedSource builds the impersonated token source (G6). With a Lifetime set,
-// impersonate.CredentialsTokenSource returns a static source that never refreshes, so it is
-// wrapped to mint a new token whenever the C1 cache asks for one.
-func newImpersonatedSource(ctx context.Context, cfg impersonate.CredentialsConfig) (oauth2.TokenSource, error) {
-	ts, err := impersonateTokenSource(ctx, cfg)
+// newImpersonatedSource builds the impersonated token source (G6); opts name the identity
+// that impersonates (ADC when empty). With a Lifetime set, impersonate.CredentialsTokenSource
+// returns a static source that never refreshes, so it is wrapped to mint a new token whenever
+// the C1 cache asks for one.
+func newImpersonatedSource(ctx context.Context, cfg impersonate.CredentialsConfig, opts ...option.ClientOption) (oauth2.TokenSource, error) {
+	ts, err := impersonateTokenSource(ctx, cfg, opts...)
 	if err != nil || cfg.Lifetime == 0 {
 		return ts, err
 	}
-	return &lifetimeSource{ctx: ctx, cfg: cfg, first: ts}, nil
+	return &lifetimeSource{ctx: ctx, cfg: cfg, opts: opts, first: ts}, nil
 }
 
 // lifetimeSource refreshes impersonated tokens that use a custom lifetime.
 type lifetimeSource struct {
 	ctx   context.Context
 	cfg   impersonate.CredentialsConfig
+	opts  []option.ClientOption // the identity that impersonates
 	mu    sync.Mutex
 	first oauth2.TokenSource // the static source from construction, used once
 }
@@ -317,7 +371,7 @@ func (s *lifetimeSource) Token() (*oauth2.Token, error) {
 	if first != nil {
 		return first.Token()
 	}
-	ts, err := impersonateTokenSource(s.ctx, s.cfg)
+	ts, err := impersonateTokenSource(s.ctx, s.cfg, s.opts...)
 	if err != nil {
 		return nil, err
 	}

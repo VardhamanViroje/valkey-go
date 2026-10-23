@@ -5,25 +5,28 @@ import (
 	"time"
 
 	"github.com/valkey-io/valkey-go"
+	"google.golang.org/api/option"
 )
 
 // Option configures what NewClient and ResolveClientOption add to a valkey.ClientOption:
 // Memorystore discovery (WithInstance), IAM or Token Auth credentials (WithIAMOptions,
-// WithDefaultIAM, WithTokenAuth) and TLS from CA material (WithTLS). Settings valkey-go
-// already has a field for, such as addresses, TLSConfig and timeouts, are set on the
-// valkey.ClientOption itself. Later options override earlier ones of the same kind.
+// WithDefaultIAM, WithTokenAuth), TLS from CA material (WithTLS) and the Google API clients
+// used during setup (WithGoogleAPIOptions). Settings valkey-go already has a field for, such
+// as addresses, TLSConfig and timeouts, are set on the valkey.ClientOption itself. Later
+// options override earlier ones of the same kind.
 type Option func(*config)
 
 // config collects the Options of one NewClient or ResolveClientOption call.
 type config struct {
-	instance          string            // WithInstance
-	network           string            // WithNetwork
-	topology          Topology          // WithTopology
-	iam               *IAMAuthOptions   // WithIAMOptions, WithDefaultIAM; nil when not given
-	token             *TokenAuthOptions // WithTokenAuth; nil when not given
-	tls               TLSOptions        // WithTLS
-	onAuth            func(AuthEvent)   // OnAuth
-	onCredentialError func(error)       // OnCredentialError
+	instance          string                // WithInstance
+	network           string                // WithNetwork
+	topology          Topology              // WithTopology
+	iam               *IAMAuthOptions       // WithIAMOptions, WithDefaultIAM; nil when not given
+	token             *TokenAuthOptions     // WithTokenAuth; nil when not given
+	tls               TLSOptions            // WithTLS
+	onAuth            func(AuthEvent)       // OnAuth
+	onCredentialError func(error)           // OnCredentialError
+	googleAPI         []option.ClientOption // WithGoogleAPIOptions
 }
 
 func newConfig(opts []Option) config {

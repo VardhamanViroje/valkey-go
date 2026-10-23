@@ -47,6 +47,8 @@ type fakeReader struct {
 	perName                     string
 	sharedProject, sharedRegion string
 	closed                      bool
+	api                         googleAPI // what the reader factory got
+	factoryCalls                int
 }
 
 func (f *fakeReader) GetInstance(_ context.Context, name string) (*memorystorepb.Instance, error) {
@@ -71,8 +73,12 @@ func (f *fakeReader) Close() error {
 	return nil
 }
 
-func (f *fakeReader) factory() func(context.Context) (instanceReader, error) {
-	return func(context.Context) (instanceReader, error) { return f, nil }
+func (f *fakeReader) factory() readerFactory {
+	return func(_ context.Context, api googleAPI) (instanceReader, error) {
+		f.api = api
+		f.factoryCalls++
+		return f, nil
+	}
 }
 
 // autoConn is an endpoints[].connections[] entry created by service connectivity automation.

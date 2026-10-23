@@ -11,6 +11,8 @@ import (
 	memorystore "cloud.google.com/go/memorystore/apiv1"
 	"cloud.google.com/go/memorystore/apiv1/memorystorepb"
 	"github.com/valkey-io/valkey-go"
+	"golang.org/x/oauth2"
+	"google.golang.org/api/option"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -25,10 +27,32 @@ type instanceReader interface {
 	Close() error
 }
 
+// googleAPI says how the Google API clients created during setup authenticate: as ts, the
+// setup identity (nil for Application Default Credentials), then the caller's
+// WithGoogleAPIOptions.
+type googleAPI struct {
+	ts   oauth2.TokenSource
+	opts []option.ClientOption
+}
+
+// clientOptions returns the options for one Google API client.
+func (g googleAPI) clientOptions() []option.ClientOption {
+	all := make([]option.ClientOption, 0, len(g.opts)+1)
+	if g.ts != nil {
+		all = append(all, option.WithTokenSource(g.ts))
+	}
+	return append(all, g.opts...)
+}
+
+// readerFactory creates the instanceReader for one resolution; tests inject a fake.
+type readerFactory func(ctx context.Context, api googleAPI) (instanceReader, error)
+
 type apiReader struct{ c *memorystore.Client }
 
-func defaultInstanceReader(ctx context.Context) (instanceReader, error) {
-	c, err := memorystore.NewClient(ctx) // ADC; needs memorystore.instances.get
+// defaultInstanceReader reads the instance through the Memorystore API. The setup identity
+// needs memorystore.instances.get.
+func defaultInstanceReader(ctx context.Context, api googleAPI) (instanceReader, error) {
+	c, err := memorystore.NewClient(ctx, api.clientOptions()...)
 	if err != nil {
 		return nil, fmt.Errorf("valkeygcp: memorystore API client: %w", err)
 	}
@@ -144,7 +168,7 @@ func trimNetworkURL(n string) string {
 // resolve applies §1.5: the caller's ClientOption and Options, then the values discovered from
 // the instance, then a safe default. Contradictions between the caller's settings and the
 // instance are errors.
-func resolve(ctx context.Context, option valkey.ClientOption, cfg config, newReader func(context.Context) (instanceReader, error)) (*resolved, error) {
+func resolve(ctx context.Context, option valkey.ClientOption, cfg config, newReader readerFactory) (*resolved, error) {
 	if err := checkEnums(cfg); err != nil {
 		return nil, err
 	}
@@ -153,6 +177,9 @@ func resolve(ctx context.Context, option valkey.ClientOption, cfg config, newRea
 	}
 	if cfg.network != "" && cfg.instance == "" {
 		return nil, errors.New("valkeygcp: WithNetwork needs WithInstance")
+	}
+	if len(cfg.googleAPI) > 0 && cfg.instance == "" {
+		return nil, errors.New("valkeygcp: WithGoogleAPIOptions needs WithInstance")
 	}
 	r := &resolved{
 		opt:      option,
@@ -186,13 +213,40 @@ func authOptionName(cfg config) string {
 	return "WithTokenAuth"
 }
 
+// setupIdentity picks the identity of the Google API calls made during setup: the one
+// WithIAMOptions names (see IAMAuthOptions), built once here and reused by the IAM token
+// provider, or Application Default Credentials without WithIAMOptions. The caller's
+// WithGoogleAPIOptions follow it.
+func (r *resolved) setupIdentity(ctx context.Context) error {
+	r.api.opts = r.cfg.googleAPI
+	if r.cfg.iam == nil {
+		return nil
+	}
+	iam, err := withIAMDefaults(*r.cfg.iam)
+	if err != nil {
+		return err
+	}
+	setupCtx, cancel := context.WithTimeout(ctx, setupTimeout)
+	defer cancel()
+	base, err := setupBaseCreds(setupCtx, iam)
+	if err != nil {
+		return err
+	}
+	r.iamBase = &base
+	r.api.ts = oauth2.ReuseTokenSource(nil, base.source) // one token for every setup call
+	return nil
+}
+
 // discover reads the instance and fills topology, modes, endpoints and the server CA.
-func (r *resolved) discover(ctx context.Context, newReader func(context.Context) (instanceReader, error)) error {
+func (r *resolved) discover(ctx context.Context, newReader readerFactory) error {
 	project, region, err := parseInstanceName(r.cfg.instance)
 	if err != nil {
 		return err
 	}
-	rd, err := newReader(ctx)
+	if err := r.setupIdentity(ctx); err != nil {
+		return err
+	}
+	rd, err := newReader(ctx, r.api)
 	if err != nil {
 		return err
 	}
@@ -278,7 +332,7 @@ func (r *resolved) fetchCustomCA(ctx context.Context, inst *memorystorepb.Instan
 	if pool == "" {
 		return fmt.Errorf("valkeygcp: instance %s uses CUSTOMER_MANAGED_CAS_CA but reports no server_ca_pool", r.cfg.instance)
 	}
-	pems, err := fetch(ctx, pool)
+	pems, err := fetch(ctx, pool, r.api.clientOptions()...) // same identity as the instance lookup
 	if err != nil {
 		return fmt.Errorf("valkeygcp: fetch the CA certificates of %s (needs privateca.caPools.get, for example roles/privateca.poolReader): %w", pool, err)
 	}

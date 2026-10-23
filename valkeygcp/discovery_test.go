@@ -6,10 +6,15 @@ import (
 	"errors"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"cloud.google.com/go/memorystore/apiv1/memorystorepb"
 	"github.com/valkey-io/valkey-go"
+	"golang.org/x/oauth2"
+	"google.golang.org/api/impersonate"
+	"google.golang.org/api/option"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -193,7 +198,7 @@ func TestResolve_DiscoverPermissionDenied(t *testing.T) {
 
 	// The reader factory's own error is returned as is.
 	boom := errors.New("no ADC")
-	_, err = resolveWith(valkey.ClientOption{}, func(context.Context) (instanceReader, error) { return nil, boom }, WithInstance(testInstance))
+	_, err = resolveWith(valkey.ClientOption{}, func(context.Context, googleAPI) (instanceReader, error) { return nil, boom }, WithInstance(testInstance))
 	if !errors.Is(err, boom) {
 		t.Fatalf("factory error: got %v", err)
 	}
@@ -444,7 +449,7 @@ func TestResolve_DiscoverCustomerManagedCAFetch(t *testing.T) {
 	const pool = "projects/my-proj/locations/us-west4/caPools/valkey-pool"
 	ca := newTestCA(t, "cas")
 	var gotPool string
-	fetch := func(_ context.Context, p string) ([]string, error) {
+	fetch := func(_ context.Context, p string, _ ...option.ClientOption) ([]string, error) {
 		gotPool = p
 		return []string{string(ca.pem)}, nil
 	}
@@ -476,17 +481,158 @@ func TestResolve_DiscoverCustomerManagedCAFetchErrors(t *testing.T) {
 	cases := []struct {
 		name  string
 		inst  *memorystorepb.Instance
-		fetch func(context.Context, string) ([]string, error)
+		fetch func(context.Context, string, ...option.ClientOption) ([]string, error)
 		want  string
 	}{
-		{"no pool", cmcaInstance(""), func(context.Context, string) ([]string, error) { return nil, nil }, "no server_ca_pool"},
-		{"fetch error", cmcaInstance(pool), func(context.Context, string) ([]string, error) { return nil, errors.New("403") }, "privateca.caPools.get"},
-		{"empty pool", cmcaInstance(pool), func(context.Context, string) ([]string, error) { return nil, nil }, "returned no CA certificate"},
+		{"no pool", cmcaInstance(""), func(context.Context, string, ...option.ClientOption) ([]string, error) { return nil, nil }, "no server_ca_pool"},
+		{"fetch error", cmcaInstance(pool), func(context.Context, string, ...option.ClientOption) ([]string, error) { return nil, errors.New("403") }, "privateca.caPools.get"},
+		{"empty pool", cmcaInstance(pool), func(context.Context, string, ...option.ClientOption) ([]string, error) { return nil, nil }, "returned no CA certificate"},
 	}
 	for _, c := range cases {
 		_, err := resolveWith(valkey.ClientOption{}, (&fakeReader{inst: c.inst}).factory(), WithInstance(testInstance), WithTLS(TLSOptions{FetchCustomCA: c.fetch}))
 		if err == nil || !strings.Contains(err.Error(), c.want) {
 			t.Errorf("%s: got %v, want error containing %q", c.name, err, c.want)
 		}
+	}
+}
+
+// lookupToken returns the access token the instance lookup authenticates with, or "" for
+// Application Default Credentials.
+func lookupToken(t *testing.T, api googleAPI) string {
+	t.Helper()
+	if api.ts == nil {
+		return ""
+	}
+	tok, err := api.ts.Token()
+	if err != nil {
+		t.Fatalf("lookup token: %v", err)
+	}
+	return tok.AccessToken
+}
+
+// T-DISC-15 (Issue 2): the instance lookup runs as the identity WithIAMOptions names, also
+// when the instance turns out not to use IAM; without WithIAMOptions it uses ADC.
+func TestResolve_LookupUsesIAMIdentity(t *testing.T) {
+	cases := []struct {
+		name     string
+		mode     memorystorepb.Instance_AuthorizationMode
+		opts     []Option
+		wantTok  string // "" = ADC
+		wantAuth string // AUTH password, "" = no credentials
+	}{
+		{"IAM instance, custom token source", memorystorepb.Instance_IAM_AUTH, []Option{WithIAMOptions(staticIAM())}, "iam-token", "iam-token"},
+		{"Token Auth instance, IAM identity", memorystorepb.Instance_TOKEN_AUTH,
+			[]Option{WithIAMOptions(staticIAM()), WithTokenAuth(TokenAuthOptions{Token: "tok"})}, "iam-token", "tok"},
+		{"no IAM option", memorystorepb.Instance_TOKEN_AUTH, []Option{WithTokenAuth(TokenAuthOptions{Token: "tok"})}, "", "tok"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			fake := &fakeReader{inst: clusterInstance(c.mode)}
+			opt, err := resolveOption(t, valkey.ClientOption{}, fake.factory(), append([]Option{WithInstance(testInstance)}, c.opts...)...)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := lookupToken(t, fake.api); got != c.wantTok {
+				t.Errorf("lookup token %q, want %q", got, c.wantTok)
+			}
+			creds, err := opt.AuthCredentialsFn(valkey.AuthCredentialsContext{})
+			if err != nil || creds.Password != c.wantAuth {
+				t.Errorf("AUTH password %q (%v), want %q", creds.Password, err, c.wantAuth)
+			}
+		})
+	}
+
+	// CredentialsJSON: the lookup gets the key's token source, not ADC.
+	fake := &fakeReader{inst: clusterInstance(memorystorepb.Instance_AUTH_DISABLED)}
+	key := IAMAuthOptions{CredentialsJSON: []byte(`{"type":"service_account","client_email":"key@p.iam.gserviceaccount.com"}`)}
+	if _, err := resolveOption(t, valkey.ClientOption{}, fake.factory(), WithInstance(testInstance), WithIAMOptions(key)); err != nil {
+		t.Fatal(err)
+	}
+	if fake.api.ts == nil {
+		t.Error("CredentialsJSON: the lookup uses ADC")
+	}
+}
+
+// T-DISC-16: with impersonation, the lookup and AUTH use the impersonated identity, which
+// is set up once.
+func TestResolve_LookupImpersonatesOnce(t *testing.T) {
+	orig := impersonateTokenSource
+	defer func() { impersonateTokenSource = orig }()
+	var calls atomic.Int32
+	impersonateTokenSource = func(context.Context, impersonate.CredentialsConfig, ...option.ClientOption) (oauth2.TokenSource, error) {
+		calls.Add(1)
+		return oauth2.StaticTokenSource(&oauth2.Token{AccessToken: "imp-token", Expiry: time.Now().Add(time.Hour)}), nil
+	}
+	fake := &fakeReader{inst: clusterInstance(memorystorepb.Instance_IAM_AUTH)}
+	opt, err := resolveOption(t, valkey.ClientOption{}, fake.factory(),
+		WithInstance(testInstance), WithIAMOptions(IAMAuthOptions{ImpersonateSA: "reader@db-proj.iam.gserviceaccount.com"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := lookupToken(t, fake.api); got != "imp-token" {
+		t.Errorf("lookup token %q, want the impersonated token", got)
+	}
+	if creds, err := opt.AuthCredentialsFn(valkey.AuthCredentialsContext{}); err != nil || creds.Password != "imp-token" {
+		t.Errorf("AUTH password %q (%v), want the impersonated token", creds.Password, err)
+	}
+	if n := calls.Load(); n != 1 {
+		t.Errorf("impersonation set up %d times, want 1", n)
+	}
+}
+
+// T-DISC-17: an identity that can't be set up fails before the lookup.
+func TestResolve_IdentityErrorsBeforeLookup(t *testing.T) {
+	t.Setenv("GOOGLE_APPLICATION_CREDENTIALS", filepath.Join(t.TempDir(), "missing.json"))
+	cases := []struct {
+		name string
+		iam  IAMAuthOptions
+		want string
+	}{
+		{"missing ADC", IAMAuthOptions{}, "Application Default Credentials not found"},
+		{"ImpersonateLifetime too short", IAMAuthOptions{ImpersonateSA: "sa@p.iam.gserviceaccount.com", ImpersonateLifetime: time.Minute}, "ImpersonateLifetime"},
+	}
+	for _, c := range cases {
+		fake := &fakeReader{inst: clusterInstance(memorystorepb.Instance_IAM_AUTH)}
+		_, err := resolveWith(valkey.ClientOption{}, fake.factory(), WithInstance(testInstance), WithIAMOptions(c.iam))
+		if err == nil || !strings.Contains(err.Error(), c.want) {
+			t.Errorf("%s: got %v, want %q", c.name, err, c.want)
+		}
+		if fake.factoryCalls != 0 {
+			t.Errorf("%s: the instance was looked up", c.name)
+		}
+	}
+}
+
+// T-DISC-18: WithGoogleAPIOptions follow the identity, for the lookup and the customer-managed
+// CA fetch, and need WithInstance.
+func TestResolve_WithGoogleAPIOptions(t *testing.T) {
+	endpoint, quota := option.WithEndpoint("memorystore.example:443"), option.WithQuotaProject("billing-proj")
+	fake := &fakeReader{inst: clusterInstance(memorystorepb.Instance_AUTH_DISABLED)}
+	if _, err := resolveWith(valkey.ClientOption{}, fake.factory(), WithInstance(testInstance), WithIAMOptions(staticIAM()),
+		WithGoogleAPIOptions(endpoint), WithGoogleAPIOptions(quota)); err != nil {
+		t.Fatal(err)
+	}
+	got := fake.api.clientOptions()
+	if len(got) != 3 || got[1] != endpoint || got[2] != quota || lookupToken(t, fake.api) != "iam-token" {
+		t.Fatalf("lookup client options = %v, want the identity, then the endpoint and quota project", got)
+	}
+
+	ca := newTestCA(t, "cas")
+	var fetchOpts []option.ClientOption
+	fetch := func(_ context.Context, _ string, opts ...option.ClientOption) ([]string, error) {
+		fetchOpts = opts
+		return []string{string(ca.pem)}, nil
+	}
+	if _, err := resolveOption(t, valkey.ClientOption{}, (&fakeReader{inst: cmcaInstance("projects/p/locations/l/caPools/x")}).factory(),
+		WithInstance(testInstance), WithIAMOptions(staticIAM()), WithGoogleAPIOptions(quota), WithTLS(TLSOptions{FetchCustomCA: fetch})); err != nil {
+		t.Fatal(err)
+	}
+	if len(fetchOpts) != 2 || fetchOpts[1] != quota {
+		t.Errorf("FetchCustomCA options = %v, want the identity, then the quota project", fetchOpts)
+	}
+
+	if _, err := resolveWith(initOption("10.0.0.15:6379"), noReader(t), WithGoogleAPIOptions(quota)); err == nil ||
+		!strings.Contains(err.Error(), "WithGoogleAPIOptions needs WithInstance") {
+		t.Fatalf("without WithInstance: got %v", err)
 	}
 }
