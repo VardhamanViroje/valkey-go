@@ -27,11 +27,17 @@ const (
 const credentialRetry = 30 * time.Second
 
 // IAMAuthOptions configures the GCP IAM OAuth2 token provider.
+//
+// The access tokens come from CustomTokenSource, or from Application Default Credentials when
+// it is nil; that identity needs roles/memorystore.dbConnectionUser on the instance.
 type IAMAuthOptions struct {
-	Username          string
-	RefreshBuffer     time.Duration
+	Username      string
+	RefreshBuffer time.Duration
+	// CustomTokenSource supplies the access tokens instead of Application Default Credentials.
 	CustomTokenSource oauth2.TokenSource
-	Scopes            []string
+	// Scopes are requested from Application Default Credentials; DefaultCloudPlatformScope
+	// when empty. They aren't used with CustomTokenSource.
+	Scopes []string
 
 	// DisableProactiveReauth turns off re-AUTH on live connections (Q2): every new connection
 	// still gets a fresh token, but RefreshAfter stays zero.

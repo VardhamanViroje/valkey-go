@@ -164,9 +164,11 @@ The cluster settings are left out when `Standalone.ReplicaAddress` is set. valke
 
 ### 1.7 Required Roles
 
-| Mechanism | Role on the workload identity                                              |
-| :-------- | :------------------------------------------------------------------------- |
+| Mechanism | Role                                                                   |
+| :-------- | :--------------------------------------------------------------------- |
 | IAM Auth  | `roles/memorystore.dbConnectionUser` (`memorystore.instances.connect`) |
+
+Grant it to the identity behind the access tokens: the ADC identity, or the identity of `IAMAuthOptions.CustomTokenSource` when you set one.
 
 ### 1.8 Testing
 
