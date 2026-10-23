@@ -47,4 +47,3 @@ func Fetcher(opts ...option.ClientOption) func(ctx context.Context, caPool strin
 		return pems, nil
 	}
 }
-

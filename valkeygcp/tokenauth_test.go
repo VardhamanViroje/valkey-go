@@ -220,21 +220,26 @@ func TestTokenAuth_ReloadDisabled(t *testing.T) {
 }
 
 func TestWithTokenAuth(t *testing.T) {
-	var opt valkey.ClientOption
-	if err := WithTokenAuth(TokenAuthOptions{Token: "tok"})(context.Background(), &opt); err != nil || opt.AuthCredentialsFn == nil {
+	opt, err := ResolveClientOption(context.Background(), initOption("10.0.0.2:6379"),
+		WithTokenAuth(TokenAuthOptions{Token: "tok"}), WithTLS(TLSOptions{Mode: TLSDisabled}))
+	if err != nil || opt.AuthCredentialsFn == nil {
 		t.Fatalf("WithTokenAuth: %v", err)
 	}
-	if err := WithTokenAuth(TokenAuthOptions{})(context.Background(), &valkey.ClientOption{}); !errors.Is(err, errNoTokenSource) {
+	if _, err := ResolveClientOption(context.Background(), initOption("10.0.0.2:6379"),
+		WithTokenAuth(TokenAuthOptions{}), WithTLS(TLSOptions{Mode: TLSDisabled})); !errors.Is(err, errNoTokenSource) {
 		t.Fatalf("got %v", err)
 	}
 }
 
-// T-TOK-8: the constructor's ctx bounds the first read made by WithTokenAuth.
+// T-TOK-8: NewClient's ctx bounds the first Token Auth read.
 func TestWithTokenAuth_HonorsContext(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
 	start := time.Now()
-	_, err := NewStandaloneClient(ctx, "127.0.0.1:0", "127.0.0.1:0", WithTokenAuth(TokenAuthOptions{
+	_, err := NewClient(ctx, valkey.ClientOption{
+		InitAddress: []string{"127.0.0.1:0"},
+		Standalone:  valkey.StandaloneOption{ReplicaAddress: []string{"127.0.0.1:0"}},
+	}, WithTLS(TLSOptions{Mode: TLSDisabled}), WithTokenAuth(TokenAuthOptions{
 		Source: func(ctx context.Context) (string, error) {
 			<-ctx.Done() // a Secret Manager read that never answers
 			return "", ctx.Err()
@@ -277,8 +282,7 @@ func TestTokenAuth_ReadDeadlines(t *testing.T) {
 func TestWithTokenAuth_OnCredentialError(t *testing.T) {
 	var fail atomic.Bool
 	var absorbed atomic.Int32
-	var opt valkey.ClientOption
-	err := WithTokenAuth(TokenAuthOptions{
+	opt, err := ResolveClientOption(context.Background(), initOption("10.0.0.2:6379"), WithTLS(TLSOptions{Mode: TLSDisabled}), WithTokenAuth(TokenAuthOptions{
 		ReloadInterval: 40 * time.Millisecond,
 		Source: func(context.Context) (string, error) {
 			if fail.Load() {
@@ -287,7 +291,7 @@ func TestWithTokenAuth_OnCredentialError(t *testing.T) {
 			return "good", nil
 		},
 		OnCredentialError: func(error) { absorbed.Add(1) },
-	})(context.Background(), &opt)
+	}))
 	if err != nil {
 		t.Fatal(err)
 	}

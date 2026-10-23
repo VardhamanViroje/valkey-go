@@ -1,7 +1,6 @@
 package valkeygcp
 
 import (
-	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"io"
@@ -124,14 +123,27 @@ func TestWithTLS(t *testing.T) {
 	if err := os.WriteFile(path, ca.pem, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	var opt valkey.ClientOption
-	if err := WithTLS(TLSOptions{CAFile: path})(context.Background(), &opt); err != nil || opt.TLSConfig == nil || opt.TLSConfig.RootCAs == nil {
+	opt, err := resolveOption(t, initOption("10.0.0.15:6379"), noReader(t), WithTLS(TLSOptions{CAFile: path}))
+	if err != nil || opt.TLSConfig == nil || opt.TLSConfig.RootCAs == nil {
 		t.Fatalf("WithTLS(CAFile): %v", err)
 	}
-	if err := WithTLS(TLSOptions{})(context.Background(), &valkey.ClientOption{}); err == nil {
-		t.Fatal("WithTLS without CA material must fail")
+	// TLSAuto with no TLS setting at all leaves TLS off.
+	opt, err = resolveOption(t, initOption("10.0.0.15:6379"), noReader(t), WithTLS(TLSOptions{}))
+	if err != nil || opt.TLSConfig != nil {
+		t.Fatalf("WithTLS(TLSOptions{}): TLSConfig set %v, %v; want TLS off", opt.TLSConfig != nil, err)
 	}
-	if err := WithTLS(TLSOptions{Mode: TLSSharedCA})(context.Background(), &valkey.ClientOption{}); err == nil || !strings.Contains(err.Error(), "TLSSharedCA") {
+	// A setting that asks for TLS without CA material fails.
+	if _, err := resolveOption(t, initOption("10.0.0.15:6379"), noReader(t), WithTLS(TLSOptions{ServerName: "valkey"})); err == nil ||
+		!strings.Contains(err.Error(), "needs CA certificates") {
+		t.Fatalf("ServerName without CA material: %v", err)
+	}
+	if _, err := resolveOption(t, initOption("10.0.0.15:6379"), noReader(t), WithTLS(TLSOptions{Mode: TLSSharedCA})); err == nil || !strings.Contains(err.Error(), "TLSSharedCA") {
 		t.Fatalf("shared CA without PEM: %v", err)
+	}
+	// A TLSConfig on the ClientOption is used as is.
+	own := &tls.Config{ServerName: "mine"}
+	opt, err = resolveOption(t, valkey.ClientOption{InitAddress: []string{"10.0.0.15:6379"}, TLSConfig: own}, noReader(t), WithTLS(TLSOptions{CAFile: path}))
+	if err != nil || opt.TLSConfig != own {
+		t.Fatalf("caller TLSConfig replaced: %v", err)
 	}
 }

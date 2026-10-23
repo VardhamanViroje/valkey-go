@@ -278,14 +278,15 @@ func TestWithIAMOptions_ClientOptionWiring(t *testing.T) {
 		},
 	}
 
-	opt := valkey.ClientOption{}
-	gcpOpt := WithIAMOptions(IAMAuthOptions{
-		Username:          "memorystore-user",
-		CustomTokenSource: mock,
-	})
-
-	if err := gcpOpt(context.Background(), &opt); err != nil {
-		t.Fatalf("WithIAMOptions failed: %v", err)
+	opt, err := ResolveClientOption(context.Background(), initOption("10.0.0.15:6379"),
+		WithIAMOptions(IAMAuthOptions{
+			Username:          "memorystore-user",
+			CustomTokenSource: mock,
+		}),
+		WithTLS(TLSOptions{Mode: TLSDisabled}),
+	)
+	if err != nil {
+		t.Fatalf("ResolveClientOption with WithIAMOptions failed: %v", err)
 	}
 
 	if opt.AuthCredentialsFn == nil {
@@ -327,12 +328,12 @@ func TestAuthCredentialsFn_TokenError(t *testing.T) {
 
 // 8. WithIAMOptions Error Handling
 func TestWithIAMOptions_Error(t *testing.T) {
-	opt := valkey.ClientOption{}
-	gcpOpt := WithIAMOptions(IAMAuthOptions{
-		CredentialsJSON: []byte(`{ invalid-json`),
-	})
-
-	err := gcpOpt(context.Background(), &opt)
+	_, err := ResolveClientOption(context.Background(), initOption("10.0.0.15:6379"),
+		WithIAMOptions(IAMAuthOptions{
+			CredentialsJSON: []byte(`{ invalid-json`),
+		}),
+		WithTLS(TLSOptions{Mode: TLSDisabled}),
+	)
 	if err == nil {
 		t.Fatal("expected error from WithIAMOptions with invalid JSON, got nil")
 	}
@@ -687,8 +688,9 @@ func TestNewGCPTokenProvider_ImpersonationError(t *testing.T) {
 		!strings.Contains(err.Error(), "impersonation token source failed") || !strings.Contains(err.Error(), "denied") {
 		t.Fatalf("got %v, want the impersonation error", err)
 	}
-	var clientOpt valkey.ClientOption
-	if err := WithIAMOptions(opts)(context.Background(), &clientOpt); err == nil || clientOpt.AuthCredentialsFn != nil {
+	clientOpt, err := ResolveClientOption(context.Background(), initOption("10.0.0.15:6379"),
+		WithIAMOptions(opts), WithTLS(TLSOptions{Mode: TLSDisabled}))
+	if err == nil || !strings.Contains(err.Error(), "impersonation token source failed") || clientOpt.AuthCredentialsFn != nil {
 		t.Fatalf("WithIAMOptions: err %v, AuthCredentialsFn set %v", err, clientOpt.AuthCredentialsFn != nil)
 	}
 }
