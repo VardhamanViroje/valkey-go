@@ -10,6 +10,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/valkey-io/valkey-go"
 	"github.com/valkey-io/valkey-go/valkeygcp"
 )
 
@@ -22,9 +23,9 @@ func main() {
 	ctx := context.Background()
 	log.Printf("Connecting to Memorystore at %s with Native IAM Auth...", endpoint)
 
-	client, err := valkeygcp.NewClusterClient(ctx, endpoint,
-		valkeygcp.WithDefaultIAM(),
-	)
+	client, err := valkeygcp.NewClient(ctx, valkey.ClientOption{
+		InitAddress: []string{endpoint}, // discovery endpoint
+	}, valkeygcp.WithDefaultIAM())
 	if err != nil {
 		log.Fatalf("Failed to create Memorystore client: %v", err)
 	}

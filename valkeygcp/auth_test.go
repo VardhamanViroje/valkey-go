@@ -265,14 +265,14 @@ func TestWithIAMOptions_ClientOptionWiring(t *testing.T) {
 		},
 	}
 
-	opt := valkey.ClientOption{}
-	gcpOpt := WithIAMOptions(IAMAuthOptions{
-		Username:          "memorystore-user",
-		CustomTokenSource: mock,
-	})
-
-	if err := gcpOpt(context.Background(), &opt); err != nil {
-		t.Fatalf("WithIAMOptions failed: %v", err)
+	opt, err := ResolveClientOption(context.Background(), valkey.ClientOption{InitAddress: []string{"10.0.0.15:6379"}},
+		WithIAMOptions(IAMAuthOptions{
+			Username:          "memorystore-user",
+			CustomTokenSource: mock,
+		}),
+	)
+	if err != nil {
+		t.Fatalf("ResolveClientOption with WithIAMOptions failed: %v", err)
 	}
 
 	if opt.AuthCredentialsFn == nil {

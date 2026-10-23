@@ -2,19 +2,35 @@ package valkeygcp
 
 import (
 	"context"
-	"net"
+	"errors"
+	"fmt"
 	"time"
 
 	"github.com/valkey-io/valkey-go"
 )
 
-// GCPOption configures the valkey.ClientOption built by NewClusterClient and
-// NewStandaloneClient. ctx is the constructor's context: options that call Google APIs while
-// the client is set up (credential discovery) stop when it is cancelled or its deadline
-// passes. Token refreshes never use it, because they run for the life of the client.
-type GCPOption func(ctx context.Context, opt *valkey.ClientOption) error
+// Option configures what NewClient and ResolveClientOption add to a valkey.ClientOption:
+// IAM credentials (WithIAMOptions, WithDefaultIAM). Settings valkey-go already has a field
+// for, such as addresses, TLSConfig and timeouts, are set on the valkey.ClientOption itself.
+// Later options override earlier ones of the same kind.
+type Option func(*config)
 
-// Connection defaults shared by the constructors.
+// config collects the Options of one NewClient or ResolveClientOption call.
+type config struct {
+	iam *IAMAuthOptions // WithIAMOptions, WithDefaultIAM; nil when not given
+}
+
+func newConfig(opts []Option) config {
+	var c config
+	for _, o := range opts {
+		if o != nil {
+			o(&c)
+		}
+	}
+	return c
+}
+
+// Connection defaults NewClient fills into the valkey.ClientOption fields left at zero.
 const (
 	defaultDialTimeout           = 2 * time.Second
 	defaultKeepAlive             = 1 * time.Second
@@ -25,62 +41,92 @@ const (
 	setupTimeout = 15 * time.Second
 )
 
-// NewClusterClient creates a Memorystore Cluster Mode client with discovery pinning,
-// fast failover reconnection, and optional IAM authentication.
-//
-// ctx bounds the setup done by opts (see GCPOption); a ctx that has ended by then stops the
-// constructor before it connects. valkey-go connects and authenticates while it builds the
-// client, so setup needs working credentials.
-func NewClusterClient(ctx context.Context, discoveryEndpoint string, opts ...GCPOption) (valkey.Client, error) {
-	clientOpt := valkey.ClientOption{
-		InitAddress: []string{discoveryEndpoint},
-		ClusterOption: valkey.ClusterOption{
-			PreferInitAddressRefresh: true,
-			ShardsRefreshInterval:    defaultShardsRefreshInterval,
-			PreferClusterShards:      true,
-		},
-		Dialer: net.Dialer{
-			KeepAlive: defaultKeepAlive,
-			Timeout:   defaultDialTimeout,
-		},
-		ConnWriteTimeout: defaultConnWriteTimeout,
-		RetryDelay:       memorystoreRetryDelay, // Correction V9: defined in retry.go
-	}
-	return newClient(ctx, clientOpt, opts)
-}
+var errNoEndpoint = errors.New("valkeygcp: no endpoint: set ClientOption.InitAddress")
 
-// NewStandaloneClient creates a Memorystore Standalone (Cluster Disabled) client with
-// automatic read/write splitting between Primary and Reader Endpoints.
+// NewClient returns a valkey.Client for Memorystore for Valkey. It takes the same
+// valkey.ClientOption as valkey.NewClient: InitAddress holds the discovery endpoint (cluster
+// mode) or the primary endpoint (cluster mode disabled), and Standalone.ReplicaAddress the
+// reader endpoint, if any. NewClient fills the Memorystore defaults into the fields left at
+// their zero value, adds the credentials opts ask for, and connects.
 //
-// ctx bounds the setup done by opts (see GCPOption), as for NewClusterClient.
-func NewStandaloneClient(ctx context.Context, primaryEndpoint, readerEndpoint string, opts ...GCPOption) (valkey.Client, error) {
-	clientOpt := valkey.ClientOption{
-		InitAddress: []string{primaryEndpoint},
-		Standalone: valkey.StandaloneOption{
-			ReplicaAddress: []string{readerEndpoint},
-		},
-		SendToReplicas: sendReadsToReplicas,
-		Dialer: net.Dialer{
-			KeepAlive: defaultKeepAlive,
-			Timeout:   defaultDialTimeout,
-		},
-		ConnWriteTimeout: defaultConnWriteTimeout,
-		RetryDelay:       memorystoreRetryDelay, // Correction V9: defined in retry.go
-	}
-	return newClient(ctx, clientOpt, opts)
-}
-
-// newClient applies opts with the constructor's ctx and connects.
-func newClient(ctx context.Context, clientOpt valkey.ClientOption, opts []GCPOption) (valkey.Client, error) {
-	for _, opt := range opts {
-		if err := opt(ctx, &clientOpt); err != nil {
-			return nil, err
-		}
+// ctx bounds credential setup; a ctx that has ended by then stops NewClient before it
+// connects. valkey-go connects and authenticates while it builds the client, so setup needs
+// working credentials. Token refreshes never use ctx.
+func NewClient(ctx context.Context, option valkey.ClientOption, opts ...Option) (valkey.Client, error) {
+	opt, err := ResolveClientOption(ctx, option, opts...)
+	if err != nil {
+		return nil, err
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err // valkey.NewClient takes no context
 	}
-	return valkey.NewClient(clientOpt)
+	return valkey.NewClient(opt)
+}
+
+// ResolveClientOption returns the valkey.ClientOption NewClient would connect with, without
+// connecting, for callers who build the client themselves (valkey.NewClient,
+// valkeyotel.NewClient) or want to inspect it.
+func ResolveClientOption(ctx context.Context, option valkey.ClientOption, opts ...Option) (valkey.ClientOption, error) {
+	cfg := newConfig(opts)
+	if len(option.InitAddress) == 0 {
+		return valkey.ClientOption{}, errNoEndpoint
+	}
+	if field := callerAuthField(option); field != "" && cfg.iam != nil {
+		return valkey.ClientOption{}, fmt.Errorf("valkeygcp: ClientOption.%s conflicts with WithIAMOptions", field)
+	}
+	opt := withDefaults(option)
+	if cfg.iam != nil {
+		p, err := NewGCPTokenProvider(ctx, *cfg.iam)
+		if err != nil {
+			return valkey.ClientOption{}, err
+		}
+		opt.AuthCredentialsFn = p.AuthCredentialsFn()
+	}
+	return opt, nil
+}
+
+// withDefaults fills the Memorystore defaults into the fields of opt left at their zero
+// value.
+func withDefaults(opt valkey.ClientOption) valkey.ClientOption {
+	if len(opt.Standalone.ReplicaAddress) > 0 {
+		if opt.SendToReplicas == nil {
+			opt.SendToReplicas = sendReadsToReplicas
+		}
+	} else {
+		// Cluster mode, or not known before connecting. valkey-go reads these only in its
+		// cluster client, so they are harmless when it falls back to a single-node client.
+		// A false bool can't be told apart from an unset one, so the bools are always on.
+		opt.ClusterOption.PreferInitAddressRefresh = true // topology only through InitAddress
+		opt.ClusterOption.PreferClusterShards = true
+		if opt.ClusterOption.ShardsRefreshInterval == 0 {
+			opt.ClusterOption.ShardsRefreshInterval = defaultShardsRefreshInterval
+		}
+	}
+	if opt.Dialer.Timeout == 0 {
+		opt.Dialer.Timeout = defaultDialTimeout
+	}
+	if opt.Dialer.KeepAlive == 0 {
+		opt.Dialer.KeepAlive = defaultKeepAlive
+	}
+	if opt.ConnWriteTimeout == 0 {
+		opt.ConnWriteTimeout = defaultConnWriteTimeout
+	}
+	if opt.RetryDelay == nil {
+		opt.RetryDelay = memorystoreRetryDelay // Correction V9: defined in retry.go
+	}
+	return opt
+}
+
+// callerAuthField names the ClientOption credential field the caller set, if any.
+// Caller-managed credentials are used as is; an IAM option next to them is an error.
+func callerAuthField(o valkey.ClientOption) string {
+	switch {
+	case o.AuthCredentialsFn != nil:
+		return "AuthCredentialsFn"
+	case o.Password != "":
+		return "Password"
+	}
+	return ""
 }
 
 // sendReadsToReplicas routes read-only commands to the reader endpoint.

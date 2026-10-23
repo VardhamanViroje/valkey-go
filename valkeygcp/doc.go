@@ -1,8 +1,9 @@
 // Package valkeygcp connects valkey-go to Google Cloud Memorystore for Valkey with native
 // Google Cloud authentication.
 //
-// NewClusterClient and NewStandaloneClient return a valkey.Client with Memorystore-friendly
-// connection defaults, configured with options such as WithDefaultIAM and WithIAMOptions.
+// NewClient takes the same valkey.ClientOption as valkey.NewClient, fills in
+// Memorystore-friendly connection defaults, and adds the credentials its Options ask for.
 // WithDefaultIAM authenticates with IAM access tokens from Application Default Credentials,
-// renewed on open connections before they expire.
+// renewed on open connections before they expire. ResolveClientOption returns the wired
+// valkey.ClientOption without connecting, for valkey.NewClient or other valkey-go modules.
 package valkeygcp

@@ -36,8 +36,8 @@ type IAMAuthOptions struct {
 	// DisableProactiveReauth turns off re-AUTH on live connections (Q2): every new connection
 	// still gets a fresh token, but RefreshAfter stays zero.
 	DisableProactiveReauth bool
-	// MaxAuthPerSecond paces token-backed AUTHs per provider, that is per WithIAMOptions or
-	// NewGCPTokenProvider call (U5). 0 disables pacing.
+	// MaxAuthPerSecond paces token-backed AUTHs per provider, that is per NewClient,
+	// ResolveClientOption or NewGCPTokenProvider call (U5). 0 disables pacing.
 	MaxAuthPerSecond float64
 	// OnCredentialError receives token fetch errors absorbed by the last-known-good logic (U6).
 	OnCredentialError func(error)
@@ -84,7 +84,7 @@ func NewGCPTokenProvider(ctx context.Context, opt IAMAuthOptions) (GCPTokenProvi
 	setupCtx, cancel := context.WithTimeout(ctx, setupTimeout)
 	defer cancel()
 	// Token sources refresh for as long as the client lives, so they must not inherit ctx's
-	// cancellation (a constructor timeout would otherwise break every later refresh). The
+	// cancellation (a NewClient timeout would otherwise break every later refresh). The
 	// setup itself still stops when setupCtx ends: callWithContext stops waiting for it.
 	srcCtx := context.WithoutCancel(ctx)
 	base, err := callWithContext(setupCtx, "credential setup", func() (oauth2.TokenSource, error) {
@@ -313,20 +313,13 @@ func (s *timeoutSource) Token() (*oauth2.Token, error) {
 	}
 }
 
-// WithDefaultIAM configures the client to authenticate using Application Default Credentials.
-func WithDefaultIAM() GCPOption {
+// WithDefaultIAM authenticates with IAM access tokens from Application Default Credentials.
+func WithDefaultIAM() Option {
 	return WithIAMOptions(IAMAuthOptions{})
 }
 
-// WithIAMOptions configures custom IAM authentication options. The constructor's ctx bounds
-// the provider's setup (see NewGCPTokenProvider).
-func WithIAMOptions(iamOpt IAMAuthOptions) GCPOption {
-	return func(ctx context.Context, opt *valkey.ClientOption) error {
-		provider, err := NewGCPTokenProvider(ctx, iamOpt)
-		if err != nil {
-			return err
-		}
-		opt.AuthCredentialsFn = provider.AuthCredentialsFn()
-		return nil
-	}
+// WithIAMOptions authenticates with IAM access tokens configured by iamOpt. NewClient's ctx
+// bounds the provider's setup (see NewGCPTokenProvider).
+func WithIAMOptions(iamOpt IAMAuthOptions) Option {
+	return func(c *config) { c.iam = &iamOpt }
 }
