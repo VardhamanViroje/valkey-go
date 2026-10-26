@@ -1,3 +1,14 @@
+// Command test_adc checks that Application Default Credentials can produce the IAM access
+// token valkeygcp authenticates with. It builds an IAM token provider with default options
+// (NewGCPTokenProvider with an empty IAMAuthOptions, as WithDefaultIAM does), fetches one
+// token and prints its first 15 characters, its type and its expiry.
+//
+// It doesn't connect to Memorystore, so it needs no instance and no role, only working
+// Application Default Credentials: for example from gcloud auth application-default login,
+// from GOOGLE_APPLICATION_CREDENTIALS, or from the metadata server on Compute Engine, GKE
+// or Cloud Run. Run it from the valkeygcp directory:
+//
+//	go run ./cmd/test_adc
 package main
 
 import (

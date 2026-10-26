@@ -1,11 +1,31 @@
 // Command livetest exercises valkeygcp against a real Memorystore for Valkey instance and
-// logs evidence for each feature: every AUTH (first dial and proactive refresh) with a token
-// fingerprint, from valkeygcp's OnAuth events, credential errors absorbed by the
-// last-known-good logic, per-node PINGs and a final machine-readable RESULT line.
+// logs evidence for each feature: every AUTH (first dial and proactive re-AUTH) with a
+// token fingerprint, from valkeygcp's OnAuth events; token fetch errors that valkeygcp
+// absorbed by keeping the last token that worked; a PING per node; and a final
+// machine-readable RESULT line in JSON. It exits with status 0 when the run passes, 1 when
+// it fails and 2 when the flags are invalid. -mode picks what it does:
 //
-// Run it on a VM in the instance's VPC network. Tokens are never printed, only 12 hex digits
-// of a fingerprint, so a rotation shows up as a new value: AUTH lines carry valkeygcp's
-// (hmac:, keyed per process), -mode=token the token's SHA-256 (sha256:).
+//	resolve  build the valkey.ClientOption with ResolveClientOption, without connecting
+//	token    fetch one IAM token using only the IAM flags; no instance needed
+//	once     connect with NewClient, PING every node, then SET and GET
+//	soak     run SET/GET traffic for -duration and log STATS, to watch re-AUTHs and token
+//	         rotations (the 70m default outlasts a one-hour token)
+//	storm    create -clients clients at the same moment, each with its own token provider,
+//	         like that many processes restarting at once
+//
+// Build it in the valkeygcp directory with go build ./cmd/livetest (-h lists the flags) and
+// run it on a VM in the instance's VPC network. The identity is Application Default
+// Credentials, or the one -credentials-json or -impersonate-sa names. It needs
+// roles/memorystore.dbConnectionUser for IAM authentication, roles/memorystore.viewer for
+// -instance and roles/privateca.poolReader on the CA pool for -cas-fetch. With
+// -impersonate-sa these roles go to the impersonated account, and the identity that
+// impersonates needs roles/iam.serviceAccountTokenCreator on it. The Token Auth secret is
+// read with Application Default Credentials (roles/secretmanager.secretAccessor).
+//
+// Tokens are never printed, only 12 hex digits of a fingerprint, so a rotation shows up as
+// a new value. AUTH lines carry valkeygcp's AuthEvent.Fingerprint (hmac:), whose key is
+// random per process, so values compare only within one run; -mode=token prints the first
+// digits of the token's SHA-256 (sha256:).
 //
 //	livetest -mode=resolve -instance=projects/P/locations/R/instances/I
 //	livetest -mode=token   -impersonate-sa=sa@proj.iam.gserviceaccount.com
@@ -82,7 +102,8 @@ var (
 	clients      = flag.Int("clients", 50, "storm: number of clients created at the same moment")
 )
 
-// Counters shared by the AUTH wrapper, the credential-error callback and the traffic loop.
+// Counters shared by the OnAuth callback (logAuth), the OnCredentialError callback and the
+// traffic loop.
 var (
 	authOK, authErr, credErr, opsOK, opsFail atomic.Int64
 )
@@ -157,8 +178,10 @@ func buildConfig() (config, error) {
 			cfg.opts = append(cfg.opts, valkeygcp.WithNetwork(*network))
 		}
 	}
-	// Explicit endpoints override the ones read from -instance. WithTopology keeps the checks
-	// that go with the endpoint's cluster mode, including that it matches the instance.
+	// Explicit endpoints override the ones read from -instance. WithTopology states the
+	// endpoint's cluster mode: NewClient checks it against the instance, and with
+	// TopologyCluster fails instead of quietly using a single-node client when cluster mode
+	// doesn't work, for example because an ACL rule denies CLUSTER SHARDS.
 	switch {
 	case *discovery != "" && *primary != "":
 		return cfg, errors.New("-discovery and -primary are both set: want one")
@@ -463,7 +486,7 @@ func logStats(start time.Time) {
 }
 
 // runStorm creates -clients clients at the same moment, each with its own token provider,
-// like that many processes restarting at once, and summarises how they connected.
+// like that many processes restarting at once, and summarizes how they connected.
 func runStorm(cfg config) bool {
 	ctx, cancel := context.WithTimeout(context.Background(), *setupTimeout)
 	defer cancel()

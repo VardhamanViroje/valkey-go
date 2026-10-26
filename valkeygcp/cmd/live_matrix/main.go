@@ -1,20 +1,36 @@
-// Command live_matrix runs the Level 6 live auth-mode matrix (SOW acceptance) against a real
-// Memorystore for Valkey instance: it connects through valkeygcp.NewClient, PINGs every node
-// (authentication and TLS SAN coverage per node IP) and runs a SET.
+// Command live_matrix checks one auth and TLS setup against a real Memorystore for Valkey
+// instance. It connects through valkeygcp.NewClient, PINGs every node and runs a SET, and
+// stops with an error at the first failure. Each node is a separate connection with its
+// own AUTH and, with TLS, its own certificate check, which passes only if the certificate
+// lists that node's IP address. Run it once for each setup to cover: auth mode (IAM, Token
+// Auth or none), in-transit encryption on or off, cluster mode enabled or disabled, and the
+// IAM username.
 //
-// Auto-discovery path (needs memorystore.instances.get):
+// Run it from the valkeygcp directory on a host that can reach the instance's endpoints,
+// such as a VM in its VPC network. Every Google call uses Application Default Credentials,
+// whose principal needs roles/memorystore.dbConnectionUser for IAM authentication and
+// roles/secretmanager.secretAccessor on the token secret for Token Auth.
+//
+// Auto-discovery path: valkeygcp reads the endpoints, auth mode and TLS settings from the
+// instance, which needs memorystore.instances.get (roles/memorystore.viewer):
 //
 //	VALKEY_GCP_INSTANCE=projects/P/locations/R/instances/I go run ./cmd/live_matrix
 //
-// Explicit path (no control-plane call): leave VALKEY_GCP_INSTANCE unset and set
+// Explicit path, with no Memorystore API call: leave VALKEY_GCP_INSTANCE unset and set
 // MEMORYSTORE_TEST_DISCOVERY_ENDPOINT (cluster) or VALKEY_GCP_PRIMARY_ENDPOINT and optionally
 // VALKEY_GCP_READER_ENDPOINT (cluster-disabled), plus VALKEY_GCP_AUTH_MODE (iam, token or
 // disabled) and VALKEY_GCP_TLS_CA_FILE when in-transit encryption is on. For an instance with
 // in-transit encryption disabled, set VALKEY_GCP_TLS_MODE=disabled: valkeygcp refuses to send
 // IAM or Token Auth credentials without TLS unless TLS is turned off explicitly.
 //
-// Both paths read VALKEY_GCP_TOKEN_SECRET and VALKEY_GCP_TOKEN_USERNAME (TOKEN_AUTH) and
-// VALKEY_GCP_USERNAME_STRATEGY=principal-email (IAM username, test L6-B).
+//	MEMORYSTORE_TEST_DISCOVERY_ENDPOINT=10.0.0.15:6379 VALKEY_GCP_AUTH_MODE=iam \
+//	  VALKEY_GCP_TLS_CA_FILE=server-ca.pem go run ./cmd/live_matrix
+//
+// Both paths read VALKEY_GCP_TOKEN_SECRET, the Secret Manager version that holds the
+// TOKEN_AUTH token (projects/P/secrets/S/versions/V), and VALKEY_GCP_TOKEN_USERNAME, its
+// user (empty for the default user). VALKEY_GCP_USERNAME_STRATEGY=principal-email makes IAM
+// AUTH send the principal's email as the username instead of "default", for an instance
+// whose ACL policy is keyed by email.
 package main
 
 import (
@@ -43,7 +59,8 @@ func main() {
 	}
 	defer client.Close()
 
-	// Every node: proves authentication and TLS SAN coverage per node IP.
+	// PING every node: each one is its own connection, with its own AUTH and, with TLS, a
+	// certificate check against the node's IP address.
 	for addr, node := range client.Nodes() {
 		if err := node.Do(ctx, node.B().Ping().Build()).Error(); err != nil {
 			log.Fatalf("PING %s: %v", addr, err)
@@ -65,11 +82,15 @@ func config() (valkey.ClientOption, []valkeygcp.Option, error) {
 	}
 	instance := os.Getenv("VALKEY_GCP_INSTANCE") // auto-discovery path
 	if instance != "" {
-		// Discovered endpoints win unless overridden on purpose; keep the two paths apart: the
-		// endpoint variables are only read without an instance.
+		// valkeygcp reads the endpoints from the instance. An InitAddress set here would
+		// override them, so the endpoint variables are only read without an instance, which
+		// keeps the two paths apart.
 		opts = append(opts, valkeygcp.WithInstance(instance))
 	} else {
-		// WithTopology keeps the checks that go with the endpoint's cluster mode.
+		// WithTopology states the endpoint's cluster mode, which WithInstance would read
+		// from the instance. With TopologyCluster, NewClient fails instead of quietly using
+		// a single-node client when cluster mode doesn't work, for example because an ACL
+		// rule denies CLUSTER SHARDS.
 		discovery, primary := os.Getenv("MEMORYSTORE_TEST_DISCOVERY_ENDPOINT"), os.Getenv("VALKEY_GCP_PRIMARY_ENDPOINT")
 		switch {
 		case discovery != "" && primary != "":
@@ -107,7 +128,8 @@ func config() (valkey.ClientOption, []valkeygcp.Option, error) {
 	case "":
 		// With an instance, the instance's auth mode picks one of the options passed. Without
 		// one, the variables decide: a token secret means Token Auth,
-		// VALKEY_GCP_USERNAME_STRATEGY means IAM, and both is an error.
+		// VALKEY_GCP_USERNAME_STRATEGY=principal-email means IAM, both is an error and
+		// neither means no auth.
 		if instance != "" || principalEmail {
 			opts = append(opts, iam)
 		}

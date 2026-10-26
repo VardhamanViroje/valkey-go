@@ -17,9 +17,10 @@ import (
 type dialFunc = func(ctx context.Context, dst string, dialer *net.Dialer, cfg *tls.Config) (net.Conn, error)
 
 // dialGate spaces out new connections after Memorystore rejected a connection's HELLO with
-// an IAM backend error (U8). valkey-go doesn't retry error replies: after a failed handshake
-// the next command dials again at once, so without the gate re-dials would follow the
-// application's request rate and add to the IAM quota pressure that caused the error.
+// an IAM backend error (ERR_IAM_EXHAUSTED or ERR_IAM_OTHER). valkey-go doesn't retry error
+// replies: after a failed handshake the next command dials again at once, so without the
+// gate re-dials would follow the application's request rate and add to the IAM quota
+// pressure that caused the error.
 //
 // The gate learns each handshake's outcome from the first reply on the connection (see
 // gatedConn). It delays dials only after a first successful handshake, so a client that
@@ -39,6 +40,8 @@ const (
 	handshakeOther           // another error reply, such as WRONGPASS: no change
 )
 
+// handshake records the outcome of one new connection's handshake. A success arms the gate
+// and clears the failure count; an IAM error adds to it.
 func (g *dialGate) handshake(outcome int) {
 	switch outcome {
 	case handshakeOK:
@@ -85,9 +88,10 @@ func installDialGate(opt *valkey.ClientOption) *dialGate {
 	return g
 }
 
-// gatedDialer makes each dial wait for the gate and report its handshake. base nil means
-// valkey-go's own dialing (valkey.go dial). valkey-go applies DisableTCPNoDelay by
-// type-asserting the connection, which the wrapper hides, so noDelayOff applies it here.
+// gatedDialer makes each dial wait for the gate and report its handshake. A nil base dials
+// the way valkey-go does without a custom dialer. valkey-go applies DisableTCPNoDelay only
+// to a connection it can see is a *net.TCPConn, which the wrapper hides, so noDelayOff
+// applies it here.
 func gatedDialer(base dialFunc, g *dialGate, noDelayOff bool) dialFunc {
 	if base == nil {
 		base = defaultDial
@@ -122,6 +126,7 @@ func defaultDial(ctx context.Context, dst string, dialer *net.Dialer, cfg *tls.C
 	return dialer.DialContext(ctx, "tcp", dst)
 }
 
+// setNoDelay sets TCP_NODELAY on conn, or on the TCP connection under a TLS one.
 func setNoDelay(conn net.Conn, on bool) {
 	if c, ok := conn.(*tls.Conn); ok {
 		conn = c.NetConn()
@@ -143,6 +148,8 @@ type gatedConn struct {
 	line []byte
 }
 
+// Read reads from the connection, showing the bytes to peek until the first reply line has
+// been seen.
 func (c *gatedConn) Read(p []byte) (int, error) {
 	n, err := c.Conn.Read(p)
 	if !c.seen && n > 0 {
@@ -151,6 +158,9 @@ func (c *gatedConn) Read(p []byte) (int, error) {
 	return n, err
 }
 
+// peek collects the first reply line. Once the line is complete, or maxReplyPeek bytes
+// long, it tells the gate whether the handshake succeeded, failed with an IAM backend
+// error, or failed for another reason.
 func (c *gatedConn) peek(b []byte) {
 	if i := bytes.IndexByte(b, '\n'); i >= 0 {
 		b, c.seen = b[:i], true

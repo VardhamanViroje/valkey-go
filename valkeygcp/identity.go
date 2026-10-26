@@ -11,13 +11,14 @@ import (
 	"golang.org/x/oauth2/google"
 )
 
-// UsernameStrategy selects the username sent with IAM AUTH when IAMAuthOptions.Username is empty (U4).
+// UsernameStrategy selects the username sent with IAM AUTH when IAMAuthOptions.Username is
+// empty.
 type UsernameStrategy int
 
 // UsernameStrategy values.
 const (
 	UsernameDefault        UsernameStrategy = iota // "default": the only IAM username the IAM docs list
-	UsernamePrincipalEmail                         // IAM principal email, for ACL policies keyed by email (Q1)
+	UsernamePrincipalEmail                         // the IAM principal's email, for ACL policies keyed by email
 )
 
 // Metadata server lookups. They are variables because metadata.OnGCEWithContext caches its
@@ -27,8 +28,10 @@ var (
 	metadataEmail = metadata.EmailWithContext
 )
 
-// resolveUsername: explicit Username > strategy. credsJSON is IAMAuthOptions.CredentialsJSON
-// or google.Credentials.JSON from ADC (nil on the metadata server).
+// resolveUsername returns the AUTH username: Username when set, otherwise the one
+// UsernameStrategy picks. For UsernamePrincipalEmail the email comes from ImpersonateSA,
+// then credsJSON, then the metadata server. credsJSON is IAMAuthOptions.CredentialsJSON or
+// the JSON of the Application Default Credentials (nil on the metadata server).
 func resolveUsername(ctx context.Context, opt IAMAuthOptions, credsJSON []byte) (string, error) {
 	if opt.Username != "" {
 		return opt.Username, nil
@@ -41,7 +44,7 @@ func resolveUsername(ctx context.Context, opt IAMAuthOptions, credsJSON []byte) 
 	}
 	var f struct {
 		ClientEmail                    string `json:"client_email"`                      // service_account keys
-		ServiceAccountImpersonationURL string `json:"service_account_impersonation_url"` // WIF configs
+		ServiceAccountImpersonationURL string `json:"service_account_impersonation_url"` // Workload Identity Federation configs
 	}
 	if len(credsJSON) > 0 && json.Unmarshal(credsJSON, &f) == nil {
 		if f.ClientEmail != "" {
@@ -71,7 +74,7 @@ func resolveUsername(ctx context.Context, opt IAMAuthOptions, credsJSON []byte) 
 }
 
 // checkIAMUsername rejects an explicit IAM username that Memorystore would refuse with
-// ERR_IAM_OTHER (U8): "If you specify a username, then you must use either the default
+// ERR_IAM_OTHER: "If you specify a username, then you must use either the default
 // username or the IAM principal email address". It stays silent when the principal can't
 // be determined (a custom token source without credentials JSON, or user credentials off
 // Google Cloud), because the username may then be right.
@@ -89,8 +92,8 @@ func checkIAMUsername(ctx context.Context, opt IAMAuthOptions, credsJSON []byte)
 	return fmt.Errorf("valkeygcp: IAM username %q isn't valid for %s: use %q (or no username) or the principal's email", opt.Username, email, DefaultIAMUsername)
 }
 
-// credTypeFromJSON lets NewGCPTokenProvider call google.CredentialsFromJSONWithType instead of
-// the deprecated google.CredentialsFromJSON (Correction V10, as on the branch).
+// credTypeFromJSON reads the credential type (the "type" field) from credentials JSON, for
+// google.CredentialsFromJSONWithType, which replaces the deprecated google.CredentialsFromJSON.
 func credTypeFromJSON(b []byte) google.CredentialsType {
 	var h struct {
 		Type google.CredentialsType `json:"type"`

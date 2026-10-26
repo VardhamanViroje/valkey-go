@@ -8,7 +8,9 @@ import (
 	"github.com/valkey-io/valkey-go"
 )
 
-// T-RETRY-1
+// Memorystore IAM backend errors (ERR_IAM_EXHAUSTED, ERR_IAM_OTHER) back off longer than
+// other errors: the first delay is at most 250ms, and later delays can pass the 2s cap of
+// other errors, up to 10s.
 func TestRetryDelay_IAMBackendErrors(t *testing.T) {
 	for _, msg := range []string{
 		"ERR (ERR_IAM_EXHAUSTED) Memorystore IAM authentication backend quota exceeded.",
@@ -34,7 +36,8 @@ func TestRetryDelay_IAMBackendErrors(t *testing.T) {
 	}
 }
 
-// T-RETRY-2
+// Other errors, and a nil error, get the generic backoff: at most 50ms at first and never
+// more than 2s. A negative attempt count is treated like the first attempt.
 func TestRetryDelay_OtherErrors(t *testing.T) {
 	for _, err := range []error{nil, errors.New("i/o timeout"), errors.New("WRONGPASS invalid username-password pair")} {
 		for attempt := range maxRetryAttempts {
@@ -52,7 +55,7 @@ func TestRetryDelay_OtherErrors(t *testing.T) {
 	}
 }
 
-// T-RETRY-3
+// From maxRetryAttempts on, the delay is negative, which tells valkey-go to stop retrying.
 func TestRetryDelay_StopsAfterMaxAttempts(t *testing.T) {
 	for _, attempt := range []int{maxRetryAttempts, maxRetryAttempts + 1, 1 << 20} {
 		if d := memorystoreRetryDelay(attempt, valkey.Completed{}, errors.New("ERR_IAM_EXHAUSTED")); d >= 0 {

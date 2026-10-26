@@ -21,14 +21,15 @@ func authOnce(t *testing.T, p *tokenAuthProvider) valkey.AuthCredentials {
 	return creds
 }
 
-// T-TOK-1
+// A static Token without a Username is handed out with an empty username, meaning the
+// default user, and a re-AUTH is scheduled within the default reload interval.
 func TestTokenAuth_StaticDefaultUser(t *testing.T) {
 	p, err := newTokenAuthProvider(context.Background(), TokenAuthOptions{Token: "static-token"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	creds := authOnce(t, p)
-	// An empty Username makes valkey-go send HELLO 3 AUTH default <token> (pipe.go).
+	// An empty Username makes valkey-go send HELLO 3 AUTH default <token>.
 	if creds.Username != "" || creds.Password != "static-token" {
 		t.Fatalf("creds = %+v", creds)
 	}
@@ -37,7 +38,7 @@ func TestTokenAuth_StaticDefaultUser(t *testing.T) {
 	}
 }
 
-// T-TOK-2
+// A Username is sent as the AUTH username.
 func TestTokenAuth_NamedUser(t *testing.T) {
 	p, err := newTokenAuthProvider(context.Background(), TokenAuthOptions{Username: "app-user", Token: "t"})
 	if err != nil {
@@ -48,7 +49,8 @@ func TestTokenAuth_NamedUser(t *testing.T) {
 	}
 }
 
-// T-TOK-3
+// The token is cached for half the ReloadInterval, then read again, so a rotated token
+// reaches the next AUTH. The re-AUTH is scheduled 90-100% of ReloadInterval ahead.
 func TestTokenAuth_ReloadAfterCacheWindow(t *testing.T) {
 	const reload = 200 * time.Millisecond
 	var calls atomic.Int32
@@ -78,7 +80,8 @@ func TestTokenAuth_ReloadAfterCacheWindow(t *testing.T) {
 	}
 }
 
-// T-TOK-4
+// When a read fails after a success, the last good token is handed out and the error goes
+// to OnCredentialError. The failed read is retried later, not on every new connection.
 func TestTokenAuth_LastKnownGood(t *testing.T) {
 	var fail atomic.Bool
 	var calls atomic.Int32
@@ -123,7 +126,8 @@ func TestTokenAuth_LastKnownGood(t *testing.T) {
 	}
 }
 
-// T-TOK-5
+// The provider reads the token once when it is built, so a failed or blank read fails setup
+// instead of the first dial. Without a token source it fails with errNoTokenSource.
 func TestTokenAuth_InitialFetchFails(t *testing.T) {
 	_, err := newTokenAuthProvider(context.Background(), TokenAuthOptions{
 		Source: func(context.Context) (string, error) { return "", errors.New("permission denied") },
@@ -139,7 +143,8 @@ func TestTokenAuth_InitialFetchFails(t *testing.T) {
 	}
 }
 
-// T-TOK-6
+// A SecretVersion is read from Secret Manager, with surrounding whitespace trimmed (secret
+// payloads often end with a newline). Source wins over SecretVersion and Token.
 func TestTokenAuth_SecretManagerTrimmed(t *testing.T) {
 	orig := newSecretSource
 	defer func() { newSecretSource = orig }()
@@ -170,7 +175,8 @@ func TestTokenAuth_SecretManagerTrimmed(t *testing.T) {
 	}
 }
 
-// T-TOK-7
+// Many concurrent new connections share the cached token instead of each reading it from
+// the source.
 func TestTokenAuth_OneFetchForManyDials(t *testing.T) {
 	var calls atomic.Int32
 	p, err := newTokenAuthProvider(context.Background(), TokenAuthOptions{
@@ -231,7 +237,8 @@ func TestWithTokenAuth(t *testing.T) {
 	}
 }
 
-// T-TOK-8: NewClient's ctx bounds the first Token Auth read.
+// NewClient's ctx bounds the first Token Auth read, so a read that never answers fails
+// NewClient at the caller's deadline.
 func TestWithTokenAuth_HonorsContext(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
@@ -253,8 +260,8 @@ func TestWithTokenAuth_HonorsContext(t *testing.T) {
 	}
 }
 
-// T-TOK-9: without a caller deadline the first read is still capped (setupTimeout), and
-// reads on the connection path get tokenFetchTimeout.
+// Without a caller deadline the first read is still capped at setupTimeout (15s), and reads
+// on the connection path get tokenFetchTimeout (5s).
 func TestTokenAuth_ReadDeadlines(t *testing.T) {
 	var deadlines []time.Duration
 	p, err := newTokenAuthProvider(context.Background(), TokenAuthOptions{
@@ -278,7 +285,7 @@ func TestTokenAuth_ReadDeadlines(t *testing.T) {
 	}
 }
 
-// T-TOK-10: WithTokenAuth reports read errors hidden behind the last-known-good token.
+// WithTokenAuth reports read errors hidden behind the last good token to OnCredentialError.
 func TestWithTokenAuth_OnCredentialError(t *testing.T) {
 	var fail atomic.Bool
 	var absorbed atomic.Int32
@@ -321,7 +328,8 @@ func stubSecretReaders(t *testing.T, factory func(ctx context.Context, location 
 	})
 }
 
-// T-TOK-11: one Secret Manager client serves every provider; a failed creation isn't cached.
+// Every provider shares one Secret Manager client per location. A failed client creation
+// isn't cached: the next provider tries again.
 func TestSharedSecretReader(t *testing.T) {
 	created, fail := 0, true
 	stubSecretReaders(t, func(context.Context, string) (func(context.Context, string) (string, error), error) {
@@ -349,8 +357,8 @@ func TestSharedSecretReader(t *testing.T) {
 	}
 }
 
-// T-TOK-12 (U12): a regional secret is read through a client for its location, shared by
-// every secret in that location; global secrets keep the global client.
+// A regional secret can only be read through its regional endpoint, so each location gets
+// its own client, shared by every secret there; global secrets use the global client.
 func TestRegionalSecretReader(t *testing.T) {
 	var locations []string
 	stubSecretReaders(t, func(_ context.Context, location string) (func(context.Context, string) (string, error), error) {

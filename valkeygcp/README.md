@@ -14,20 +14,19 @@
 
 * **The valkey-go Way:** `valkeygcp.NewClient(ctx, valkey.ClientOption{...}, opts...)` takes a regular `valkey.ClientOption`: endpoints in `InitAddress` and `Standalone.ReplicaAddress`, and any other valkey-go setting. Memorystore defaults only fill the fields you leave at zero. Options add what valkey-go has no field for: `WithInstance`, `WithIAMOptions` or `WithDefaultIAM`, `WithTokenAuth` and `WithTLS`.
 * **Auto-Discovery:** `WithInstance` reads the instance (auth mode, TLS mode, server CA, cluster mode, PSC endpoints) and fills in the endpoints, TLS and credentials the `ClientOption` leaves empty. It reads the instance as the identity `WithIAMOptions` names, or as ADC. Settings that contradict the instance fail before any connection is made.
-* **Zero-Password IAM Authentication:** Authenticate using Google Cloud IAM OAuth2 access tokens via Application Default Credentials (ADC), GKE Workload Identity, VM Metadata Server, or Service Account keys.
+* **IAM Authentication, No Password:** Connections authenticate with Google Cloud IAM access tokens instead of a password. The tokens come from Application Default Credentials (ADC), which finds the identity of a GKE pod (Workload Identity) or a VM (metadata server), or from a service account key.
 * **Token Auth (`TOKEN_AUTH`):** Tokens from Secret Manager (recommended; global or regional secrets), a static value or a custom source; reloaded periodically so rotated tokens reach live connections.
 * **In-Transit Encryption:** Per-instance, shared regional and customer-managed (CAS) server CAs, TLS 1.2+, every CA chain loaded for overlap during CA rotation. Customer-managed CAs are read from their CA Service pool with `TLSOptions.FetchCustomCA` and the `valkeygcp/cas` package.
 * **No Accidental Plaintext Credentials:** Without `WithInstance`, IAM and Token Auth credentials need CA material (`WithTLS` or `ClientOption.TLSConfig`) or an explicit `WithTLS(valkeygcp.TLSOptions{Mode: valkeygcp.TLSDisabled})`.
 * **ACL Usernames:** IAM username `"default"` (the default) or the IAM principal email for ACL policies keyed by email. An explicit username that Memorystore would reject fails at setup.
-* **Proactive In-Flight Token Rotation:** Automatically rotates tokens 5 minutes before the 60-minute expiration mark over existing TCP connections using Valkey's RESP3 `AUTH` command without dropping connections or interrupting in-flight queries. Refreshes are spread over the first half of that window so connections don't re-AUTH in the same second.
-* **Refresh Failure Tolerance:** If the token source is briefly unreachable, live connections keep the last valid token instead of being closed; `OnCredentialError` reports the failure.
+* **Token Refresh on Live Connections:** An IAM access token lasts 60 minutes. valkeygcp caches each token and gets a new one 5 minutes before it expires (`IAMAuthOptions.RefreshBuffer`), and every live connection sends the new token with `AUTH`, without reconnecting or interrupting commands in flight. The re-AUTHs are spread over the first half of those 5 minutes, so connections don't all re-AUTH in the same second.
+* **Refresh Failure Tolerance:** If the token source is briefly unreachable, live connections keep the last token that worked instead of being closed, and the refresh is retried about every 30 seconds; `OnCredentialError` reports the failure.
 * **Bounded Setup and Token Fetches:** `NewClient`'s `ctx` bounds discovery, credential setup, impersonation and the first Token Auth read. Each IAM token fetch and each Token Auth read is capped, so a hung endpoint can't block new connections (see [1.5](#15-contexts-timeouts-and-setup-failures)).
-* **IAM Throttling Backoff:** `NewClient` retries `ERR_IAM_EXHAUSTED` / `ERR_IAM_OTHER` during the connection handshake with exponential backoff, within its `ctx`, and re-dials after such an error wait for the same backoff. Optional `MaxAuthPerSecond` caps the AUTH rate.
-* **Observability:** The `OnAuth` option reports every credential hand-out: node address, username, a token fingerprint (never the token), the next refresh, and whether the last-known-good fallback or a connection without TLS was used.
-* **Defect C1 Resolution:** Wraps token retrieval with `oauth2.ReuseTokenSourceWithExpiry` with a 5-minute buffer, preventing the recursive token halving loop bug.
-* **Enterprise Service Account Impersonation (Gap G6):** Cross-project access via `google.golang.org/api/impersonate`, with optional token lifetimes up to 12 hours.
-* **Works With Other valkey-go Modules:** `NewClient` fits the `ClientBuilder` of `valkeylock`, `valkeylimiter` and `valkeyaside`, and `ResolveClientOption` returns the wired `valkey.ClientOption` for `valkey.NewClient` or `valkeyotel.NewClient`.
-* **Zero Core Bloat:** All Google Cloud SDK dependencies remain completely isolated inside this sub-module; root `valkey-go` remains 100% lightweight and cloud-agnostic.
+* **IAM Throttling Backoff:** Memorystore answers `ERR_IAM_EXHAUSTED` (IAM quota exhausted) or `ERR_IAM_OTHER` (a transient IAM error) when it can't check a token right now. `NewClient` retries those errors during the connection handshake with exponential backoff, within its `ctx`, and after such an error new connections wait with the same backoff before dialing. The optional `IAMAuthOptions.MaxAuthPerSecond` limits how many AUTHs are sent per second.
+* **Observability:** The `OnAuth` option reports each time credentials are handed to valkey-go: the node address, the username, a token fingerprint (never the token), the next refresh, whether the last token that worked was reused after a failed refresh, and whether the connection is without TLS.
+* **Service Account Impersonation:** `IAMAuthOptions.ImpersonateSA` gets tokens for another service account, for example one that can reach an instance in another project. Impersonated tokens can last up to 12 hours (`ImpersonateLifetime`).
+* **Works With Other valkey-go Modules:** `NewClient` fits the `ClientBuilder` of `valkeylock`, `valkeylimiter` and `valkeyaside`, and `ResolveClientOption` returns the configured `valkey.ClientOption` for `valkey.NewClient` or `valkeyotel.NewClient`.
+* **No Cloud Dependencies in valkey-go:** The Google Cloud SDK dependencies live only in this module; the root `valkey-go` module doesn't depend on them.
 
 ### 1.2 Installation
 
@@ -87,7 +86,7 @@ client, err := valkeygcp.NewClient(ctx, valkey.ClientOption{},
 )
 ```
 
-`WithInstance` fills in what the `ClientOption` leaves empty: the endpoint, the reader endpoint of a cluster-disabled instance, the server CA, and the credentials that match the instance's auth mode. An `IAM_AUTH` instance uses ADC unless you pass `WithIAMOptions`. The instance is read once, while `NewClient` runs, as the identity `WithIAMOptions` names (`CustomTokenSource`, `ImpersonateSA` or `CredentialsJSON`), or as ADC without one; that identity needs `memorystore.instances.get` (`roles/memorystore.viewer`). `WithGoogleAPIOptions` sets other credentials, an endpoint or a quota project for that call. Add `WithNetwork` when the instance has endpoints in several VPC networks. `valkeygcp.ResolveClientOption` returns the wired `valkey.ClientOption` without connecting, so you can inspect or adjust it first.
+`WithInstance` fills in what the `ClientOption` leaves empty: the endpoint, the reader endpoint of a cluster-disabled instance, the server CA, and the credentials that match the instance's auth mode. An `IAM_AUTH` instance uses ADC unless you pass `WithIAMOptions`. The instance is read once, while `NewClient` runs, as the identity `WithIAMOptions` names (`CustomTokenSource`, `ImpersonateSA` or `CredentialsJSON`), or as ADC without one; that identity needs `memorystore.instances.get` (`roles/memorystore.viewer`). `WithGoogleAPIOptions` sets other credentials, an endpoint or a quota project for that call. Add `WithNetwork` when the instance has endpoints in several VPC networks. `valkeygcp.ResolveClientOption` returns the configured `valkey.ClientOption` without connecting, so you can inspect or adjust it first.
 
 #### Cluster Mode Disabled with a Reader Endpoint and Token Auth
 
@@ -144,7 +143,7 @@ locker, err := valkeylock.NewLocker(valkeylock.LockerOption{
 	},
 })
 
-// valkeyotel builds the client itself, so pass it the wired ClientOption:
+// valkeyotel builds the client itself, so pass it the ClientOption valkeygcp prepared:
 option, err := valkeygcp.ResolveClientOption(ctx, valkey.ClientOption{InitAddress: []string{"10.0.0.15:6379"}},
 	valkeygcp.WithDefaultIAM(), tlsOpt)
 client, err := valkeyotel.NewClient(option)
@@ -173,7 +172,7 @@ The cluster settings are left out when `Standalone.ReplicaAddress` is set or the
 * **Setup needs working credentials.** valkey-go connects and authenticates while it builds the client, so missing ADC, a denied impersonation or an unreadable secret fails `NewClient` immediately, with the underlying error. Without ADC, name an identity in `WithIAMOptions` (`CustomTokenSource` or `CredentialsJSON`), which `WithInstance` also uses, or leave out `WithInstance` and set `InitAddress` yourself. Token Auth secrets are read with ADC; use `TokenAuthOptions.Source` or `Token` without it.
 * **Cluster mode is checked.** valkey-go falls back to a single-node client when `CLUSTER SHARDS` fails, for example because an ACL rule doesn't allow it. When the instance (`WithInstance`) or `WithTopology(valkeygcp.TopologyCluster)` says cluster mode, `NewClient` fails instead, naming the missing permission.
 * **One Secret Manager client per location.** All Token Auth providers share one Secret Manager client per location (global, or each region of a regional secret), created on first use, so creating many clients or retrying setup doesn't pile up gRPC connections. Regional secrets use their regional endpoint, `secretmanager.LOCATION.rep.googleapis.com`, which isn't reachable through Private Google Access.
-* **A rejected re-AUTH closes the connection.** If Memorystore rejects a proactive re-AUTH (for example with `ERR_IAM_EXHAUSTED`), valkey-go closes that connection and the next command dials again (`pipe.go` `refreshAuth`), although Memorystore would keep the authenticated connection working.
+* **A rejected re-AUTH closes the connection.** If Memorystore rejects the re-AUTH of a live connection (for example with `ERR_IAM_EXHAUSTED`), valkey-go closes that connection and the next command dials a new one, although Memorystore would have kept the authenticated connection working.
 
 ### 1.6 IAM Username and ACL Policies
 

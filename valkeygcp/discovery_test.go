@@ -48,7 +48,9 @@ func clusterDisabledInstance(auth memorystorepb.Instance_AuthorizationMode) *mem
 	}
 }
 
-// T-DISC-1
+// WithInstance on a cluster-mode IAM_AUTH instance with a per-instance CA: the discovery
+// endpoint becomes InitAddress, the CA is downloaded once, IAM credentials are wired in,
+// and the Memorystore API client is closed after setup.
 func TestResolve_DiscoverClusterIAMPerInstanceCA(t *testing.T) {
 	ca1, ca2 := newTestCA(t, "ca-1"), newTestCA(t, "ca-2")
 	inst := clusterInstance(memorystorepb.Instance_IAM_AUTH)
@@ -81,7 +83,9 @@ func TestResolve_DiscoverClusterIAMPerInstanceCA(t *testing.T) {
 	}
 }
 
-// T-DISC-2
+// WithInstance on a cluster-disabled TOKEN_AUTH instance with the shared regional CA: the
+// instance's auth mode picks Token Auth over the IAM option, the CA is read for the
+// instance's project and region, and the primary and reader endpoints are filled in.
 func TestResolve_DiscoverClusterDisabledTokenSharedCA(t *testing.T) {
 	ca := newTestCA(t, "regional")
 	inst := clusterDisabledInstance(memorystorepb.Instance_TOKEN_AUTH)
@@ -118,7 +122,8 @@ func TestResolve_DiscoverClusterDisabledTokenSharedCA(t *testing.T) {
 	}
 }
 
-// T-DISC-3
+// An instance with auth and in-transit encryption disabled gets no credentials and no TLS,
+// even with WithIAMOptions, and no CA is downloaded.
 func TestResolve_DiscoverNoAuthNoTLS(t *testing.T) {
 	inst := clusterInstance(memorystorepb.Instance_AUTH_DISABLED)
 	inst.TransitEncryptionMode = memorystorepb.Instance_TRANSIT_ENCRYPTION_DISABLED
@@ -132,7 +137,8 @@ func TestResolve_DiscoverNoAuthNoTLS(t *testing.T) {
 	}
 }
 
-// T-DISC-4
+// A TLS mode, topology or reader endpoint that contradicts the instance fails during
+// setup, instead of later when connecting.
 func TestResolve_DiscoverContradictions(t *testing.T) {
 	cases := []struct {
 		name   string
@@ -157,7 +163,8 @@ func TestResolve_DiscoverContradictions(t *testing.T) {
 	}
 }
 
-// T-DISC-5
+// A TOKEN_AUTH instance needs WithTokenAuth with a token source. Without one, setup fails
+// with errNoTokenSource, which names the options to set.
 func TestResolve_DiscoverTokenAuthWithoutSource(t *testing.T) {
 	for name, opts := range map[string][]Option{
 		"no token option":        {WithIAMOptions(staticIAM())},
@@ -171,7 +178,9 @@ func TestResolve_DiscoverTokenAuthWithoutSource(t *testing.T) {
 	}
 }
 
-// T-DISC-6
+// When the Memorystore API denies the instance read or the CA download, the error names the
+// missing permission and role and keeps the gRPC status. Other API errors get no hint, and
+// an error from creating the API client is returned as is.
 func TestResolve_DiscoverPermissionDenied(t *testing.T) {
 	denied := status.Error(codes.PermissionDenied, "Permission 'memorystore.instances.get' denied")
 	_, err := resolveWith(valkey.ClientOption{}, (&fakeReader{getErr: denied}).factory(), WithInstance(testInstance))
@@ -204,7 +213,9 @@ func TestResolve_DiscoverPermissionDenied(t *testing.T) {
 	}
 }
 
-// T-DISC-7
+// WithNetwork picks the endpoint of one VPC network when the instance has PSC endpoints in
+// several. It accepts a full network name, a URL or a bare name; without it the first
+// endpoint is used, and an unknown network is an error.
 func TestResolve_DiscoverNetworkSelection(t *testing.T) {
 	inst := clusterInstance(memorystorepb.Instance_AUTH_DISABLED)
 	inst.Endpoints = []*memorystorepb.Instance_InstanceEndpoint{
@@ -228,7 +239,8 @@ func TestResolve_DiscoverNetworkSelection(t *testing.T) {
 	}
 }
 
-// T-DISC-8
+// An instance that only fills the deprecated discovery_endpoints field still yields its
+// discovery endpoint.
 func TestResolve_DiscoverDeprecatedDiscoveryEndpoints(t *testing.T) {
 	inst := &memorystorepb.Instance{
 		Mode:               memorystorepb.Instance_CLUSTER,
@@ -240,7 +252,9 @@ func TestResolve_DiscoverDeprecatedDiscoveryEndpoints(t *testing.T) {
 	}
 }
 
-// T-DISC-9
+// The Memorystore API can't return a customer-managed CA (CUSTOMER_MANAGED_CAS_CA). Without
+// CA material or TLSOptions.FetchCustomCA, setup fails with an error that says what to
+// pass; with CAPEM it works.
 func TestResolve_DiscoverCustomerManagedCANeedsPEM(t *testing.T) {
 	inst := clusterInstance(memorystorepb.Instance_AUTH_DISABLED)
 	inst.TransitEncryptionMode = memorystorepb.Instance_SERVER_AUTHENTICATION
@@ -260,7 +274,8 @@ func TestResolve_DiscoverCustomerManagedCANeedsPEM(t *testing.T) {
 	}
 }
 
-// T-DISC-10
+// An instance with TLS on but no server CA mode, as older instances report, uses its
+// per-instance CA.
 func TestResolve_DiscoverUnspecifiedCAModeIsPerInstance(t *testing.T) {
 	ca := newTestCA(t, "legacy")
 	inst := clusterInstance(memorystorepb.Instance_AUTH_DISABLED)
@@ -273,7 +288,7 @@ func TestResolve_DiscoverUnspecifiedCAModeIsPerInstance(t *testing.T) {
 	}
 }
 
-// T-DISC-11
+// An endpoint reported without a port gets the default port 6379.
 func TestResolve_DiscoverPortZeroDefaults(t *testing.T) {
 	inst := clusterInstance(memorystorepb.Instance_AUTH_DISABLED)
 	inst.Endpoints = []*memorystorepb.Instance_InstanceEndpoint{endpointGroup(
@@ -285,7 +300,7 @@ func TestResolve_DiscoverPortZeroDefaults(t *testing.T) {
 	}
 }
 
-// T-DISC-13: the instance fills only what the ClientOption leaves empty.
+// The instance fills only what the ClientOption leaves empty.
 func TestResolve_DiscoverFillsOnlyEmptyFields(t *testing.T) {
 	newFake := func() *fakeReader {
 		return &fakeReader{inst: clusterDisabledInstance(memorystorepb.Instance_AUTH_DISABLED)}
@@ -320,8 +335,8 @@ func TestResolve_DiscoverFillsOnlyEmptyFields(t *testing.T) {
 	}
 }
 
-// T-DISC-14: with both auth options, the instance's auth mode picks one; an IAM_AUTH
-// instance without an IAM option uses Application Default Credentials.
+// With both auth options, the instance's auth mode picks one; an IAM_AUTH instance without
+// an IAM option uses Application Default Credentials.
 func TestResolve_DiscoverInstancePicksAuth(t *testing.T) {
 	both := []Option{WithInstance(testInstance), WithIAMOptions(staticIAM()), WithTokenAuth(TokenAuthOptions{Token: "tok"})}
 	for mode, want := range map[memorystorepb.Instance_AuthorizationMode]string{
@@ -443,8 +458,8 @@ func cmcaInstance(pool string) *memorystorepb.Instance {
 	return inst
 }
 
-// T-DISC-12 (U11): with TLSOptions.FetchCustomCA, a customer-managed CA instance is configured
-// from WithInstance alone: the CA comes from the instance's CA pool.
+// With TLSOptions.FetchCustomCA, a customer-managed CA instance is configured from
+// WithInstance alone: the CA comes from the instance's Certificate Authority Service pool.
 func TestResolve_DiscoverCustomerManagedCAFetch(t *testing.T) {
 	const pool = "projects/my-proj/locations/us-west4/caPools/valkey-pool"
 	ca := newTestCA(t, "cas")
@@ -510,8 +525,8 @@ func lookupToken(t *testing.T, api googleAPI) string {
 	return tok.AccessToken
 }
 
-// T-DISC-15 (Issue 2): the instance lookup runs as the identity WithIAMOptions names, also
-// when the instance turns out not to use IAM; without WithIAMOptions it uses ADC.
+// The instance lookup runs as the identity WithIAMOptions names, also when the instance
+// turns out not to use IAM; without WithIAMOptions it uses Application Default Credentials.
 func TestResolve_LookupUsesIAMIdentity(t *testing.T) {
 	cases := []struct {
 		name     string
@@ -553,8 +568,8 @@ func TestResolve_LookupUsesIAMIdentity(t *testing.T) {
 	}
 }
 
-// T-DISC-16: with impersonation, the lookup and AUTH use the impersonated identity, which
-// is set up once.
+// With impersonation, the lookup and AUTH use the impersonated identity, which is set up
+// once.
 func TestResolve_LookupImpersonatesOnce(t *testing.T) {
 	orig := impersonateTokenSource
 	defer func() { impersonateTokenSource = orig }()
@@ -580,7 +595,7 @@ func TestResolve_LookupImpersonatesOnce(t *testing.T) {
 	}
 }
 
-// T-DISC-17: an identity that can't be set up fails before the lookup.
+// An identity that can't be set up fails before the lookup.
 func TestResolve_IdentityErrorsBeforeLookup(t *testing.T) {
 	t.Setenv("GOOGLE_APPLICATION_CREDENTIALS", filepath.Join(t.TempDir(), "missing.json"))
 	cases := []struct {
@@ -603,8 +618,8 @@ func TestResolve_IdentityErrorsBeforeLookup(t *testing.T) {
 	}
 }
 
-// T-DISC-18: WithGoogleAPIOptions follow the identity, for the lookup and the customer-managed
-// CA fetch, and need WithInstance.
+// WithGoogleAPIOptions follow the identity, for the lookup and the customer-managed CA
+// fetch, and need WithInstance.
 func TestResolve_WithGoogleAPIOptions(t *testing.T) {
 	endpoint, quota := option.WithEndpoint("memorystore.example:443"), option.WithQuotaProject("billing-proj")
 	fake := &fakeReader{inst: clusterInstance(memorystorepb.Instance_AUTH_DISABLED)}

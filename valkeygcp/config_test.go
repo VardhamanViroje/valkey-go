@@ -47,7 +47,9 @@ func resolveOption(t *testing.T, option valkey.ClientOption, newReader readerFac
 	return r.clientOption(context.Background())
 }
 
-// T-CFG-1
+// Without WithInstance, the endpoint can only come from ClientOption.InitAddress. Setup
+// fails with errNoEndpoint when it is empty, also when a reader endpoint
+// (Standalone.ReplicaAddress) or WithTopology is given.
 func TestResolve_NoEndpoint(t *testing.T) {
 	_, err := resolveOption(t, valkey.ClientOption{}, noReader(t))
 	if !errors.Is(err, errNoEndpoint) {
@@ -64,12 +66,14 @@ func TestResolve_NoEndpoint(t *testing.T) {
 	}
 }
 
-// T-CFG-2
+// A cluster-mode endpoint with IAM gets the Memorystore defaults: IAM credentials for the
+// "default" user, the cluster options, the connection settings and memorystoreRetryDelay.
+// With TLS off there is no TLSConfig, and cluster mode gets no read routing.
 func TestResolve_ExplicitClusterIAM(t *testing.T) {
 	opt, err := resolveOption(t, initOption("10.0.0.15:6379"), noReader(t),
 		WithTopology(TopologyCluster),
 		WithIAMOptions(staticIAM()),
-		WithTLS(TLSOptions{Mode: TLSDisabled}), // explicit opt-in to plaintext (U10)
+		WithTLS(TLSOptions{Mode: TLSDisabled}), // opt in to sending IAM tokens without TLS
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -102,7 +106,9 @@ func TestResolve_ExplicitClusterIAM(t *testing.T) {
 	}
 }
 
-// T-CFG-3
+// A cluster-disabled primary with a reader endpoint: reads go to the reader, writes and
+// blocking commands stay on the primary, and the cluster defaults are left out. Without a
+// reader endpoint, no read routing is set.
 func TestResolve_ExplicitClusterDisabled(t *testing.T) {
 	withReader := valkey.ClientOption{
 		InitAddress: []string{"10.0.0.2:6379"},
@@ -131,7 +137,7 @@ func TestResolve_ExplicitClusterDisabled(t *testing.T) {
 			t.Errorf("%v: SET must go to the primary", topology)
 		}
 		if opt.SendToReplicas(b.Blpop().Key("k").Timeout(1).Build()) {
-			t.Errorf("%v: blocking reads must go to the primary (C5)", topology)
+			t.Errorf("%v: blocking commands such as BLPOP must go to the primary", topology)
 		}
 		if opt.AuthCredentialsFn != nil || opt.TLSConfig != nil {
 			t.Errorf("%v: no auth and no TLS expected", topology)
@@ -148,7 +154,7 @@ func TestResolve_ExplicitClusterDisabled(t *testing.T) {
 	}
 }
 
-// T-CFG-4: values the caller set on the ClientOption beat the Memorystore defaults.
+// Values the caller set on the ClientOption beat the Memorystore defaults.
 func TestResolve_CallerOptionsPreserved(t *testing.T) {
 	retry := func(int, valkey.Completed, error) time.Duration { return 42 }
 	everything := func(valkey.Completed) bool { return true } // writes too, unlike sendReadsToReplicas
@@ -203,8 +209,8 @@ func TestResolve_CallerOptionsPreserved(t *testing.T) {
 	}
 }
 
-// T-CFG-5: credentials set on the ClientOption are used as is, so an auth option next to
-// them is a contradiction.
+// Credentials set on the ClientOption are used as is, so an auth option next to them is a
+// contradiction.
 func TestResolve_CallerCredentialsConflict(t *testing.T) {
 	fn := func(valkey.AuthCredentialsContext) (valkey.AuthCredentials, error) {
 		return valkey.AuthCredentials{Username: "caller", Password: "caller-secret"}, nil
@@ -272,7 +278,7 @@ func TestResolve_CallerCredentialsConflict(t *testing.T) {
 	}
 }
 
-// T-CFG-6: every InitAddress and Standalone.ReplicaAddress value is kept as given.
+// Every InitAddress and Standalone.ReplicaAddress value is kept as given.
 func TestResolve_AddressesKept(t *testing.T) {
 	init := []string{"10.0.0.1:6379", "10.0.0.2:6379", "10.0.0.3:6379"}
 	readers := []string{"10.0.1.1:6379", "10.0.1.2:6379"}
@@ -304,7 +310,7 @@ func TestResolve_AddressesKept(t *testing.T) {
 	}
 }
 
-// T-CFG-7: the cluster defaults are filled unless the ClientOption has a reader endpoint or
+// The cluster defaults are filled in unless the ClientOption has a reader endpoint or
 // WithTopology says cluster mode is disabled. Read routing needs a reader endpoint.
 func TestResolve_ClusterDefaults(t *testing.T) {
 	clusterDefaults := valkey.ClusterOption{PreferInitAddressRefresh: true, ShardsRefreshInterval: defaultShardsRefreshInterval, PreferClusterShards: true}
@@ -319,8 +325,9 @@ func TestResolve_ClusterDefaults(t *testing.T) {
 		want     valkey.ClusterOption
 		toReader bool // SendToReplicas expected
 	}{
-		// What NewStandaloneClient(ctx, primary, "") used to configure as an empty reader
-		// address: now no reader at all, and the cluster defaults in case it is a cluster.
+		// InitAddress only: no reader address is added, not even an empty one, which
+		// valkey-go would fail to dial, and the cluster defaults are filled in case the
+		// endpoint is a cluster.
 		{"InitAddress only", initOption("10.0.0.2:6379"), TopologyAuto, clusterDefaults, false},
 		{"cluster", initOption("10.0.0.15:6379"), TopologyCluster, clusterDefaults, false},
 		{"cluster disabled", initOption("10.0.0.2:6379"), TopologyClusterDisabled, valkey.ClusterOption{}, false},
@@ -479,7 +486,7 @@ func TestModeStrings(t *testing.T) {
 	}
 }
 
-// T-CFG-8: WithNetwork picks one of the instance's PSC endpoints, so it needs WithInstance.
+// WithNetwork picks one of the instance's PSC endpoints, so it needs WithInstance.
 func TestResolve_NetworkNeedsInstance(t *testing.T) {
 	_, err := resolveOption(t, initOption("10.0.0.15:6379"), noReader(t), WithNetwork(vpcB))
 	if err == nil || !strings.Contains(err.Error(), "WithNetwork needs WithInstance") {
@@ -487,8 +494,8 @@ func TestResolve_NetworkNeedsInstance(t *testing.T) {
 	}
 }
 
-// T-CFG-9: the OnAuth and OnCredentialError options reach the IAM and Token Auth providers
-// when IAMAuthOptions or TokenAuthOptions leave their own callback nil; set ones win.
+// The OnAuth and OnCredentialError options reach the IAM and Token Auth providers when
+// IAMAuthOptions or TokenAuthOptions leave their own callback nil; set ones win.
 func TestResolve_CallbackOptions(t *testing.T) {
 	for _, mech := range []string{"IAM", "Token Auth"} {
 		for _, own := range []struct{ onAuth, onErr bool }{{false, false}, {true, false}, {false, true}, {true, true}} {

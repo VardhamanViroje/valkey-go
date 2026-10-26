@@ -61,7 +61,7 @@ func TestResolveClientOption_ClusterWiring(t *testing.T) {
 		t.Errorf("cluster options = %+v / %+v", opt.InitAddress, opt.ClusterOption)
 	}
 	if opt.DialCtxFn == nil {
-		t.Error("IAM must space out re-dials (U8): no gated dialer")
+		t.Error("IAM must space out re-dials after IAM backend errors: no gated dialer")
 	}
 	creds, err := opt.AuthCredentialsFn(valkey.AuthCredentialsContext{})
 	if err != nil || creds.Username != DefaultIAMUsername || creds.Password != "cluster-token" {
@@ -161,7 +161,8 @@ func TestResolveClientOption_SendToReplicasLogic(t *testing.T) {
 		t.Errorf("expected SET NOT to route to replica, got true")
 	}
 
-	// Blocking command (BLPOP) -> should NOT route to replica even if read-only
+	// Blocking command (BLPOP) -> should NOT route to replica. BLPOP pops an element, so it
+	// isn't read-only either.
 	blpopCmd := builder.Blpop().Key("k").Timeout(1).Build()
 	if capturedOpt.SendToReplicas(blpopCmd) {
 		t.Errorf("expected BLPOP NOT to route to replica, got true")
@@ -181,9 +182,8 @@ func TestResolveClientOption_MemorystoreRetryDelay(t *testing.T) {
 	}
 }
 
-// T-CTX-1: NewClient's ctx reaches the setup calls (here the first Token Auth read), and a
-// ctx that ends during setup stops NewClient before it dials (valkey.NewClient takes no
-// context).
+// NewClient's ctx reaches the setup calls (here the first Token Auth read), and a ctx that
+// ends during setup stops NewClient before it dials (valkey.NewClient takes no context).
 func TestNewClient_ContextDuringSetup(t *testing.T) {
 	type key struct{}
 	srv := newFakeValkey(t, standaloneReply)
@@ -211,7 +211,7 @@ func TestNewClient_ContextDuringSetup(t *testing.T) {
 	}
 }
 
-// T-CTX-2: missing ADC fails setup with the real error, before any dial.
+// Missing Application Default Credentials fail setup with the real error, before any dial.
 func TestWithDefaultIAM(t *testing.T) {
 	// A credentials file that doesn't exist makes ADC fail at once, without probing the
 	// metadata server, so the result is the same on laptops, CI and Google Cloud.

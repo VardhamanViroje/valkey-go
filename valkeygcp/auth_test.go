@@ -52,7 +52,9 @@ func (m *mockTokenSource) CallCount() int64 {
 	return atomic.LoadInt64(&m.calls)
 }
 
-// 1. Basic Token Acquisition and Credential Formatting
+// A provider built on a custom token source returns its token from Token, and
+// AuthCredentialsFn turns that token into AUTH credentials: the configured username, the
+// token as the password, and a re-AUTH time inside the refresh buffer.
 func TestNewGCPTokenProvider_CustomTokenSource(t *testing.T) {
 	ctx := context.Background()
 	expectedToken := &oauth2.Token{
@@ -92,7 +94,9 @@ func TestNewGCPTokenProvider_CustomTokenSource(t *testing.T) {
 		t.Errorf("got password %q, want %q", creds.Password, expectedToken.AccessToken)
 	}
 
-	// Verify RefreshAfter lands inside the C1 buffer window [Expiry - 10m, Expiry - 5m] (U5 jitter)
+	// RefreshAfter must fall in [Expiry-10m, Expiry-5m], the first half of the 10m refresh
+	// buffer: inside the buffer, so the re-AUTH gets a new token from the cache, and at a
+	// random point, so the connections of a client don't all re-AUTH at the same moment.
 	windowStart := expectedToken.Expiry.Add(-10 * time.Minute)
 	windowEnd := expectedToken.Expiry.Add(-5 * time.Minute)
 	if creds.RefreshAfter.Before(windowStart) || creds.RefreshAfter.After(windowEnd) {
@@ -100,8 +104,11 @@ func TestNewGCPTokenProvider_CustomTokenSource(t *testing.T) {
 	}
 }
 
-// 2. Defect C1 Halving Loop Regression Test
-func TestDefectC1_HalvingLoopPrevention(t *testing.T) {
+// The token cache treats a token as expiring RefreshBuffer early, so a token with less time
+// left than the buffer is replaced on the next call. With oauth2's default 10s margin, a
+// re-AUTH scheduled inside the buffer would get the old token again and reschedule itself
+// at ever shorter intervals (the "halving loop").
+func TestTokenCache_RefreshesInsideBuffer(t *testing.T) {
 	ctx := context.Background()
 
 	// Token 1: Expires in 4 minutes (which is inside the 5-minute buffer)
@@ -145,20 +152,21 @@ func TestDefectC1_HalvingLoopPrevention(t *testing.T) {
 	// Under standard ReuseTokenSource, calling Token() now would see 4 minutes remaining (>10s)
 	// and return the same token1 without calling mock.
 	// But with ReuseTokenSourceWithExpiry(5m), remaining time (4m) < buffer (5m),
-	// so it MUST fetch token2 immediately!
+	// so it must fetch token2 right away.
 	tok2, err := provider.Token(ctx)
 	if err != nil {
 		t.Fatalf("second token call failed: %v", err)
 	}
 	if tok2.AccessToken != "token-refreshed" {
-		t.Errorf("C1 Fix Failed! Got cached token %q instead of refreshed token %q", tok2.AccessToken, "token-refreshed")
+		t.Errorf("got cached token %q, want the refreshed token %q", tok2.AccessToken, "token-refreshed")
 	}
 	if mock.CallCount() != 2 {
 		t.Errorf("expected 2 underlying calls due to eager refresh, got %d", mock.CallCount())
 	}
 }
 
-// 3. Near-Expiry and Expired Token Fallback Logic
+// When the token has less time left than the refresh buffer, the re-AUTH is scheduled after
+// half the remaining time; when the token has already expired, 10s from now.
 func TestAuthCredentialsFn_NearExpiryFallback(t *testing.T) {
 	ctx := context.Background()
 
@@ -184,7 +192,7 @@ func TestAuthCredentialsFn_NearExpiryFallback(t *testing.T) {
 		t.Fatalf("authFn failed: %v", err)
 	}
 
-	// Remaining time is ~2m, so refreshAt should be scheduled at ~1m in the future (remaining / 2)
+	// Remaining time is ~2m, so RefreshAfter should be ~1m in the future (remaining / 2)
 	timeUntilRefresh := time.Until(creds.RefreshAfter)
 	if timeUntilRefresh < 45*time.Second || timeUntilRefresh > 75*time.Second {
 		t.Errorf("got timeUntilRefresh %v, want ~1m (half remaining)", timeUntilRefresh)
@@ -211,7 +219,7 @@ func TestAuthCredentialsFn_NearExpiryFallback(t *testing.T) {
 	}
 }
 
-// 4. Invalid JSON Credentials Validation
+// NewGCPTokenProvider rejects malformed CredentialsJSON.
 func TestNewGCPTokenProvider_InvalidJSON(t *testing.T) {
 	ctx := context.Background()
 	_, err := NewGCPTokenProvider(ctx, IAMAuthOptions{
@@ -222,7 +230,8 @@ func TestNewGCPTokenProvider_InvalidJSON(t *testing.T) {
 	}
 }
 
-// 5. Concurrency and Race Safety
+// Token and AuthCredentialsFn can be called from many goroutines at once: valkey-go calls
+// AuthCredentialsFn for each of its connections. Run with -race to catch data races.
 func TestAuthCredentials_Concurrency(t *testing.T) {
 	ctx := context.Background()
 	mock := &mockTokenSource{
@@ -268,7 +277,8 @@ func TestAuthCredentials_Concurrency(t *testing.T) {
 	wg.Wait()
 }
 
-// 6. ClientOption Wiring
+// WithIAMOptions sets ClientOption.AuthCredentialsFn to the IAM provider, which hands out
+// the configured username and the token from the token source.
 func TestWithIAMOptions_ClientOptionWiring(t *testing.T) {
 	mock := &mockTokenSource{
 		defaultTok: &oauth2.Token{
@@ -305,7 +315,8 @@ func TestWithIAMOptions_ClientOptionWiring(t *testing.T) {
 	}
 }
 
-// 7. Token Error Propagation
+// When the token source fails and no token has ever been fetched, AuthCredentialsFn returns
+// the error, so valkey-go fails the dial.
 func TestAuthCredentialsFn_TokenError(t *testing.T) {
 	ctx := context.Background()
 	mock := &mockTokenSource{
@@ -326,7 +337,8 @@ func TestAuthCredentialsFn_TokenError(t *testing.T) {
 	}
 }
 
-// 8. WithIAMOptions Error Handling
+// ResolveClientOption returns the error when WithIAMOptions can't build its token provider,
+// here because of malformed CredentialsJSON.
 func TestWithIAMOptions_Error(t *testing.T) {
 	_, err := ResolveClientOption(context.Background(), initOption("10.0.0.15:6379"),
 		WithIAMOptions(IAMAuthOptions{
@@ -339,7 +351,7 @@ func TestWithIAMOptions_Error(t *testing.T) {
 	}
 }
 
-// 9. Default Options Verification
+// Options left empty get their defaults: the AUTH username is DefaultIAMUsername.
 func TestNewGCPTokenProvider_Defaults(t *testing.T) {
 	ctx := context.Background()
 	mock := &mockTokenSource{
@@ -368,16 +380,19 @@ func TestNewGCPTokenProvider_Defaults(t *testing.T) {
 	}
 }
 
-// 10. Refresh tolerance (U6): the provider must not make refreshAuth close healthy connections.
+// Refresh-failure tolerance. valkey-go closes a live connection when AuthCredentialsFn
+// returns an error during a re-AUTH, so a failed token fetch must not reach it as an error
+// while the connection can keep working.
 
-// T-U6-1
+// When a fetch fails while the last good token is still valid, the provider hands out that
+// token again, schedules a retry in 27-30s, and passes the error to OnCredentialError.
 func TestRefreshTolerance_CachedTokenValid(t *testing.T) {
 	var fail atomic.Bool
 	src := tokenSourceFunc(func() (*oauth2.Token, error) {
 		if fail.Load() {
 			return nil, errors.New("metadata server unreachable")
 		}
-		// Inside the 5m buffer, so the C1 cache asks the source again on the next call.
+		// Inside the 5m refresh buffer, so the token cache fetches again on the next call.
 		return &oauth2.Token{AccessToken: "cached", Expiry: time.Now().Add(3 * time.Minute)}, nil
 	})
 	var absorbed atomic.Int32
@@ -409,7 +424,9 @@ func TestRefreshTolerance_CachedTokenValid(t *testing.T) {
 	}
 }
 
-// T-U6-2
+// Once the last good token has expired, a failed fetch hands out empty credentials, so
+// valkey-go skips the re-AUTH and the connection stays authenticated. A retry is still
+// scheduled in 27-30s.
 func TestRefreshTolerance_CachedTokenExpired(t *testing.T) {
 	mock := &mockTokenSource{tokens: []*oauth2.Token{{AccessToken: "expired", Expiry: time.Now().Add(-time.Minute)}}}
 	provider, err := NewGCPTokenProvider(context.Background(), IAMAuthOptions{CustomTokenSource: mock})
@@ -429,14 +446,15 @@ func TestRefreshTolerance_CachedTokenExpired(t *testing.T) {
 		t.Fatalf("got error %v, want empty credentials", err)
 	}
 	if creds.Username != "" || creds.Password != "" {
-		t.Errorf("creds = %+v, want empty (refreshAuth then skips AUTH)", creds)
+		t.Errorf("creds = %+v, want empty (valkey-go then skips the re-AUTH)", creds)
 	}
 	if d := creds.RefreshAfter.Sub(before); d < 27*time.Second || d > 30*time.Second+100*time.Millisecond {
 		t.Errorf("retry in %v, want 27-30s", d)
 	}
 }
 
-// T-U6-3
+// If no fetch has ever succeeded, there is no token to fall back on: AuthCredentialsFn
+// returns the error, and OnCredentialError isn't called for it.
 func TestRefreshTolerance_NeverSucceeded(t *testing.T) {
 	var absorbed atomic.Int32
 	provider, err := NewGCPTokenProvider(context.Background(), IAMAuthOptions{
@@ -454,7 +472,9 @@ func TestRefreshTolerance_NeverSucceeded(t *testing.T) {
 	}
 }
 
-// T-U6-4: needs the docker compose Valkey on 127.0.0.1:6379 (run by dockertest.sh in CI).
+// Against a real server, a token source that goes down before the first re-AUTH leaves the
+// live connection in place: commands keep running on it (same CLIENT ID). Needs the docker
+// compose Valkey on 127.0.0.1:6379 (dockertest.sh starts it in CI); skipped otherwise.
 func TestRefreshTolerance_LiveConnection(t *testing.T) {
 	const addr = "127.0.0.1:6379"
 	dialer := net.Dialer{Timeout: 300 * time.Millisecond}
@@ -513,12 +533,14 @@ func TestRefreshTolerance_LiveConnection(t *testing.T) {
 	if after != id {
 		t.Fatalf("connection was replaced (CLIENT ID %d -> %d)", id, after)
 	}
-	if err := client.Do(ctx, client.B().Set().Key("valkeygcp:u6").Value("ok").Build()).Error(); err != nil {
+	if err := client.Do(ctx, client.B().Set().Key("valkeygcp:refresh-tolerance").Value("ok").Build()).Error(); err != nil {
 		t.Fatal(err)
 	}
 }
 
-// T-U6-5
+// refreshTime picks a random point in the first half of the refresh buffer; for a token
+// already inside the buffer it waits half the remaining time, and for an expired one 10s.
+// jitter takes up to 10% off a duration and passes non-positive durations through.
 func TestRefreshTolerance_RefreshTimeWindow(t *testing.T) {
 	now := time.Now()
 	expiry := now.Add(time.Hour)
@@ -545,7 +567,9 @@ func TestRefreshTolerance_RefreshTimeWindow(t *testing.T) {
 	}
 }
 
-// T-U6-6
+// With DisableProactiveReauth, credentials never carry a re-AUTH time. After a failed
+// fetch, new connections still get the last token while it is valid, but once it has
+// expired the dial fails with the real error: there is no live connection to protect.
 func TestRefreshTolerance_DisableProactiveReauth(t *testing.T) {
 	var fail atomic.Bool
 	expiry := time.Now().Add(3 * time.Minute)
@@ -590,7 +614,9 @@ func TestAuthCredentials_NonExpiringToken(t *testing.T) {
 	}
 }
 
-// 11. Connection-rate pacing (U5)
+// MaxAuthPerSecond spaces out the AUTHs of one provider, so a burst of new connections
+// doesn't send all its AUTHs to Memorystore at once: at 20 per second, four AUTHs take at
+// least 150ms. MaxAuthPerSecond 0 creates no limiter, and a nil limiter doesn't wait.
 func TestMaxAuthPerSecond(t *testing.T) {
 	provider, err := NewGCPTokenProvider(context.Background(), IAMAuthOptions{
 		CustomTokenSource: &mockTokenSource{},
@@ -620,7 +646,12 @@ func TestMaxAuthPerSecond(t *testing.T) {
 	}
 }
 
-// 12. Impersonation with a custom token lifetime (G6)
+// Service account impersonation (ImpersonateSA) with a custom ImpersonateLifetime: the
+// target, delegates, lifetime and scopes reach impersonate. With a lifetime, impersonate
+// returns a source that never refreshes, so the provider calls impersonate again for each
+// new token; UsernamePrincipalEmail gives the impersonated account. Without a lifetime the
+// impersonate source refreshes itself and is built once. A negative lifetime, or one not
+// longer than RefreshBuffer, is rejected.
 func TestImpersonateLifetime(t *testing.T) {
 	orig := impersonateTokenSource
 	defer func() { impersonateTokenSource = orig }()
@@ -674,8 +705,9 @@ func TestImpersonateLifetime(t *testing.T) {
 	}
 }
 
-// G6: with CredentialsJSON, the key is the identity that impersonates ImpersonateSA; without
-// it, ADC is. With a custom lifetime, every new token is minted with the same identity.
+// With CredentialsJSON, the key is the identity that impersonates ImpersonateSA; without
+// it, Application Default Credentials (ADC) are. With a custom lifetime, every new token is
+// minted with the same identity.
 func TestImpersonation_SourceIdentity(t *testing.T) {
 	orig := impersonateTokenSource
 	defer func() { impersonateTokenSource = orig }()
@@ -709,9 +741,11 @@ func TestImpersonation_SourceIdentity(t *testing.T) {
 	}
 }
 
-// 13. Context and timeouts: setup honors the caller's ctx; upstream fetches are capped.
+// Context and timeouts: setup honors the caller's ctx, and each upstream token fetch is
+// capped by FetchTimeout.
 
-// T-CTX-3: impersonation setup errors surface from the provider and the option.
+// An impersonation setup error is returned by NewGCPTokenProvider, and by
+// ResolveClientOption with WithIAMOptions, which then returns no AuthCredentialsFn.
 func TestNewGCPTokenProvider_ImpersonationError(t *testing.T) {
 	orig := impersonateTokenSource
 	defer func() { impersonateTokenSource = orig }()
@@ -730,7 +764,7 @@ func TestNewGCPTokenProvider_ImpersonationError(t *testing.T) {
 	}
 }
 
-// T-CTX-4: a hung credential setup (here the eager impersonation fetch used with
+// A hung credential setup (here the eager impersonation fetch used with
 // ImpersonateLifetime) stops at the caller's deadline.
 func TestNewGCPTokenProvider_SetupHonorsContext(t *testing.T) {
 	orig := impersonateTokenSource
@@ -760,8 +794,9 @@ func TestNewGCPTokenProvider_SetupHonorsContext(t *testing.T) {
 	}
 }
 
-// T-CTX-5: a hung token endpoint can't block a dial for longer than FetchTimeout, and later
-// calls share the running fetch instead of piling up goroutines.
+// A hung token endpoint can't block a dial for longer than FetchTimeout, and later calls
+// share the running fetch instead of piling up goroutines. Once the fetch is 3*FetchTimeout
+// old, it counts as stuck and the next call starts a new one.
 func TestFetchTimeout_HungSource(t *testing.T) {
 	const timeout = 40 * time.Millisecond
 	release := make(chan struct{})
@@ -800,7 +835,8 @@ func TestFetchTimeout_HungSource(t *testing.T) {
 	}
 }
 
-// T-CTX-6: a fetch that times out after a success serves the last valid token (U6).
+// A fetch that times out after an earlier success is handled like any failed fetch: the
+// last valid token is handed out with a retry time, and OnCredentialError gets the timeout.
 func TestFetchTimeout_FallsBackToLastGood(t *testing.T) {
 	const timeout = 40 * time.Millisecond
 	release := make(chan struct{})
@@ -808,7 +844,7 @@ func TestFetchTimeout_FallsBackToLastGood(t *testing.T) {
 	var calls atomic.Int32
 	src := tokenSourceFunc(func() (*oauth2.Token, error) {
 		if calls.Add(1) == 1 {
-			// Inside the refresh buffer, so the C1 cache fetches again on the next call.
+			// Inside the refresh buffer, so the token cache fetches again on the next call.
 			return &oauth2.Token{AccessToken: "first", Expiry: time.Now().Add(time.Minute)}, nil
 		}
 		<-release
@@ -836,7 +872,7 @@ func TestFetchTimeout_FallsBackToLastGood(t *testing.T) {
 	}
 }
 
-// T-CTX-7: GCPTokenProvider.Token honors its ctx.
+// GCPTokenProvider.Token stops waiting when its ctx ends, even when FetchTimeout is longer.
 func TestTokenProvider_TokenHonorsContext(t *testing.T) {
 	release := make(chan struct{})
 	t.Cleanup(func() { close(release) })

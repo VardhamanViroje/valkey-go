@@ -19,7 +19,8 @@ import (
 
 var errNoEndpoint = errors.New("valkeygcp: no endpoint: set ClientOption.InitAddress, or use WithInstance")
 
-// instanceReader is the minimal control-plane surface; tests inject a fake.
+// instanceReader is the part of the Memorystore API that discovery uses; tests replace it
+// with a fake.
 type instanceReader interface {
 	GetInstance(ctx context.Context, name string) (*memorystorepb.Instance, error)
 	PerInstanceCA(ctx context.Context, name string) ([]string, error)               // PEM certificates
@@ -44,9 +45,11 @@ func (g googleAPI) clientOptions() []option.ClientOption {
 	return append(all, g.opts...)
 }
 
-// readerFactory creates the instanceReader for one resolution; tests inject a fake.
+// readerFactory creates the instanceReader for one NewClient or ResolveClientOption call;
+// tests replace it with a fake.
 type readerFactory func(ctx context.Context, api googleAPI) (instanceReader, error)
 
+// apiReader is the instanceReader backed by the Memorystore API.
 type apiReader struct{ c *memorystore.Client }
 
 // defaultInstanceReader reads the instance through the Memorystore API. The setup identity
@@ -68,8 +71,10 @@ func (a *apiReader) PerInstanceCA(ctx context.Context, name string) ([]string, e
 	if err != nil {
 		return nil, err
 	}
+	// Keep every chain: during a CA rotation the old and the new CA are both listed, and a
+	// node may present a certificate from either.
 	var pems []string
-	for _, chain := range ca.GetManagedServerCa().GetCaCerts() { // every chain: covers CA overlap (Q4)
+	for _, chain := range ca.GetManagedServerCa().GetCaCerts() {
 		pems = append(pems, chain.GetCertificates()...)
 	}
 	return pems, nil
@@ -101,6 +106,7 @@ func parseInstanceName(name string) (project, region string, err error) {
 	return p[1], p[3], nil
 }
 
+// pscEndpoint is one Private Service Connect (PSC) endpoint of the instance.
 type pscEndpoint struct {
 	addr    string
 	typ     memorystorepb.ConnectionType
@@ -136,6 +142,8 @@ func pscEndpoints(inst *memorystorepb.Instance) []pscEndpoint {
 	return out
 }
 
+// pickEndpoint returns the address of the first endpoint of type typ in network, or ""
+// when there is none. An empty network, on either side, matches any network.
 func pickEndpoint(eps []pscEndpoint, typ memorystorepb.ConnectionType, network string) string {
 	for _, e := range eps {
 		if e.typ == typ && (network == "" || e.network == "" || sameNetwork(e.network, network)) {
@@ -158,6 +166,7 @@ func sameNetwork(a, b string) bool {
 	return false
 }
 
+// trimNetworkURL drops what comes before "projects/" in a network URL.
 func trimNetworkURL(n string) string {
 	if i := strings.Index(n, "projects/"); i >= 0 {
 		return n[i:]
@@ -165,9 +174,9 @@ func trimNetworkURL(n string) string {
 	return n
 }
 
-// resolve applies §1.5: the caller's ClientOption and Options, then the values discovered from
-// the instance, then a safe default. Contradictions between the caller's settings and the
-// instance are errors.
+// resolve settles every setting. The order of precedence is: what the caller set on the
+// ClientOption and in Options, then what the instance says (WithInstance), then a safe
+// default. A caller setting that contradicts the instance is an error.
 func resolve(ctx context.Context, option valkey.ClientOption, cfg config, newReader readerFactory) (*resolved, error) {
 	if err := checkEnums(cfg); err != nil {
 		return nil, err
@@ -250,7 +259,7 @@ func (r *resolved) discover(ctx context.Context, newReader readerFactory) error 
 	if err != nil {
 		return err
 	}
-	defer func() { _ = rd.Close() }() // control plane is used for resolution only
+	defer func() { _ = rd.Close() }() // the Memorystore API is only used during setup
 
 	inst, err := rd.GetInstance(ctx, r.cfg.instance)
 	if err != nil {
@@ -321,8 +330,9 @@ func (r *resolved) discover(ctx context.Context, newReader readerFactory) error 
 	return nil
 }
 
-// fetchCustomCA gets a CUSTOMER_MANAGED_CAS_CA instance's server CA from its CA Service pool
-// through TLSOptions.FetchCustomCA (U11). Without the hook, validate reports the missing CA.
+// fetchCustomCA gets the server CA of a CUSTOMER_MANAGED_CAS_CA instance from its CA
+// Service pool through TLSOptions.FetchCustomCA, because the Memorystore API can't return
+// it. Without FetchCustomCA, validate reports the missing CA.
 func (r *resolved) fetchCustomCA(ctx context.Context, inst *memorystorepb.Instance) error {
 	fetch := r.cfg.tls.FetchCustomCA
 	if fetch == nil || inst.GetServerCaMode() != memorystorepb.Instance_CUSTOMER_MANAGED_CAS_CA {
@@ -397,10 +407,10 @@ func (r *resolved) validate() error {
 }
 
 // checkPlaintextCredentials refuses to send IAM or Token Auth credentials without TLS when
-// there is no instance, unless the caller turned TLS off on purpose (U10): TLSAuto infers
-// TLSDisabled when no CA option is set, and the AUTH command then crosses the network in
-// plaintext, even to an instance that only accepts TLS. With WithInstance the instance's
-// in-transit encryption setting decides.
+// there is no instance, unless the caller turned TLS off on purpose. Without an instance,
+// TLSAuto becomes TLSDisabled when no CA option is set, and the AUTH command would then
+// cross the network in plaintext, even to an instance that only accepts TLS. With
+// WithInstance, the instance's in-transit encryption setting decides.
 func (r *resolved) checkPlaintextCredentials(callerAuth bool) error {
 	if r.cfg.instance != "" || callerAuth || r.tls != TLSDisabled || r.cfg.tls.Mode == TLSDisabled || r.opt.TLSConfig != nil {
 		return nil
@@ -417,6 +427,7 @@ func (r *resolved) checkPlaintextCredentials(callerAuth bool) error {
 	return fmt.Errorf("valkeygcp: refusing to send %s without TLS: pass WithTLS with the instance's server CA (TLSOptions.CAFile or CAPEM) or set ClientOption.TLSConfig, or pass WithTLS(TLSOptions{Mode: TLSDisabled}) if the instance has in-transit encryption disabled", what)
 }
 
+// errMissing reports that the instance has no endpoint of type typ.
 func (r *resolved) errMissing(typ memorystorepb.ConnectionType) error {
 	if r.cfg.network != "" {
 		return fmt.Errorf("valkeygcp: instance %s has no %v endpoint in network %q", r.cfg.instance, typ, r.cfg.network)
@@ -424,6 +435,7 @@ func (r *resolved) errMissing(typ memorystorepb.ConnectionType) error {
 	return fmt.Errorf("valkeygcp: instance %s has no %v endpoint yet (is its PSC connection created?)", r.cfg.instance, typ)
 }
 
+// topologyOf maps the instance's mode to a Topology.
 func topologyOf(inst *memorystorepb.Instance) (Topology, error) {
 	switch m := inst.GetMode(); m {
 	case memorystorepb.Instance_CLUSTER, memorystorepb.Instance_MODE_UNSPECIFIED: // the API default is CLUSTER
@@ -438,6 +450,7 @@ func topologyOf(inst *memorystorepb.Instance) (Topology, error) {
 	}
 }
 
+// authModeOf maps the instance's authorization mode to an authMode.
 func authModeOf(inst *memorystorepb.Instance) (authMode, error) {
 	switch m := inst.GetAuthorizationMode(); m {
 	case memorystorepb.Instance_AUTH_DISABLED, memorystorepb.Instance_AUTHORIZATION_MODE_UNSPECIFIED:
@@ -451,6 +464,7 @@ func authModeOf(inst *memorystorepb.Instance) (authMode, error) {
 	}
 }
 
+// tlsModeOf maps the instance's transit encryption mode and server CA mode to a TLSMode.
 func tlsModeOf(inst *memorystorepb.Instance) (TLSMode, error) {
 	switch m := inst.GetTransitEncryptionMode(); m {
 	case memorystorepb.Instance_TRANSIT_ENCRYPTION_DISABLED, memorystorepb.Instance_TRANSIT_ENCRYPTION_MODE_UNSPECIFIED:
@@ -490,6 +504,7 @@ func checkTLSMode(opt valkey.ClientOption, t TLSOptions, inst *memorystorepb.Ins
 	return fmt.Errorf("valkeygcp: instance uses %s but WithTLS sets Mode %v", desc, explicit)
 }
 
+// checkEnums rejects TLSMode and Topology values that aren't one of the defined constants.
 func checkEnums(cfg config) error {
 	if cfg.tls.Mode < TLSAuto || cfg.tls.Mode > TLSCustomCA {
 		return fmt.Errorf("valkeygcp: unknown TLSOptions.Mode %v", cfg.tls.Mode)

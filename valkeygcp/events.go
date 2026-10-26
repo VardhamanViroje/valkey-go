@@ -14,9 +14,9 @@ import (
 // defaultUser is the AUTH user valkey-go uses when a credential has no username.
 const defaultUser = "default"
 
-// AuthEvent describes one credential hand-out to valkey-go (U9). valkey-go asks for
-// credentials for every new connection (its HELLO) and at each proactive re-AUTH. An event
-// never contains the token itself.
+// AuthEvent describes one time credentials were handed to valkey-go, for logs and metrics
+// (see the OnAuth option). valkey-go asks for credentials for every new connection (its
+// HELLO) and at each re-AUTH of a live connection. An event never contains the token itself.
 type AuthEvent struct {
 	// Address is the node the credentials are for, "" if valkey-go didn't say.
 	Address string
@@ -30,12 +30,12 @@ type AuthEvent struct {
 	Fingerprint string
 	// RefreshAfter is when the next proactive re-AUTH is due; zero when none is scheduled.
 	RefreshAfter time.Time
-	// Fallback reports that a token fetch failed and the last-known-good token (or, once it
-	// has expired, no token) was handed out instead (U6). OnCredentialError gets the error.
+	// Fallback reports that a token fetch failed and the last token that worked was handed
+	// out instead, or no token once that one has expired. OnCredentialError gets the error.
 	Fallback bool
-	// Plaintext reports that NewClient wired these credentials for connections without TLS
+	// Plaintext reports that NewClient set up these credentials for connections without TLS
 	// (no ClientOption.TLSConfig): the instance has in-transit encryption disabled, or WithTLS
-	// set TLSDisabled (U10). A provider made directly with NewGCPTokenProvider doesn't know
+	// set TLSDisabled. A provider made directly with NewGCPTokenProvider doesn't know
 	// the transport and leaves it false.
 	Plaintext bool
 	// Err is set when no credentials could be handed out. valkey-go then fails the dial, or

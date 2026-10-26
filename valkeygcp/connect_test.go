@@ -129,7 +129,9 @@ func iamOptions(extra ...Option) []Option {
 	}, extra...)
 }
 
-// T-CONN-1 (U8): NewClient retries ERR_IAM_* during the handshake with backoff.
+// When Memorystore rejects the handshake with an IAM backend error (ERR_IAM_EXHAUSTED or
+// ERR_IAM_OTHER), NewClient retries with exponential backoff, since valkey-go doesn't
+// retry that reply. Here the third connection succeeds.
 func TestNewClient_RetriesIAMBackendErrors(t *testing.T) {
 	srv := newFakeValkey(t, func(conn int64, args []string) (string, bool) {
 		if strings.EqualFold(args[0], "HELLO") && conn <= 2 {
@@ -152,7 +154,8 @@ func TestNewClient_RetriesIAMBackendErrors(t *testing.T) {
 	}
 }
 
-// T-CONN-2 (U8): retries stop when ctx ends, and the error keeps the IAM reply.
+// The retries of IAM backend errors stop when NewClient's ctx ends; the error keeps the IAM
+// reply and wraps the ctx error.
 func TestNewClient_IAMRetriesStopAtDeadline(t *testing.T) {
 	srv := newFakeValkey(t, func(conn int64, args []string) (string, bool) {
 		if strings.EqualFold(args[0], "HELLO") {
@@ -176,7 +179,8 @@ func TestNewClient_IAMRetriesStopAtDeadline(t *testing.T) {
 	}
 }
 
-// T-CONN-3: other handshake errors are returned at once.
+// Handshake errors other than the IAM backend errors, such as WRONGPASS, are returned at
+// once, without a retry.
 func TestNewClient_OtherHandshakeErrorsNotRetried(t *testing.T) {
 	srv := newFakeValkey(t, func(conn int64, args []string) (string, bool) {
 		if strings.EqualFold(args[0], "HELLO") {
@@ -193,7 +197,9 @@ func TestNewClient_OtherHandshakeErrorsNotRetried(t *testing.T) {
 	}
 }
 
-// T-CONN-4 (U7): a refused CLIENT TRACKING names the ACL rule to change.
+// valkey-go sends CLIENT TRACKING on every new connection unless ClientOption.DisableCache
+// is set. When an ACL rule refuses it, the error names the ACL rule to change and still
+// wraps valkey.ErrNoCache.
 func TestNewClient_ClientTrackingNOPERMHint(t *testing.T) {
 	srv := newFakeValkey(t, func(conn int64, args []string) (string, bool) {
 		if len(args) > 1 && strings.EqualFold(args[0], "CLIENT") && strings.EqualFold(args[1], "TRACKING") {
@@ -208,7 +214,9 @@ func TestNewClient_ClientTrackingNOPERMHint(t *testing.T) {
 	}
 }
 
-// T-CONN-5 (U7): a cluster-mode endpoint that yields a single-node client is an error.
+// valkey-go quietly falls back to a single-node client when CLUSTER SHARDS fails, for
+// example because an ACL rule denies it. With TopologyCluster, NewClient fails instead and
+// names the ACL permission to add; ForceSingleClient and TopologyAuto keep the fallback.
 func TestNewClient_ClusterFallbackRejected(t *testing.T) {
 	const noperm = "-NOPERM User default has no permissions to run the 'cluster|shards' command\r\n"
 	srv := newFakeValkey(t, func(conn int64, args []string) (string, bool) {
@@ -244,7 +252,8 @@ func TestNewClient_ClusterFallbackRejected(t *testing.T) {
 	client.Close()
 }
 
-// T-CONN-6 (U9): OnAuth reports every credential hand-out without the token.
+// OnAuth reports each credential hand-out with the node address, the username and a
+// fingerprint of the token, never the token itself. Plaintext is set because TLS is off.
 func TestNewClient_OnAuthEvents(t *testing.T) {
 	srv := newFakeValkey(t, standaloneReply)
 	var mu sync.Mutex
@@ -271,8 +280,8 @@ func TestNewClient_OnAuthEvents(t *testing.T) {
 	}
 }
 
-// U9: the fingerprint is keyed, so a logged value can't be used to check guesses of the
-// token offline the way its plain SHA-256 could; it still tells tokens apart.
+// The AuthEvent fingerprint is keyed, so a logged value can't be used to check guesses of
+// the token offline the way its plain SHA-256 could; it still tells tokens apart.
 func TestFingerprint_Keyed(t *testing.T) {
 	fp := fingerprint("tok-1")
 	plain := sha256.Sum256([]byte("tok-1"))
@@ -288,7 +297,9 @@ func TestFingerprint_Keyed(t *testing.T) {
 	}
 }
 
-// T-CONN-7 (U9): fallbacks and failures show up in the events too.
+// When a token fetch fails and the last good token is handed out instead, the AuthEvent
+// has Fallback set and the same fingerprint. Token Auth reports events too, with the
+// "default" user when TokenAuthOptions.Username is empty.
 func TestOnAuth_FallbackAndError(t *testing.T) {
 	var fail atomic.Bool
 	src := tokenSourceFunc(func() (*oauth2.Token, error) {
@@ -312,7 +323,7 @@ func TestOnAuth_FallbackAndError(t *testing.T) {
 	}
 	fail.Store(true)
 	if _, err := fn(valkey.AuthCredentialsContext{}); err != nil {
-		t.Fatal(err) // last-known-good
+		t.Fatal(err) // the fetch fails, but the last token that worked is handed out instead
 	}
 	if len(got) != 2 || got[0].Fallback || got[0].Fingerprint == "" || !got[1].Fallback || got[1].Fingerprint != got[0].Fingerprint {
 		t.Fatalf("events = %+v", got)
@@ -330,8 +341,8 @@ func TestOnAuth_FallbackAndError(t *testing.T) {
 	}
 }
 
-// T-CONN-8 (U10): IAM and Token Auth credentials aren't sent in plaintext unless the caller
-// turns TLS off on purpose, or the instance has in-transit encryption disabled.
+// IAM and Token Auth credentials aren't sent in plaintext unless the caller turns TLS off
+// on purpose, or the instance has in-transit encryption disabled.
 func TestResolve_PlaintextCredentials(t *testing.T) {
 	ca := newTestCA(t, "ca")
 	noTLSInstance := clusterInstance(memorystorepb.Instance_IAM_AUTH)
@@ -453,7 +464,9 @@ func (c *chunkConn) Read(p []byte) (int, error) {
 	return n, nil
 }
 
-// T-CONN-9 (U8): after a re-dial is rejected with ERR_IAM_*, the next dial waits.
+// After a re-dial's HELLO is rejected with an IAM backend error, the dial gate makes the
+// next dial wait for the backoff instead of following the request rate; a successful
+// handshake clears the delay.
 func TestDialGate_SpacesOutRedials(t *testing.T) {
 	var dropFirst atomic.Bool
 	dropFirst.Store(true)
@@ -543,10 +556,10 @@ func TestInstallDialGate_KeepsCallerDialer(t *testing.T) {
 	}
 }
 
-// T-CONN-10: a primary endpoint alone, without a reader endpoint, gives a working client
-// (NewStandaloneClient(ctx, primary, "") failed: it configured an empty reader address).
-// Without WithTopology(TopologyClusterDisabled), valkey-go finds that cluster mode is
-// disabled and falls back to a single-node client.
+// A primary endpoint alone, without a reader endpoint, gives a working client: no empty
+// reader address is configured, which valkey-go would fail to dial. valkey-go tries cluster
+// mode first, finds it disabled and falls back to a single-node client, also with
+// WithTopology(TopologyClusterDisabled), which only leaves out the cluster defaults.
 func TestNewClient_PrimaryEndpointOnly(t *testing.T) {
 	srv := newFakeValkey(t, standaloneReply)
 	for _, topology := range []Topology{TopologyAuto, TopologyClusterDisabled} {
@@ -566,9 +579,8 @@ func TestNewClient_PrimaryEndpointOnly(t *testing.T) {
 	}
 }
 
-// T-CONN-11: with Standalone.ReplicaAddress, NewClient connects to the primary and the
-// reader endpoint, and the default routing sends reads to the reader and writes to the
-// primary.
+// With Standalone.ReplicaAddress, NewClient connects to the primary and the reader
+// endpoint, and the default routing sends reads to the reader and writes to the primary.
 func TestNewClient_ReaderEndpointRouting(t *testing.T) {
 	node := func(name string, writes *atomic.Int32) func(int64, []string) (string, bool) {
 		return func(conn int64, args []string) (string, bool) {
@@ -605,8 +617,9 @@ func TestNewClient_ReaderEndpointRouting(t *testing.T) {
 	}
 }
 
-// T-CONN-12 (U8): only IAM puts the dial gate in front of new connections, and the gate
-// keeps the caller's DialCtxFn underneath.
+// Only IAM puts the dial gate in front of new connections, since only IAM handshakes can
+// fail with the IAM backend errors it reacts to. The gate keeps the caller's DialCtxFn
+// underneath.
 func TestResolve_DialGateForIAMOnly(t *testing.T) {
 	plaintext := WithTLS(TLSOptions{Mode: TLSDisabled})
 	cases := []struct {

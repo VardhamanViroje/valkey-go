@@ -8,6 +8,9 @@ import (
 	"github.com/valkey-io/valkey-go"
 )
 
+// Backoff settings: retryBase and retryCap for the errors valkey-go retries, iamBackoffBase
+// and iamBackoffCap for Memorystore IAM backend errors, which Google asks to retry more
+// slowly. After maxRetryAttempts attempts, memorystoreRetryDelay stops retrying.
 const (
 	retryBase        = 50 * time.Millisecond
 	retryCap         = 2 * time.Second
@@ -21,8 +24,8 @@ const (
 // It is a valkey.RetryDelayFn: negative stops retrying, 0 retries now, positive waits.
 //
 // valkey-go calls it only for errors it retries: network errors and LOADING. An ERR_IAM_*
-// reply to a connection's HELLO is not one of them (U8); connect and dialGate back off
-// those instead.
+// reply to a connection's HELLO is not one of them; connect and dialGate back off those
+// instead.
 func memorystoreRetryDelay(attempts int, _ valkey.Completed, err error) time.Duration {
 	if attempts >= maxRetryAttempts {
 		return -1

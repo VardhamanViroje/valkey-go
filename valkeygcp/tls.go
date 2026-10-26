@@ -9,8 +9,9 @@ import (
 	"strings"
 )
 
-// buildTLSConfig turns the resolved mode plus CA material into a *tls.Config.
-// Precedence: TLS.CAPEM > TLS.CAFile > PEMs discovered from the Memorystore API > TLS.Base.RootCAs.
+// buildTLSConfig turns the resolved TLS mode and CA material into a *tls.Config, or nil when
+// TLS is off. The CA comes from the first of: TLSOptions.CAPEM, TLSOptions.CAFile, the
+// certificates downloaded from the Memorystore API, TLSOptions.Base.RootCAs.
 func buildTLSConfig(opt TLSOptions, mode TLSMode, discovered []string) (*tls.Config, error) {
 	if mode == TLSDisabled || mode == TLSAuto {
 		return nil, nil
@@ -49,14 +50,14 @@ func buildTLSConfig(opt TLSOptions, mode TLSMode, discovered []string) (*tls.Con
 	if opt.ServerName != "" {
 		cfg.ServerName = opt.ServerName
 	}
-	// ServerName stays empty by default: tls.Dialer (valkey.go:620) then verifies each
-	// node's dialed IP against its certificate (Q3).
+	// ServerName stays empty by default: Go's tls.Dialer then checks each node's certificate
+	// against the IP address it dialed, so one config works for every node of a cluster.
 	return cfg, nil
 }
 
 // errNeedsCA reports a TLS mode without CA material. Customer-managed CAs (Certificate
 // Authority Service) can't be downloaded from the Memorystore API; TLSOptions.FetchCustomCA
-// reads them from the CA pool instead (U11).
+// reads them from the CA pool instead.
 func errNeedsCA(mode TLSMode) error {
 	if mode == TLSCustomCA {
 		return fmt.Errorf("valkeygcp: TLS mode %v needs CA certificates: pass WithTLS with TLSOptions.CAPEM or CAFile, or TLSOptions.FetchCustomCA (package valkeygcp/cas) with WithInstance", mode)
@@ -67,7 +68,8 @@ func errNeedsCA(mode TLSMode) error {
 // WithTLS turns on TLS with the CA material in opt (CAPEM, CAFile, Base.RootCAs, or
 // FetchCustomCA with WithInstance). With Mode TLSDisabled it states that the instance has
 // in-transit encryption disabled, which lets IAM and Token Auth credentials be sent without
-// TLS when there is no instance (U10). A ClientOption.TLSConfig is used as is instead.
+// TLS when there is no instance; otherwise NewClient refuses to send them in plaintext. A
+// ClientOption.TLSConfig, when set, is used as is instead.
 func WithTLS(opt TLSOptions) Option {
 	return func(c *config) { c.tls = opt }
 }

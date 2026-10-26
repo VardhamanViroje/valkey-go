@@ -16,19 +16,21 @@ import (
 // options override earlier ones of the same kind.
 type Option func(*config)
 
-// config collects the Options of one NewClient or ResolveClientOption call.
+// config collects the Options of one NewClient or ResolveClientOption call. The comment on
+// each field names the Option that sets it.
 type config struct {
-	instance          string                // WithInstance
-	network           string                // WithNetwork
-	topology          Topology              // WithTopology
-	iam               *IAMAuthOptions       // WithIAMOptions, WithDefaultIAM; nil when not given
-	token             *TokenAuthOptions     // WithTokenAuth; nil when not given
-	tls               TLSOptions            // WithTLS
-	onAuth            func(AuthEvent)       // OnAuth
-	onCredentialError func(error)           // OnCredentialError
-	googleAPI         []option.ClientOption // WithGoogleAPIOptions
+	instance          string                // instance to read, projects/P/locations/R/instances/I (WithInstance)
+	network           string                // VPC network whose endpoints to use (WithNetwork)
+	topology          Topology              // the cluster mode the caller states (WithTopology)
+	iam               *IAMAuthOptions       // IAM settings (WithIAMOptions, WithDefaultIAM); nil when not given
+	token             *TokenAuthOptions     // Token Auth settings (WithTokenAuth); nil when not given
+	tls               TLSOptions            // TLS settings (WithTLS)
+	onAuth            func(AuthEvent)       // used when the auth options have no OnAuth (OnAuth)
+	onCredentialError func(error)           // used when the auth options have no OnCredentialError (OnCredentialError)
+	googleAPI         []option.ClientOption // extra options for the setup API clients (WithGoogleAPIOptions)
 }
 
+// newConfig applies opts in order, skipping nil ones.
 func newConfig(opts []Option) config {
 	var c config
 	for _, o := range opts {
@@ -41,10 +43,13 @@ func newConfig(opts []Option) config {
 
 // Connection defaults NewClient fills into the valkey.ClientOption fields left at zero.
 const (
-	defaultDialTimeout           = 2 * time.Second
-	defaultKeepAlive             = 1 * time.Second
-	defaultConnWriteTimeout      = 3 * time.Second
-	defaultShardsRefreshInterval = 10 * time.Second // Fix C6: 10s with jitter
+	defaultDialTimeout      = 2 * time.Second
+	defaultKeepAlive        = 1 * time.Second
+	defaultConnWriteTimeout = 3 * time.Second
+	// defaultShardsRefreshInterval is how often a cluster client re-reads the cluster
+	// topology. valkey-go starts each refresh after a short random delay, so many clients
+	// don't query the cluster at the same moment.
+	defaultShardsRefreshInterval = 10 * time.Second
 	// setupTimeout caps one-off setup calls (credential discovery, impersonation, the first
 	// Token Auth read) when the caller's context has no earlier deadline.
 	setupTimeout = 15 * time.Second
@@ -61,7 +66,7 @@ const (
 // IAM backend errors are retried with backoff until ctx ends (at most 15s when it has no
 // earlier deadline). Token refreshes never use ctx.
 func NewClient(ctx context.Context, option valkey.ClientOption, opts ...Option) (valkey.Client, error) {
-	r, err := resolve(ctx, option, newConfig(opts), defaultInstanceReader) // §4.8
+	r, err := resolve(ctx, option, newConfig(opts), defaultInstanceReader) // settle every setting, reading the instance for WithInstance
 	if err != nil {
 		return nil, err
 	}
@@ -78,15 +83,17 @@ func NewClient(ctx context.Context, option valkey.ClientOption, opts ...Option) 
 // connect-time handling: the retries of Memorystore IAM backend errors during the handshake
 // and the cluster mode check (see WithTopology).
 func ResolveClientOption(ctx context.Context, option valkey.ClientOption, opts ...Option) (valkey.ClientOption, error) {
-	r, err := resolve(ctx, option, newConfig(opts), defaultInstanceReader) // §4.8
+	r, err := resolve(ctx, option, newConfig(opts), defaultInstanceReader) // settle every setting, reading the instance for WithInstance
 	if err != nil {
 		return valkey.ClientOption{}, err
 	}
 	return r.clientOption(ctx)
 }
 
-// sendReadsToReplicas routes read-only commands to the reader endpoint.
+// sendReadsToReplicas routes read-only commands to the reader endpoint, except blocking
+// ones.
 func sendReadsToReplicas(cmd valkey.Completed) bool {
-	// Fix C5: Exclude blocking commands from replica routing
+	// A blocking read, such as XREAD with BLOCK, waits for new data. New data reaches the
+	// primary first, so blocking reads stay on the primary.
 	return cmd.IsReadOnly() && !cmd.IsBlock()
 }

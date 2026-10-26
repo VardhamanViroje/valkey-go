@@ -20,7 +20,7 @@ func fakeMetadata(t *testing.T, srv *httptest.Server) {
 		metadataOnGCE = func(context.Context) bool { return false }
 		return
 	}
-	// The real metadata client honours GCE_METADATA_HOST on every request.
+	// The real metadata client honors GCE_METADATA_HOST on every request.
 	t.Setenv("GCE_METADATA_HOST", srv.Listener.Addr().String())
 	metadataOnGCE = func(context.Context) bool { return true }
 }
@@ -37,11 +37,11 @@ func TestUsername_Strategies(t *testing.T) {
 		json string
 		want string
 	}{
-		{"T-ID-1", IAMAuthOptions{Username: "explicit", UsernameStrategy: UsernamePrincipalEmail, ImpersonateSA: "sa@p.iam.gserviceaccount.com"}, saKey, "explicit"},
-		{"T-ID-2", IAMAuthOptions{}, saKey, DefaultIAMUsername},
-		{"T-ID-3", IAMAuthOptions{UsernameStrategy: UsernamePrincipalEmail, ImpersonateSA: "sa@p.iam.gserviceaccount.com"}, saKey, "sa@p.iam.gserviceaccount.com"},
-		{"T-ID-4", IAMAuthOptions{UsernameStrategy: UsernamePrincipalEmail}, saKey, "key@p.iam.gserviceaccount.com"},
-		{"T-ID-5", IAMAuthOptions{UsernameStrategy: UsernamePrincipalEmail}, wif, "wif@p.iam.gserviceaccount.com"},
+		{"explicit username wins", IAMAuthOptions{Username: "explicit", UsernameStrategy: UsernamePrincipalEmail, ImpersonateSA: "sa@p.iam.gserviceaccount.com"}, saKey, "explicit"},
+		{"default strategy", IAMAuthOptions{}, saKey, DefaultIAMUsername},
+		{"impersonated service account", IAMAuthOptions{UsernameStrategy: UsernamePrincipalEmail, ImpersonateSA: "sa@p.iam.gserviceaccount.com"}, saKey, "sa@p.iam.gserviceaccount.com"},
+		{"service account key email", IAMAuthOptions{UsernameStrategy: UsernamePrincipalEmail}, saKey, "key@p.iam.gserviceaccount.com"},
+		{"workload identity federation", IAMAuthOptions{UsernameStrategy: UsernamePrincipalEmail}, wif, "wif@p.iam.gserviceaccount.com"},
 	}
 	for _, c := range cases {
 		got, err := resolveUsername(context.Background(), c.opt, []byte(c.json))
@@ -51,7 +51,8 @@ func TestUsername_Strategies(t *testing.T) {
 	}
 }
 
-// T-ID-6
+// On Google Cloud, when no credentials JSON names an email, the principal-email strategy
+// reads the email of the default service account from the metadata server.
 func TestUsername_MetadataServer(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Metadata-Flavor") != "Google" || r.URL.Path != "/computeMetadata/v1/instance/service-accounts/default/email" {
@@ -89,7 +90,9 @@ func TestUsername_MetadataServerErrors(t *testing.T) {
 	}
 }
 
-// T-ID-7
+// When the principal email can't be found (no usable credentials JSON and no metadata
+// server), the principal-email strategy fails with an error that points to
+// IAMAuthOptions.Username, and so does NewGCPTokenProvider.
 func TestUsername_Unresolvable(t *testing.T) {
 	fakeMetadata(t, nil)
 	_, err := resolveUsername(context.Background(), IAMAuthOptions{UsernameStrategy: UsernamePrincipalEmail}, []byte(`{ not json`))
@@ -116,8 +119,9 @@ func TestCredTypeFromJSON(t *testing.T) {
 	}
 }
 
-// T-ID-8 (U8): an explicit IAM username must be "default" or the principal's email. A
-// mismatch fails setup instead of every dial (ERR_IAM_OTHER); an unknown principal passes.
+// An explicit IAM username must be "default" or the principal's email: Memorystore answers
+// any other username with ERR_IAM_OTHER. checkIAMUsername catches a mismatch during setup
+// instead of on every dial, and lets the username through when the principal is unknown.
 func TestCheckIAMUsername(t *testing.T) {
 	fakeMetadata(t, nil) // not on GCE: principal unknown without JSON or impersonation
 	const saKey = `{"type":"service_account","client_email":"key@p.iam.gserviceaccount.com"}`
@@ -160,7 +164,7 @@ func TestNewGCPTokenProvider_RejectsInvalidUsername(t *testing.T) {
 	}
 }
 
-// T-ID-9: on GKE, a Kubernetes ServiceAccount linked to an IAM service account gets
+// On GKE, a Kubernetes ServiceAccount linked to an IAM service account gets
 // SERVICEACCOUNT_NAME.svc.id.goog from the metadata server unless the
 // iam.gke.io/return-principal-id-as-email annotation is set. That isn't an email, so the
 // principal-email strategy fails with the annotation hint, and the explicit-username check

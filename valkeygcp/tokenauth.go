@@ -17,7 +17,7 @@ import (
 // DefaultTokenReloadInterval is how often a TOKEN_AUTH token is re-read by default.
 const DefaultTokenReloadInterval = 5 * time.Minute
 
-// tokenFetchTimeout bounds one token read on the connection path.
+// tokenFetchTimeout bounds one token read for a new connection or a re-AUTH.
 const tokenFetchTimeout = 5 * time.Second
 
 var errNoTokenSource = errors.New("valkeygcp: TOKEN_AUTH needs WithTokenAuth with TokenAuthOptions.SecretVersion, Token or Source")
@@ -29,33 +29,36 @@ type TokenAuthOptions struct {
 	// SecretVersion holds the token in Secret Manager (recommended), e.g.
 	// "projects/P/secrets/valkey-default-token/versions/latest". A regional secret
 	// ("projects/P/locations/L/secrets/S/versions/V") is read through its regional endpoint,
-	// secretmanager.L.rep.googleapis.com (U12).
+	// secretmanager.L.rep.googleapis.com.
 	SecretVersion string
 	// Token is a static token (local development only).
 	Token string
 	// Source is a custom fetcher; it overrides SecretVersion and Token. It must return when
-	// ctx ends: reads on the connection path get a 5s deadline, and the first read during
-	// setup gets the caller's deadline (at most 15s).
+	// ctx ends: reads for new connections and re-AUTHs get a 5s deadline, and the first
+	// read, during setup, gets the caller's deadline (at most 15s).
 	Source func(ctx context.Context) (string, error)
 	// ReloadInterval controls how often the token is re-read so rotated tokens reach
 	// live connections (re-AUTH). Default 5m; negative disables reload.
 	ReloadInterval time.Duration
-	// OnCredentialError receives token read errors absorbed by the last-known-good logic
-	// (U6). The OnCredentialError option is used when this field is nil.
+	// OnCredentialError receives the token read errors that valkeygcp works around by
+	// reusing the last token read, so a failed read doesn't close connections. When nil, the
+	// OnCredentialError option is used.
 	OnCredentialError func(error)
-	// OnAuth receives an AuthEvent each time credentials are handed to valkey-go (U9). It
-	// runs on the connection path, so it must return quickly. The OnAuth option is used when
-	// this field is nil.
+	// OnAuth receives an AuthEvent each time credentials are handed to valkey-go, for logs
+	// and metrics. It runs while a connection is being set up, so it must return quickly.
+	// When nil, the OnAuth option is used.
 	OnAuth func(AuthEvent)
 }
 
+// tokenAuthProvider hands out the Token Auth token. It caches the token and reads it again
+// at most once per half ReloadInterval, so new connections don't each read the secret.
 type tokenAuthProvider struct {
 	opt       TokenAuthOptions
-	fetch     func(ctx context.Context) (string, error)
-	plaintext bool // set by NewClient when the connections don't use TLS (AuthEvent.Plaintext)
+	fetch     func(ctx context.Context) (string, error) // reads the token from its source
+	plaintext bool                                      // true when the connections don't use TLS (AuthEvent.Plaintext)
 	mu        sync.Mutex
-	last      string    // last-known-good token (U6)
-	nextFetch time.Time // cache: one upstream read per half reload interval
+	last      string    // the last token read successfully, used when a read fails
+	nextFetch time.Time // when to read the token again
 }
 
 // newSecretSource returns a reader for one Secret Manager secret version. It is a variable
@@ -70,7 +73,7 @@ var newSecretSource = func(ctx context.Context, version string) (func(context.Co
 
 // newSecretManagerReader creates the Secret Manager client behind sharedSecretReader for one
 // location ("" for global secrets); tests replace it. Regional secrets are only served by
-// their regional endpoint (U12). Reading a secret needs secretmanager.versions.access.
+// their regional endpoint. Reading a secret needs secretmanager.versions.access.
 var newSecretManagerReader = func(ctx context.Context, location string) (func(ctx context.Context, version string) (string, error), error) {
 	var opts []option.ClientOption
 	if location != "" {
@@ -106,14 +109,16 @@ func secretLocation(version string) string {
 
 // One Secret Manager client per location serves every Token Auth provider in the process. A
 // client per provider would leak, because valkey.Client has no close hook, and wrapping the
-// returned client to add one would hide its concrete type from valkey-go's helpers
-// (helper.go switches on it for MGET/MSET and DisableCache). A client is created on first use
-// and kept for the life of the process; a failed creation is retried on the next call.
+// returned client to add one would hide its concrete type from valkey-go's helpers, such as
+// valkey.MGet and valkey.MSet, which check that type. A client is created on first use and
+// kept for the life of the process; a failed creation is retried on the next call.
 var (
 	secretMu      sync.Mutex
 	secretReaders = map[string]func(ctx context.Context, version string) (string, error){}
 )
 
+// sharedSecretReader returns the process-wide secret reader for location, creating it on
+// first use.
 func sharedSecretReader(ctx context.Context, location string) (func(context.Context, string) (string, error), error) {
 	secretMu.Lock()
 	defer secretMu.Unlock()
@@ -162,7 +167,8 @@ func newTokenAuthProvider(ctx context.Context, opt TokenAuthOptions) (*tokenAuth
 	return p, nil
 }
 
-// token returns the token and whether it is the last-known-good fallback (U6).
+// token returns the token, and whether it is the last token read, used because a read
+// failed. It reports that failure to OnCredentialError.
 func (p *tokenAuthProvider) token(ctx context.Context) (string, bool, error) {
 	tok, absorbed, err := p.cachedToken(ctx)
 	if absorbed != nil && p.opt.OnCredentialError != nil {
@@ -172,7 +178,7 @@ func (p *tokenAuthProvider) token(ctx context.Context) (string, bool, error) {
 }
 
 // cachedToken returns the token, re-reading it at most once per half reload interval.
-// absorbed is a fetch error hidden behind the last-known-good token (U6).
+// absorbed is a read error hidden by returning the last token read.
 func (p *tokenAuthProvider) cachedToken(ctx context.Context) (tok string, absorbed, err error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -189,8 +195,8 @@ func (p *tokenAuthProvider) cachedToken(ctx context.Context) (tok string, absorb
 		if p.last == "" {
 			return "", nil, err
 		}
-		// U6: keep serving the last token (both tokens stay valid during a rotation
-		// window) and retry later rather than on every new connection.
+		// Keep serving the last token (both tokens stay valid during a rotation window) and
+		// retry later rather than on every new connection.
 		p.nextFetch = now.Add(min(credentialRetry, p.opt.ReloadInterval/2))
 		return p.last, err, nil
 	}
@@ -198,6 +204,9 @@ func (p *tokenAuthProvider) cachedToken(ctx context.Context) (tok string, absorb
 	return tok, nil, nil
 }
 
+// AuthCredentialsFn returns the valkey.ClientOption.AuthCredentialsFn of this provider. Each
+// call hands valkey-go the username and token, schedules the next re-AUTH so rotated tokens
+// reach live connections, and reports an AuthEvent to OnAuth.
 func (p *tokenAuthProvider) AuthCredentialsFn() func(valkey.AuthCredentialsContext) (valkey.AuthCredentials, error) {
 	return func(c valkey.AuthCredentialsContext) (valkey.AuthCredentials, error) {
 		creds, fallback, err := p.credentials()
@@ -208,6 +217,8 @@ func (p *tokenAuthProvider) AuthCredentialsFn() func(valkey.AuthCredentialsConte
 	}
 }
 
+// credentials returns the AUTH credentials and whether the last token read was used because
+// a read failed.
 func (p *tokenAuthProvider) credentials() (valkey.AuthCredentials, bool, error) {
 	// AuthCredentialsContext carries no context (dials and timer-driven refreshes have no
 	// caller to take one from), so each read gets its own deadline.
