@@ -97,7 +97,7 @@ client, err := valkeygcp.NewClient(ctx, valkey.ClientOption{
 | `RefreshBuffer`          | 5m (`DefaultRefreshBuffer`)                      | How long before expiry a token is replaced; live connections re-AUTH in the first half of that window |
 | `FetchTimeout`           | 10s (`DefaultTokenFetchTimeout`)                 | Cap on one token fetch; negative disables it                                                          |
 | `DisableProactiveReauth` | `false`                                          | When true, live connections aren't re-AUTHed; every new connection still gets a fresh token           |
-| `MaxAuthPerSecond`       | 0 (off)                                            | Paces token-backed AUTHs for the client                                                               |
+| `MaxAuthPerSecond`       | 0 (off)                                            | Limits how many AUTHs the client sends per second, for when many connections reconnect at once        |
 | `OnCredentialError`      | none                                               | Receives token fetch errors while live connections keep the last valid token                          |
 
 #### Use valkey.NewClient Directly
@@ -128,7 +128,7 @@ locker, err := valkeylock.NewLocker(valkeylock.LockerOption{
 	},
 })
 
-// valkeyotel builds the client itself, so pass it the wired ClientOption:
+// valkeyotel builds the client itself, so pass it the ClientOption valkeygcp prepared:
 option, err := valkeygcp.ResolveClientOption(ctx, valkey.ClientOption{InitAddress: []string{"10.0.0.15:6379"}},
 	valkeygcp.WithDefaultIAM())
 client, err := valkeyotel.NewClient(option)
@@ -153,7 +153,7 @@ The cluster settings are left out when `Standalone.ReplicaAddress` is set. valke
 * **When tokens are refreshed.** A token is replaced `RefreshBuffer` (5m) before it expires. Live connections re-AUTH with the new token at a random time in the first half of that window, so they don't all re-AUTH in the same second. `DisableProactiveReauth` turns this off; new connections still get a fresh token.
 * **When a refresh fails.** Live connections keep the last valid token, and the refresh is retried about every 30 seconds. `OnCredentialError` receives each error. If the last token expires before a refresh succeeds, live connections stay authenticated (their re-AUTH is skipped), but new connections fail until a token can be fetched again.
 * **Token fetches are capped.** Each fetch waits at most `FetchTimeout` (10s); a fetch that times out counts as a failed one.
-* **A rejected re-AUTH closes the connection.** If Memorystore rejects a re-AUTH (for example with `ERR_IAM_EXHAUSTED`), valkey-go closes that connection and the next command dials again (`pipe.go` `refreshAuth`).
+* **A rejected re-AUTH closes the connection.** If Memorystore rejects the re-AUTH of a live connection (for example with `ERR_IAM_EXHAUSTED`), valkey-go closes that connection and the next command dials a new one, although Memorystore would have kept the authenticated connection working.
 
 ### 1.6 Contexts and Setup Failures
 

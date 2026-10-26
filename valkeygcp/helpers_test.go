@@ -8,4 +8,3 @@ import (
 type tokenSourceFunc func() (*oauth2.Token, error)
 
 func (f tokenSourceFunc) Token() (*oauth2.Token, error) { return f() }
-

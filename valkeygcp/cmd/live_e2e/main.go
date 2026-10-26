@@ -1,3 +1,18 @@
+// Command live_e2e keeps SET and GET traffic running against a cluster-mode Memorystore for
+// Valkey instance with IAM authentication, to check that requests keep succeeding while the
+// IAM token is refreshed. valkeygcp schedules a re-AUTH on each live connection 2.5 to 5
+// minutes before its token expires, and valkey-go then sends AUTH with a new token. Access
+// tokens last an hour, so leave the program running for more than an hour.
+//
+// It needs a host that can reach the instance's discovery endpoint, such as a VM in the
+// instance's VPC network. The tokens come from Application Default Credentials; that
+// principal needs roles/memorystore.dbConnectionUser on the instance. Run it from the
+// valkeygcp directory and stop it with Ctrl+C:
+//
+//	MEMORYSTORE_TEST_DISCOVERY_ENDPOINT=10.0.0.15:6379 go run ./cmd/live_e2e
+//
+// It runs one SET/GET pair every 200ms, logs each failure, and logs the counts after every
+// 300 successful pairs, about once a minute.
 package main
 
 import (
@@ -25,7 +40,7 @@ func main() {
 
 	client, err := valkeygcp.NewClient(ctx, valkey.ClientOption{
 		InitAddress: []string{endpoint}, // discovery endpoint
-	}, valkeygcp.WithDefaultIAM())
+	}, valkeygcp.WithDefaultIAM()) // IAM tokens from Application Default Credentials
 	if err != nil {
 		log.Fatalf("Failed to create Memorystore client: %v", err)
 	}

@@ -32,6 +32,8 @@ func staticTokenIAM(token string) IAMAuthOptions {
 	}}}
 }
 
+// With a discovery endpoint alone, the cluster defaults and the connection defaults are
+// filled in, no reader routing is set, and the IAM token becomes the AUTH password.
 func TestResolveClientOption_ClusterWiring(t *testing.T) {
 	opt, err := ResolveClientOption(context.Background(), valkey.ClientOption{InitAddress: []string{"10.0.0.15:6379"}},
 		WithIAMOptions(staticTokenIAM("cluster-token")))
@@ -54,6 +56,7 @@ func TestResolveClientOption_ClusterWiring(t *testing.T) {
 	}
 }
 
+// With a reader endpoint, reads are routed to it and the cluster defaults are left out.
 func TestResolveClientOption_StandaloneWiring(t *testing.T) {
 	opt, err := ResolveClientOption(context.Background(), valkey.ClientOption{
 		InitAddress: []string{"10.0.0.2:6379"},
@@ -92,8 +95,8 @@ func TestResolveClientOption_AddressesKept(t *testing.T) {
 	}
 }
 
-// A primary endpoint without a reader (an instance without replicas) needs no
-// Standalone.ReplicaAddress; the old NewStandaloneClient(primary, "") dialed "" and failed.
+// A primary endpoint without a reader endpoint (an instance without replicas) needs no
+// Standalone.ReplicaAddress, and no reader routing is set up.
 func TestResolveClientOption_NoReader(t *testing.T) {
 	opt, err := ResolveClientOption(context.Background(), valkey.ClientOption{InitAddress: []string{"10.0.0.2:6379"}})
 	if err != nil {
@@ -104,6 +107,7 @@ func TestResolveClientOption_NoReader(t *testing.T) {
 	}
 }
 
+// Without InitAddress there is nothing to connect to, so ResolveClientOption fails.
 func TestResolveClientOption_NoEndpoint(t *testing.T) {
 	if _, err := ResolveClientOption(context.Background(), valkey.ClientOption{}, WithDefaultIAM()); !errors.Is(err, errNoEndpoint) {
 		t.Fatalf("got %v, want %v", err, errNoEndpoint)
@@ -177,6 +181,8 @@ func TestResolveClientOption_LastIAMOptionWins(t *testing.T) {
 	}
 }
 
+// The default routing sends read-only commands to the reader endpoint, and writes and
+// blocking commands to the primary.
 func TestResolveClientOption_SendToReplicasLogic(t *testing.T) {
 	capturedOpt, err := ResolveClientOption(context.Background(), valkey.ClientOption{
 		InitAddress: []string{"127.0.0.1:0"},
@@ -203,13 +209,15 @@ func TestResolveClientOption_SendToReplicasLogic(t *testing.T) {
 		t.Errorf("expected SET NOT to route to replica, got true")
 	}
 
-	// Blocking command (BLPOP) -> should NOT route to replica even if read-only
+	// Blocking command (BLPOP) -> should NOT route to replica. BLPOP pops an element, so it
+	// isn't read-only either.
 	blpopCmd := builder.Blpop().Key("k").Timeout(1).Build()
 	if capturedOpt.SendToReplicas(blpopCmd) {
 		t.Errorf("expected BLPOP NOT to route to replica, got true")
 	}
 }
 
+// Both cluster and standalone options get memorystoreRetryDelay as RetryDelay.
 func TestResolveClientOption_MemorystoreRetryDelay(t *testing.T) {
 	for name, option := range map[string]valkey.ClientOption{
 		"cluster":    {InitAddress: []string{"127.0.0.1:0"}},
@@ -225,7 +233,7 @@ func TestResolveClientOption_MemorystoreRetryDelay(t *testing.T) {
 	}
 }
 
-// T-CTX-1: a ctx that has ended during setup stops NewClient before it dials
+// A ctx that has ended during setup stops NewClient before it dials
 // (valkey.NewClient takes no context).
 func TestNewClient_ContextEndedBeforeDial(t *testing.T) {
 	var dials atomic.Int32
@@ -245,7 +253,8 @@ func TestNewClient_ContextEndedBeforeDial(t *testing.T) {
 	}
 }
 
-// T-CTX-2: missing ADC fails setup with the real error, before any dial.
+// Missing Application Default Credentials (ADC) fail setup with the real error, before any
+// dial.
 func TestWithDefaultIAM(t *testing.T) {
 	// A credentials file that doesn't exist makes ADC fail at once, without probing the
 	// metadata server, so the result is the same on laptops, CI and Google Cloud.

@@ -17,9 +17,10 @@ type Option func(*config)
 
 // config collects the Options of one NewClient or ResolveClientOption call.
 type config struct {
-	iam *IAMAuthOptions // WithIAMOptions, WithDefaultIAM; nil when not given
+	iam *IAMAuthOptions // IAM settings (WithIAMOptions, WithDefaultIAM); nil when not given
 }
 
+// newConfig applies opts in order, skipping nil ones.
 func newConfig(opts []Option) config {
 	var c config
 	for _, o := range opts {
@@ -32,10 +33,13 @@ func newConfig(opts []Option) config {
 
 // Connection defaults NewClient fills into the valkey.ClientOption fields left at zero.
 const (
-	defaultDialTimeout           = 2 * time.Second
-	defaultKeepAlive             = 1 * time.Second
-	defaultConnWriteTimeout      = 3 * time.Second
-	defaultShardsRefreshInterval = 10 * time.Second // Fix C6: 10s with jitter
+	defaultDialTimeout      = 2 * time.Second
+	defaultKeepAlive        = 1 * time.Second
+	defaultConnWriteTimeout = 3 * time.Second
+	// defaultShardsRefreshInterval is how often a cluster client re-reads the cluster
+	// topology. valkey-go starts each refresh after a short random delay, so many clients
+	// don't query the cluster at the same moment.
+	defaultShardsRefreshInterval = 10 * time.Second
 	// setupTimeout caps one-off setup calls (credential discovery) when the caller's context
 	// has no earlier deadline.
 	setupTimeout = 15 * time.Second
@@ -112,7 +116,7 @@ func withDefaults(opt valkey.ClientOption) valkey.ClientOption {
 		opt.ConnWriteTimeout = defaultConnWriteTimeout
 	}
 	if opt.RetryDelay == nil {
-		opt.RetryDelay = memorystoreRetryDelay // Correction V9: defined in retry.go
+		opt.RetryDelay = memorystoreRetryDelay // exponential backoff with full jitter
 	}
 	return opt
 }
@@ -129,8 +133,10 @@ func callerAuthField(o valkey.ClientOption) string {
 	return ""
 }
 
-// sendReadsToReplicas routes read-only commands to the reader endpoint.
+// sendReadsToReplicas routes read-only commands to the reader endpoint, except blocking
+// ones.
 func sendReadsToReplicas(cmd valkey.Completed) bool {
-	// Fix C5: Exclude blocking commands from replica routing
+	// A blocking read, such as XREAD with BLOCK, waits for new data. New data reaches the
+	// primary first, so blocking reads stay on the primary.
 	return cmd.IsReadOnly() && !cmd.IsBlock()
 }

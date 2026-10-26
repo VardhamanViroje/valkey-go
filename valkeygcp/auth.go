@@ -13,66 +13,92 @@ import (
 	"golang.org/x/oauth2/google"
 )
 
-// Defaults applied when the matching IAMAuthOptions field is left empty.
+// Defaults used when the matching IAMAuthOptions field is left empty.
 const (
+	// DefaultCloudPlatformScope is the OAuth2 scope requested for IAM access tokens.
 	DefaultCloudPlatformScope = "https://www.googleapis.com/auth/cloud-platform"
-	DefaultRefreshBuffer      = 5 * time.Minute
-	DefaultIAMUsername        = "default"
-	// DefaultTokenFetchTimeout caps one upstream IAM token fetch (IAMAuthOptions.FetchTimeout).
+	// DefaultRefreshBuffer is how long before a token expires a new one is used.
+	DefaultRefreshBuffer = 5 * time.Minute
+	// DefaultIAMUsername is the username sent with AUTH. Memorystore accepts "default" or
+	// the email of the IAM principal.
+	DefaultIAMUsername = "default"
+	// DefaultTokenFetchTimeout is how long one request for a new IAM token may take.
 	DefaultTokenFetchTimeout = 10 * time.Second
 )
 
-// credentialRetry is how soon a failed token refresh is retried while the last-known-good
-// token is served (U6). jitter spreads it over 27-30s.
+// credentialRetry is how soon a failed token refresh is tried again while the last token
+// that worked is still in use. jitter turns it into 27-30s, so connections don't all retry
+// at the same moment.
 const credentialRetry = 30 * time.Second
 
-// IAMAuthOptions configures the GCP IAM OAuth2 token provider.
+// IAMAuthOptions configures IAM authentication: where the access tokens come from, the
+// username sent with them, and how they are refreshed. The zero value uses Application
+// Default Credentials (ADC) and the username "default".
 //
-// The access tokens come from CustomTokenSource, or from Application Default Credentials when
-// it is nil; that identity needs roles/memorystore.dbConnectionUser on the instance.
+// The access tokens come from CustomTokenSource, or from ADC when it is nil; that identity
+// needs roles/memorystore.dbConnectionUser on the instance.
 type IAMAuthOptions struct {
-	Username      string
+	// Username is sent with AUTH. Memorystore accepts only "default" or the email of the
+	// IAM principal. Empty means DefaultIAMUsername.
+	Username string
+	// RefreshBuffer is how long before a token expires a new one is used. Live connections
+	// re-AUTH with the new token at a random moment in the first half of this window, so
+	// they don't all re-AUTH at once. Zero or negative means DefaultRefreshBuffer.
 	RefreshBuffer time.Duration
-	// CustomTokenSource supplies the access tokens instead of Application Default Credentials.
+	// CustomTokenSource supplies the access tokens instead of Application Default
+	// Credentials, for tokens you get your own way.
 	CustomTokenSource oauth2.TokenSource
-	// Scopes are requested from Application Default Credentials; DefaultCloudPlatformScope
-	// when empty. They aren't used with CustomTokenSource.
+	// Scopes are the OAuth2 scopes requested from Application Default Credentials;
+	// DefaultCloudPlatformScope when empty. They aren't used with CustomTokenSource.
 	Scopes []string
 
-	// DisableProactiveReauth turns off re-AUTH on live connections (Q2): every new connection
-	// still gets a fresh token, but RefreshAfter stays zero.
+	// DisableProactiveReauth turns off re-AUTH on live connections. Every new connection
+	// still gets a fresh token, but a live connection keeps the token it authenticated with:
+	// the credentials carry no RefreshAfter, so valkey-go schedules no re-AUTH.
 	DisableProactiveReauth bool
-	// MaxAuthPerSecond paces token-backed AUTHs per provider, that is per NewClient,
-	// ResolveClientOption or NewGCPTokenProvider call (U5). 0 disables pacing.
+	// MaxAuthPerSecond spaces out the AUTHs that send a token, at most this many per second,
+	// so many connections reconnecting at once don't all ask for authentication together.
+	// Each NewClient, ResolveClientOption or NewGCPTokenProvider call has its own limit.
+	// 0 disables it.
 	MaxAuthPerSecond float64
-	// OnCredentialError receives token fetch errors absorbed by the last-known-good logic (U6).
+	// OnCredentialError receives the token fetch errors that valkeygcp works around instead
+	// of returning: when a refresh fails, connections keep the last token that worked, and
+	// the fetch is retried about every 30s. Use it for logs and metrics.
 	OnCredentialError func(error)
-	// FetchTimeout caps one upstream token fetch, so a hung token endpoint can't block new
-	// connections. A timed-out fetch is handled like any failed fetch (U6). Zero means
-	// DefaultTokenFetchTimeout; negative disables the cap.
+	// FetchTimeout limits how long one request for a new token may take, so a token endpoint
+	// that hangs can't block new connections. A timed-out request counts as a failed fetch
+	// (see OnCredentialError). Zero means DefaultTokenFetchTimeout; negative means no limit.
 	FetchTimeout time.Duration
 }
 
-// GCPTokenProvider manages the retrieval, caching, and lifecycle of IAM OAuth2 access tokens.
+// GCPTokenProvider gets, caches and refreshes IAM access tokens. NewGCPTokenProvider makes
+// one, for callers who build the valkey.ClientOption themselves.
 type GCPTokenProvider interface {
+	// Token returns a valid access token: the cached one, or a new one when the cached one
+	// is within RefreshBuffer of expiring.
 	Token(ctx context.Context) (*oauth2.Token, error)
+	// AuthCredentialsFn returns the function to set as valkey.ClientOption.AuthCredentialsFn.
+	// valkey-go calls it for every new connection and at every scheduled re-AUTH.
 	AuthCredentialsFn() func(valkey.AuthCredentialsContext) (valkey.AuthCredentials, error)
 }
 
+// tokenProvider is the GCPTokenProvider behind NewGCPTokenProvider and WithIAMOptions.
 type tokenProvider struct {
-	source        oauth2.TokenSource
+	source        oauth2.TokenSource // cached tokens; a new one RefreshBuffer before expiry
 	refreshBuffer time.Duration
 	username      string
-	lastGood      atomic.Pointer[oauth2.Token]
+	lastGood      atomic.Pointer[oauth2.Token] // the last token fetched successfully
 	disableReauth bool
 	limiter       *authLimiter
 	onErr         func(error)
 }
 
-// NewGCPTokenProvider creates an IAM token manager with eager refresh margin to prevent halving loops (C1).
+// NewGCPTokenProvider returns a GCPTokenProvider for opt, for callers who set
+// valkey.ClientOption.AuthCredentialsFn themselves instead of using NewClient. Tokens are
+// cached and replaced RefreshBuffer before they expire, so every re-AUTH sends a new token.
 //
-// ctx bounds the one-off setup (credential discovery), capped at 15s when it has no earlier
-// deadline. Token refreshes don't use it.
+// ctx bounds the one-off setup (finding the credentials), which also stops after 15s when
+// ctx has no earlier deadline. Token refreshes don't use ctx.
 func NewGCPTokenProvider(ctx context.Context, opt IAMAuthOptions) (GCPTokenProvider, error) {
 	if opt.Username == "" {
 		opt.Username = DefaultIAMUsername
@@ -101,8 +127,11 @@ func NewGCPTokenProvider(ctx context.Context, opt IAMAuthOptions) (GCPTokenProvi
 	}
 
 	p := &tokenProvider{
-		// Fix C1: Wrap source with ReuseTokenSourceWithExpiry to prevent redundant halving loop.
-		// The fetch timeout sits underneath, so it caps upstream fetches, not cache hits.
+		// The cache hands out the same token until RefreshBuffer before it expires, then
+		// fetches a new one. Re-AUTHs are scheduled inside that window, so they always send
+		// a new token. With the default 10s margin of oauth2.ReuseTokenSource they would
+		// resend the old token and reschedule at ever shorter intervals until it expired.
+		// The fetch timeout sits under the cache, so it limits real fetches, not cache hits.
 		source:        oauth2.ReuseTokenSourceWithExpiry(nil, withFetchTimeout(base, opt.FetchTimeout), opt.RefreshBuffer),
 		refreshBuffer: opt.RefreshBuffer,
 		username:      opt.Username,
@@ -116,9 +145,9 @@ func NewGCPTokenProvider(ctx context.Context, opt IAMAuthOptions) (GCPTokenProvi
 	return p, nil
 }
 
-// newBaseSource builds the upstream token source: CustomTokenSource when set, otherwise
-// Application Default Credentials. ctx is kept by the source for later refreshes, so the
-// caller passes a context without cancellation.
+// newBaseSource creates the token source the cache fetches from: CustomTokenSource when set,
+// otherwise Application Default Credentials. The source keeps ctx for later refreshes, so
+// the caller passes a context that is never cancelled.
 func newBaseSource(ctx context.Context, opt IAMAuthOptions) (oauth2.TokenSource, error) {
 	if opt.CustomTokenSource != nil {
 		return opt.CustomTokenSource, nil
@@ -130,8 +159,9 @@ func newBaseSource(ctx context.Context, opt IAMAuthOptions) (oauth2.TokenSource,
 	return creds.TokenSource, nil
 }
 
-// Token returns the current token, fetching a new one inside the refresh buffer. ctx bounds
-// how long the caller waits; the upstream fetch is also capped by FetchTimeout.
+// Token returns the cached token, or fetches a new one when the cached one is within
+// RefreshBuffer of expiring. ctx bounds how long the caller waits; each fetch is also
+// limited by FetchTimeout.
 func (p *tokenProvider) Token(ctx context.Context) (*oauth2.Token, error) {
 	return callWithContext(ctx, "token fetch", func() (*oauth2.Token, error) {
 		tok, err := p.source.Token()
@@ -142,17 +172,19 @@ func (p *tokenProvider) Token(ctx context.Context) (*oauth2.Token, error) {
 	})
 }
 
+// AuthCredentialsFn returns the valkey.ClientOption.AuthCredentialsFn of this provider. Each
+// call hands valkey-go the username and a token, and schedules the next re-AUTH.
 func (p *tokenProvider) AuthCredentialsFn() func(valkey.AuthCredentialsContext) (valkey.AuthCredentials, error) {
 	return func(valkey.AuthCredentialsContext) (valkey.AuthCredentials, error) {
-		p.limiter.wait() // U5: no-op unless MaxAuthPerSecond > 0
+		p.limiter.wait() // waits for its turn when MaxAuthPerSecond is set
 		return p.credentials()
 	}
 }
 
-// credentials returns the AUTH credentials, falling back to the last-known-good token when
-// a fetch fails (U6).
+// credentials returns the AUTH credentials. When a fetch fails, tolerate decides what to
+// hand out instead.
 func (p *tokenProvider) credentials() (valkey.AuthCredentials, error) {
-	tok, err := p.source.Token() // C1: ReuseTokenSourceWithExpiry
+	tok, err := p.source.Token() // the cache: a new token only inside RefreshBuffer
 	now := time.Now()
 	if err != nil {
 		return p.tolerate(now, err)
@@ -166,9 +198,14 @@ func (p *tokenProvider) credentials() (valkey.AuthCredentials, error) {
 	return creds, nil
 }
 
-// tolerate applies the refresh-failure rules (U6). refreshAuth closes the connection when
-// AuthCredentialsFn fails (pipe.go refreshAuth -> p._exit), so a short token-source outage
-// must not surface as an error while a live connection can keep working.
+// tolerate decides what to hand valkey-go when a token fetch fails. valkey-go closes a live
+// connection when AuthCredentialsFn returns an error during a re-AUTH, so a short outage of
+// the token source must not become an error while connections can keep working:
+//   - The last token that worked is still valid: use it, and retry the fetch in about 30s.
+//   - It has expired: return empty credentials. valkey-go then skips the re-AUTH, and the
+//     live connection stays authenticated; a new connection fails with NOAUTH until a fetch
+//     succeeds.
+//   - No fetch has succeeded yet: return the error.
 func (p *tokenProvider) tolerate(now time.Time, err error) (valkey.AuthCredentials, error) {
 	last := p.lastGood.Load()
 	lastValid := last != nil && (last.Expiry.IsZero() || last.Expiry.After(now))
@@ -180,33 +217,35 @@ func (p *tokenProvider) tolerate(now time.Time, err error) (valkey.AuthCredentia
 	if p.onErr != nil {
 		p.onErr(err)
 	}
-	if p.disableReauth { // dial-only mode: serve the valid token without arming a refresh timer
+	if p.disableReauth { // re-AUTH is off: hand out the valid token without scheduling a re-AUTH
 		return valkey.AuthCredentials{Username: p.username, Password: last.AccessToken}, nil
 	}
 	retry := now.Add(jitter(credentialRetry))
-	if lastValid { // U6: still valid, keep using it and retry soon
+	if lastValid { // still valid: keep using it and retry soon
 		return valkey.AuthCredentials{Username: p.username, Password: last.AccessToken, RefreshAfter: retry}, nil
 	}
-	// U6: expired. Empty credentials make refreshAuth skip AUTH (the connection stays
-	// authenticated, V3); a brand-new dial fails with NOAUTH until the source recovers.
+	// Expired: with empty credentials valkey-go skips the re-AUTH, and the connection stays
+	// authenticated. A new connection fails with NOAUTH until the source recovers.
 	return valkey.AuthCredentials{RefreshAfter: retry}, nil
 }
 
-// refreshTime schedules the re-AUTH INSIDE the C1 buffer, so the cache always hands out a
-// new token at that moment, spread over the first half of the buffer (U5). Jittering
-// earlier than Expiry-buffer would re-AUTH with the same cached token.
+// refreshTime returns when a live connection should re-AUTH, for a token that expires at
+// expiry: at a random moment in the first half of the refresh buffer, so connections don't
+// all re-AUTH at once. It is never before expiry-buffer, because until then the cache hands
+// out the same token again.
 func refreshTime(now, expiry time.Time, buffer time.Duration) time.Time {
 	start := expiry.Add(-buffer)
 	if now.Before(start) {
 		return start.Add(time.Duration(rand.Int64N(int64(buffer/2) + 1)))
 	}
 	if remaining := expiry.Sub(now); remaining > 0 {
-		return now.Add(remaining / 2) // existing near-expiry fallback
+		return now.Add(remaining / 2) // already inside the buffer: halfway to expiry
 	}
-	return now.Add(10 * time.Second)
+	return now.Add(10 * time.Second) // already expired: try again soon
 }
 
-// jitter returns d minus up to 10%, never more than d.
+// jitter returns d minus a random amount of up to 10%, so timers set at the same moment
+// don't fire together. The result is never more than d.
 func jitter(d time.Duration) time.Duration {
 	if d <= 0 {
 		return d
@@ -214,13 +253,15 @@ func jitter(d time.Duration) time.Duration {
 	return d - time.Duration(rand.Int64N(int64(d)/10+1))
 }
 
-// authLimiter paces token-backed AUTHs for one provider (U5). A nil limiter is a no-op.
+// authLimiter spaces out the AUTHs of one provider for IAMAuthOptions.MaxAuthPerSecond: each
+// caller waits until interval after the previous one. A nil limiter doesn't wait.
 type authLimiter struct {
 	mu       sync.Mutex
-	next     time.Time
+	next     time.Time // when the next caller may go
 	interval time.Duration
 }
 
+// wait blocks until the caller's turn.
 func (l *authLimiter) wait() {
 	if l == nil || l.interval <= 0 {
 		return
@@ -258,8 +299,8 @@ func callWithContext[T any](ctx context.Context, what string, fn func() (T, erro
 	}
 }
 
-// withFetchTimeout caps each upstream fetch of src (IAMAuthOptions.FetchTimeout). A negative
-// timeout returns src unchanged.
+// withFetchTimeout limits each fetch from src to timeout (IAMAuthOptions.FetchTimeout). A
+// negative timeout returns src unchanged.
 func withFetchTimeout(src oauth2.TokenSource, timeout time.Duration) oauth2.TokenSource {
 	if timeout < 0 {
 		return src
@@ -267,11 +308,12 @@ func withFetchTimeout(src oauth2.TokenSource, timeout time.Duration) oauth2.Toke
 	return &timeoutSource{src: src, timeout: timeout}
 }
 
-// timeoutSource stops waiting for an upstream fetch after timeout, so a hung token endpoint
-// can't block new connections (nor, through the C1 cache's lock, every other caller).
-// oauth2.TokenSource can't be cancelled, so a timed-out fetch keeps running in the
-// background. Later calls wait for that fetch instead of starting another until it is
-// 3*timeout old, so a hung endpoint costs at most one goroutine per 3*timeout.
+// timeoutSource stops waiting for a token fetch after timeout, so a token endpoint that hangs
+// can't block new connections, nor every other caller waiting on the token cache, which
+// holds its lock while it fetches. oauth2.TokenSource can't be cancelled, so a timed-out
+// fetch keeps running in the background. Later calls wait for that fetch instead of starting
+// another until it is 3*timeout old, so a hung endpoint costs at most one goroutine per
+// 3*timeout.
 type timeoutSource struct {
 	src     oauth2.TokenSource
 	timeout time.Duration
@@ -280,6 +322,7 @@ type timeoutSource struct {
 	cur *tokenFetch // the latest fetch, shared while it runs
 }
 
+// tokenFetch is one fetch from the underlying source, shared by the callers waiting for it.
 type tokenFetch struct {
 	start time.Time
 	done  chan struct{} // closed when tok and err are set
@@ -287,6 +330,7 @@ type tokenFetch struct {
 	err   error
 }
 
+// finished reports whether the fetch has returned.
 func (f *tokenFetch) finished() bool {
 	select {
 	case <-f.done:
@@ -296,6 +340,7 @@ func (f *tokenFetch) finished() bool {
 	}
 }
 
+// Token waits up to timeout for the running fetch, starting one when none is running.
 func (s *timeoutSource) Token() (*oauth2.Token, error) {
 	s.mu.Lock()
 	f := s.cur
@@ -319,13 +364,14 @@ func (s *timeoutSource) Token() (*oauth2.Token, error) {
 	}
 }
 
-// WithDefaultIAM authenticates with IAM access tokens from Application Default Credentials.
+// WithDefaultIAM authenticates with IAM access tokens from Application Default Credentials,
+// with the username "default". It is the same as WithIAMOptions(IAMAuthOptions{}).
 func WithDefaultIAM() Option {
 	return WithIAMOptions(IAMAuthOptions{})
 }
 
 // WithIAMOptions authenticates with IAM access tokens configured by iamOpt. NewClient's ctx
-// bounds the provider's setup (see NewGCPTokenProvider).
+// bounds the token setup (see NewGCPTokenProvider).
 func WithIAMOptions(iamOpt IAMAuthOptions) Option {
 	return func(c *config) { c.iam = &iamOpt }
 }
