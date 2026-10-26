@@ -1,7 +1,7 @@
 // Command test_impersonation checks service account impersonation: it builds an IAM token
 // provider with IAMAuthOptions.ImpersonateSA set to the service account in
-// VALKEY_GCP_IMPERSONATE_SA, fetches one token for it and prints the token's first 15
-// characters. Impersonation lets a workload authenticate as another service account, for
+// VALKEY_GCP_IMPERSONATE_SA, fetches one token for it and prints its length and expiry;
+// the token itself is never printed. Impersonation lets a workload authenticate as another service account, for
 // example one that may connect to an instance in another project.
 //
 // The identity that impersonates is Application Default Credentials; it needs
@@ -15,6 +15,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"time"
 
 	"github.com/valkey-io/valkey-go/valkeygcp"
 )
@@ -39,9 +40,7 @@ func main() {
 	}
 
 	fmt.Printf("✅ Successfully acquired impersonated token for: %s\n", targetSA)
-	prefixLen := 15
-	if len(tok.AccessToken) < prefixLen {
-		prefixLen = len(tok.AccessToken)
-	}
-	fmt.Printf("Token Prefix: %s...\n", tok.AccessToken[:prefixLen])
+	// The token is a credential, so only its length and expiry are shown.
+	fmt.Printf("Token Length: %d characters (not printed)\n", len(tok.AccessToken))
+	fmt.Printf("Expiration:   %s (in %v)\n", tok.Expiry.Format(time.RFC3339), time.Until(tok.Expiry).Round(time.Second))
 }

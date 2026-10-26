@@ -80,7 +80,7 @@ var (
 	impersonateSA = flag.String("impersonate-sa", "", "service account to impersonate")
 	impLifetime   = flag.Duration("impersonate-lifetime", 0, "impersonated token lifetime (0 = 1h; above 1h needs the org policy)")
 	credsFile     = flag.String("credentials-json", "", "path to a service account key or WIF credential config")
-	refreshBuffer = flag.Duration("refresh-buffer", 0, "IAM refresh buffer (0 = 5m)")
+	refreshBuffer = flag.Duration("refresh-buffer", 0, "IAM refresh buffer (0 = 3m45s)")
 	fetchTimeout  = flag.Duration("fetch-timeout", 0, "cap on one IAM token fetch (0 = 10s, negative = no cap)")
 	maxAuthPerSec = flag.Float64("max-auth-per-second", 0, "pace token-backed AUTHs per client (0 = off)")
 	disableReauth = flag.Bool("disable-reauth", false, "turn off proactive re-AUTH on live connections")

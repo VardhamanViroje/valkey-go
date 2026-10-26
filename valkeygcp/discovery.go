@@ -397,6 +397,16 @@ func (r *resolved) validate() error {
 		}
 	}
 	callerAuth := callerAuthField(r.opt) != ""
+	// A ClientOption.Username alone would be dropped without a word: valkey-go ignores it
+	// once valkeygcp sets AuthCredentialsFn, which supplies its own username.
+	if r.opt.Username != "" && !callerAuth {
+		switch r.auth {
+		case authIAM:
+			return errors.New("valkeygcp: ClientOption.Username conflicts with IAM authentication, which supplies the AUTH username (IAMAuthOptions.Username) and token")
+		case authToken:
+			return errors.New("valkeygcp: ClientOption.Username conflicts with Token Auth, which supplies the AUTH username (TokenAuthOptions.Username) and token")
+		}
+	}
 	if r.auth == authToken && !callerAuth && (r.cfg.token == nil || !r.cfg.token.hasSource()) {
 		return errNoTokenSource
 	}

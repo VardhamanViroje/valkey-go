@@ -7,13 +7,15 @@
 //
 //	go run ./cmd/accelerated_test
 //
-// It asks the provider's AuthCredentialsFn for credentials five times, one second apart, as
-// valkey-go does for each new connection, and logs when the next re-AUTH would be due
-// (AuthCredentials.RefreshAfter). With RefreshBuffer set to 3s, the provider's cache treats
-// each token as expired 3s before its real expiry, so all five calls get the first token.
-// RefreshAfter falls in the first half of those last 3s, 7s to 8.5s after the token was
-// issued, picked at random so that connections don't re-AUTH at once. The cache already
-// treats the token as expired by then, so the re-AUTH gets a new token, not the old one.
+// It asks the provider's AuthCredentialsFn for credentials 15 times, one second apart, as
+// valkey-go does for each new connection, and logs the number of the token it got (never
+// the token itself) and when the next re-AUTH would be due (AuthCredentials.RefreshAfter).
+// With RefreshBuffer set to 3s, the provider's cache treats each token as expired 3s
+// before its real expiry, so each token is handed out for 7s and the run sees three
+// tokens. RefreshAfter falls in the first half of those last 3s, 7s to 8.5s after the
+// token was issued, picked at random so that connections don't re-AUTH at once. The cache
+// already treats the token as expired by then, so the re-AUTH gets a new token, not the
+// old one.
 package main
 
 import (
@@ -57,16 +59,20 @@ func main() {
 
 	authFn := provider.AuthCredentialsFn()
 
-	log.Println("Simulating accelerated token rotation across 30 seconds...")
-	for i := 0; i < 5; i++ {
+	const calls = 15
+	log.Printf("Asking for credentials %d times, 1s apart, as valkey-go does for each new connection...", calls)
+	for range calls {
 		creds, err := authFn(valkey.AuthCredentialsContext{})
 		if err != nil {
 			log.Fatalf("authFn error: %v", err)
 		}
-		log.Printf("Token acquired. Next Refresh Scheduled in: %v",
+		// Credentials don't belong in logs, even fake ones, so log the token's number: the
+		// cache hands out the newest token, which is the last one the fake source issued.
+		log.Printf("Got token #%d. Next re-AUTH due in: %v", atomic.LoadInt64(&mockSource.rotations),
 			time.Until(creds.RefreshAfter).Round(time.Millisecond),
 		)
 		time.Sleep(1 * time.Second)
 	}
-	log.Printf("✅ Stress test completed successfully with %d token rotations!", atomic.LoadInt64(&mockSource.rotations))
+	issued := atomic.LoadInt64(&mockSource.rotations)
+	log.Printf("✅ Done: %d tokens issued in %ds, so the cache rotated the token %d times", issued, calls, issued-1)
 }

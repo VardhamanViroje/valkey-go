@@ -245,8 +245,30 @@ func TestResolve_CallerCredentialsConflict(t *testing.T) {
 		})
 	}
 
+	// A ClientOption.Username alone would be dropped once valkeygcp supplies the credentials,
+	// whether an auth option or the instance's auth mode picks them, so it is an error.
+	withUser := initOption("10.0.0.15:6379")
+	withUser.Username = "alice"
+	for _, c := range []struct {
+		name   string
+		reader readerFactory
+		opts   []Option
+		want   string
+	}{
+		{"WithIAMOptions", noReader(t), []Option{WithIAMOptions(staticIAM())}, "ClientOption.Username conflicts with IAM authentication"},
+		{"WithTokenAuth", noReader(t), []Option{token}, "ClientOption.Username conflicts with Token Auth"},
+		{"IAM_AUTH instance", (&fakeReader{inst: clusterInstance(memorystorepb.Instance_IAM_AUTH)}).factory(),
+			[]Option{WithInstance(testInstance)}, "ClientOption.Username conflicts with IAM authentication"},
+	} {
+		if _, err := resolveOption(t, withUser, c.reader, c.opts...); err == nil || !strings.Contains(err.Error(), c.want) {
+			t.Errorf("Username and %s: got %v, want an error containing %q", c.name, err, c.want)
+		}
+	}
+
 	// Without an auth option the caller's credentials are used as is, also when the instance
 	// requires IAM or Token Auth.
+	withUserPassword := withPassword
+	withUserPassword.Username = "alice"
 	kept := []struct {
 		name   string
 		option valkey.ClientOption
@@ -254,6 +276,7 @@ func TestResolve_CallerCredentialsConflict(t *testing.T) {
 		opts   []Option
 	}{
 		{"Password", withPassword, noReader(t), nil},
+		{"Username and Password", withUserPassword, noReader(t), nil},
 		{"AuthCredentialsFn", withFn, noReader(t), nil},
 		{"Password, IAM_AUTH instance", withPassword, (&fakeReader{inst: clusterInstance(memorystorepb.Instance_IAM_AUTH)}).factory(),
 			[]Option{WithInstance(testInstance)}},

@@ -167,6 +167,13 @@ func TestResolveClientOption_SendToReplicasLogic(t *testing.T) {
 	if capturedOpt.SendToReplicas(blpopCmd) {
 		t.Errorf("expected BLPOP NOT to route to replica, got true")
 	}
+
+	// Blocking read (XREAD ... BLOCK) -> should NOT route to replica. It is read-only, so
+	// only the blocking check keeps it on the primary.
+	xreadCmd := builder.Xread().Block(1000).Streams().Key("s").Id("$").Build()
+	if capturedOpt.SendToReplicas(xreadCmd) {
+		t.Errorf("expected XREAD BLOCK NOT to route to replica, got true")
+	}
 }
 
 func TestResolveClientOption_MemorystoreRetryDelay(t *testing.T) {

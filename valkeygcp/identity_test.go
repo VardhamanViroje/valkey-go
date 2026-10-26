@@ -170,7 +170,7 @@ func TestNewGCPTokenProvider_RejectsInvalidUsername(t *testing.T) {
 // principal-email strategy fails with the annotation hint, and the explicit-username check
 // stays silent instead of rejecting a correct email.
 func TestUsername_GKENonEmailIdentifier(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte("my-ksa.svc.id.goog"))
 	}))
 	defer srv.Close()

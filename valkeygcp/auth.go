@@ -19,8 +19,11 @@ import (
 const (
 	// DefaultCloudPlatformScope is the OAuth2 scope requested for IAM access tokens.
 	DefaultCloudPlatformScope = "https://www.googleapis.com/auth/cloud-platform"
-	// DefaultRefreshBuffer is how long before a token expires a new one is used.
-	DefaultRefreshBuffer = 5 * time.Minute
+	// DefaultRefreshBuffer is how long before a token expires a new one is used: 3m45s, the
+	// margin Google's own auth library uses. The metadata server can keep handing out the
+	// old token until 4 minutes before it expires, so asking earlier could get the same
+	// token again.
+	DefaultRefreshBuffer = 3*time.Minute + 45*time.Second
 	// DefaultIAMUsername is the username sent with AUTH. Memorystore accepts "default" or
 	// the email of the IAM principal.
 	DefaultIAMUsername = "default"
@@ -48,10 +51,15 @@ type IAMAuthOptions struct {
 	Username string
 	// RefreshBuffer is how long before a token expires a new one is used. Live connections
 	// re-AUTH with the new token at a random moment in the first half of this window, so
-	// they don't all re-AUTH at once. Zero or negative means DefaultRefreshBuffer.
+	// they don't all re-AUTH at once. A buffer longer than the token source's own refresh
+	// margin makes re-AUTHs resend the old token (see CustomTokenSource). Zero or negative
+	// means DefaultRefreshBuffer.
 	RefreshBuffer time.Duration
 	// CustomTokenSource supplies the access tokens, for tokens you get your own way. It
-	// takes precedence over ImpersonateSA and CredentialsJSON.
+	// takes precedence over ImpersonateSA and CredentialsJSON. If it caches tokens, it must
+	// hand out a new one once the current token has less than RefreshBuffer left: valkeygcp
+	// asks for a new token then, and live connections would otherwise re-AUTH with the old
+	// one.
 	CustomTokenSource oauth2.TokenSource
 	// Scopes are the OAuth2 scopes requested for the access tokens; DefaultCloudPlatformScope
 	// when empty. The Google API calls made during setup use the same tokens, so keep a
@@ -131,7 +139,8 @@ var impersonateTokenSource = impersonate.CredentialsTokenSource
 
 // NewGCPTokenProvider returns a GCPTokenProvider for opt, for callers who set
 // valkey.ClientOption.AuthCredentialsFn themselves instead of using NewClient. Tokens are
-// cached and replaced RefreshBuffer before they expire, so every re-AUTH sends a new token.
+// cached and replaced RefreshBuffer before they expire, so a re-AUTH sends a new token, as
+// long as the token source hands one out by then (see IAMAuthOptions.CustomTokenSource).
 //
 // ctx bounds the one-off setup (finding the credentials, impersonation, looking up the
 // principal email), which also stops after 15s when ctx has no earlier deadline. Token
@@ -197,10 +206,12 @@ func newTokenProvider(ctx context.Context, opt IAMAuthOptions, base baseCreds) (
 
 	p := &tokenProvider{
 		// The cache hands out the same token until RefreshBuffer before it expires, then
-		// fetches a new one. Re-AUTHs are scheduled inside that window, so they always send
-		// a new token. With the default 10s margin of oauth2.ReuseTokenSource they would
+		// fetches a new one. Re-AUTHs are scheduled inside that window, so they send a new
+		// token. With the default 10s margin of oauth2.ReuseTokenSource they would
 		// resend the old token and reschedule at ever shorter intervals until it expired.
-		// The fetch timeout sits under the cache, so it limits real fetches, not cache hits.
+		// For ADC, newBaseCreds gives ADC's own cache the same margin, so the fetch gets a
+		// new token too. The fetch timeout sits under the cache, so it limits real fetches,
+		// not cache hits.
 		source:        oauth2.ReuseTokenSourceWithExpiry(nil, withFetchTimeout(base.source, opt.FetchTimeout), opt.RefreshBuffer),
 		refreshBuffer: opt.RefreshBuffer,
 		username:      username,
@@ -221,6 +232,10 @@ type baseCreds struct {
 	source oauth2.TokenSource
 	json   []byte // used to find the principal email for UsernamePrincipalEmail
 }
+
+// findDefaultCredentials looks up Application Default Credentials. It is a variable so tests
+// can check the parameters without a metadata server.
+var findDefaultCredentials = google.FindDefaultCredentialsWithParams
 
 // newBaseCreds creates the token source of the identity opt names: CustomTokenSource,
 // ImpersonateSA, CredentialsJSON, or else Application Default Credentials. The source keeps
@@ -262,7 +277,17 @@ func newBaseCreds(ctx context.Context, opt IAMAuthOptions) (baseCreds, error) {
 		}
 		return baseCreds{source: creds.TokenSource, json: opt.CredentialsJSON}, nil
 	default:
-		creds, err := google.FindDefaultCredentials(ctx, opt.Scopes...)
+		// ADC keeps its own token cache, which renews tokens 10s before they expire unless
+		// told otherwise. EarlyTokenRefresh makes it renew at the same point as valkeygcp's
+		// cache, so a re-AUTH gets a new token. oauth2 honors it only for metadata-server
+		// credentials (Compute Engine, GKE, Cloud Run). Key files, user credentials and
+		// Workload Identity Federation keep the 10s cache, as do the CredentialsJSON and
+		// impersonation cases above; for them, early renewal still relies on oauth2's
+		// ReuseTokenSource sharing its token object with valkeygcp's cache.
+		creds, err := findDefaultCredentials(ctx, google.CredentialsParams{
+			Scopes:            opt.Scopes,
+			EarlyTokenRefresh: opt.RefreshBuffer,
+		})
 		if err != nil {
 			return baseCreds{}, fmt.Errorf("valkeygcp: Application Default Credentials not found: %w", err)
 		}
