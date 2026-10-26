@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/valkey-io/valkey-go"
 	"golang.org/x/oauth2"
+	"golang.org/x/oauth2/google"
 )
 
 // mockTokenSource simulates a Google OAuth2 token source with configurable expiry and call tracking.
@@ -203,10 +205,13 @@ func TestAuthCredentialsFn_NearExpiryFallback(t *testing.T) {
 		Expiry:      time.Now().Add(-1 * time.Minute),
 	}
 	mockExpired := &mockTokenSource{defaultTok: expiredToken}
-	providerExpired, _ := NewGCPTokenProvider(ctx, IAMAuthOptions{
+	providerExpired, err := NewGCPTokenProvider(ctx, IAMAuthOptions{
 		RefreshBuffer:     5 * time.Minute,
 		CustomTokenSource: mockExpired,
 	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	credsExpired, err := providerExpired.AuthCredentialsFn()(valkey.AuthCredentialsContext{})
 	if err != nil {
 		t.Fatalf("authFn on expired token failed: %v", err)
@@ -364,7 +369,8 @@ func TestRefreshTolerance_CachedTokenValid(t *testing.T) {
 		if fail.Load() {
 			return nil, errors.New("metadata server unreachable")
 		}
-		// Inside the 5m refresh buffer, so the token cache fetches again on the next call.
+		// Inside the default 3m45s refresh buffer, so the token cache fetches again on the next
+		// call.
 		return &oauth2.Token{AccessToken: "cached", Expiry: time.Now().Add(3 * time.Minute)}, nil
 	})
 	var absorbed atomic.Int32
@@ -605,14 +611,17 @@ func TestMaxAuthPerSecond(t *testing.T) {
 		}
 	}
 	if elapsed := time.Since(start); elapsed < 140*time.Millisecond {
-		t.Errorf("4 AUTHs took %v, want >= 150ms at 20/s", elapsed)
+		t.Errorf("4 AUTHs took %v, want about 150ms or more: 3 waits of 50ms at 20/s", elapsed)
 	}
 	var nilLimiter *authLimiter
 	nilLimiter.wait() // no-op, must not panic
 	if p := provider.(*tokenProvider); p.limiter == nil || p.limiter.interval != 50*time.Millisecond {
 		t.Errorf("limiter = %+v", p.limiter)
 	}
-	unpaced, _ := NewGCPTokenProvider(context.Background(), IAMAuthOptions{CustomTokenSource: &mockTokenSource{}})
+	unpaced, err := NewGCPTokenProvider(context.Background(), IAMAuthOptions{CustomTokenSource: &mockTokenSource{}})
+	if err != nil {
+		t.Fatal(err)
+	}
 	if unpaced.(*tokenProvider).limiter != nil {
 		t.Error("MaxAuthPerSecond 0 must not create a limiter")
 	}
@@ -735,5 +744,46 @@ func TestTokenProvider_TokenHonorsContext(t *testing.T) {
 	defer cancel()
 	if _, err := provider.Token(ctx); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("got %v, want the caller's deadline", err)
+	}
+}
+
+// Application Default Credentials are looked up with EarlyTokenRefresh set to RefreshBuffer,
+// so ADC's own token cache renews at the same point as valkeygcp's cache and a re-AUTH gets
+// a new token, without relying on how oauth2's caches share token objects. A
+// CustomTokenSource is used as is, with no ADC lookup.
+func TestNewBaseSource_EarlyTokenRefresh(t *testing.T) {
+	orig := findDefaultCredentials
+	defer func() { findDefaultCredentials = orig }()
+	var got google.CredentialsParams
+	findDefaultCredentials = func(_ context.Context, params google.CredentialsParams) (*google.Credentials, error) {
+		got = params
+		return &google.Credentials{TokenSource: &mockTokenSource{}}, nil
+	}
+	for _, tc := range []struct {
+		name   string
+		opt    IAMAuthOptions
+		buffer time.Duration
+		scopes []string
+	}{
+		{"defaults", IAMAuthOptions{}, DefaultRefreshBuffer, []string{DefaultCloudPlatformScope}},
+		{"custom", IAMAuthOptions{RefreshBuffer: 2 * time.Minute, Scopes: []string{"scope-a"}}, 2 * time.Minute, []string{"scope-a"}},
+	} {
+		got = google.CredentialsParams{}
+		if _, err := NewGCPTokenProvider(context.Background(), tc.opt); err != nil {
+			t.Fatalf("%s: %v", tc.name, err)
+		}
+		if got.EarlyTokenRefresh != tc.buffer || !slices.Equal(got.Scopes, tc.scopes) {
+			t.Errorf("%s: EarlyTokenRefresh = %v, Scopes = %v; want %v, %v",
+				tc.name, got.EarlyTokenRefresh, got.Scopes, tc.buffer, tc.scopes)
+		}
+	}
+
+	var looked atomic.Bool
+	findDefaultCredentials = func(context.Context, google.CredentialsParams) (*google.Credentials, error) {
+		looked.Store(true)
+		return nil, errors.New("ADC must not be looked up")
+	}
+	if _, err := NewGCPTokenProvider(context.Background(), IAMAuthOptions{CustomTokenSource: &mockTokenSource{}}); err != nil || looked.Load() {
+		t.Fatalf("CustomTokenSource: err = %v, ADC looked up = %v", err, looked.Load())
 	}
 }

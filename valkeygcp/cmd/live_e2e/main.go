@@ -1,7 +1,7 @@
 // Command live_e2e keeps SET and GET traffic running against a cluster-mode Memorystore for
 // Valkey instance with IAM authentication, to check that requests keep succeeding while the
-// IAM token is refreshed. valkeygcp schedules a re-AUTH on each live connection 2.5 to 5
-// minutes before its token expires, and valkey-go then sends AUTH with a new token. Access
+// IAM token is refreshed. valkeygcp schedules a re-AUTH on each live connection 1m52s to
+// 3m45s before its token expires, and valkey-go then sends AUTH with a new token. Access
 // tokens last an hour, so leave the program running for more than an hour.
 //
 // It needs a host that can reach the instance's discovery endpoint, such as a VM in the
@@ -12,7 +12,8 @@
 //	MEMORYSTORE_TEST_DISCOVERY_ENDPOINT=10.0.0.15:6379 go run ./cmd/live_e2e
 //
 // It runs one SET/GET pair every 200ms, logs each failure, and logs the counts after every
-// 300 successful pairs, about once a minute.
+// 300 successful pairs, about once a minute. When stopped, it prints the totals and exits
+// with status 1 if any pair failed.
 package main
 
 import (
@@ -79,9 +80,14 @@ func main() {
 
 			// Execute GET
 			getVal, err := client.Do(ctx, client.B().Get().Key(key).Build()).ToString()
-			if err != nil || getVal != val {
+			if err != nil {
 				atomic.AddUint64(&errorCount, 1)
-				log.Printf("❌ GET failed or value mismatch: %v", err)
+				log.Printf("❌ GET failed: %v", err)
+				continue
+			}
+			if getVal != val {
+				atomic.AddUint64(&errorCount, 1)
+				log.Printf("❌ GET %s returned %q, want %q", key, getVal, val)
 				continue
 			}
 
@@ -95,7 +101,13 @@ func main() {
 			}
 
 		case <-stopChan:
-			log.Println("Stopping test...")
+			failed := atomic.LoadUint64(&errorCount)
+			log.Printf("Stopping test after %v: %d succeeded, %d failed",
+				time.Since(startTime).Round(time.Second), atomic.LoadUint64(&successCount), failed)
+			if failed > 0 {
+				client.Close()
+				os.Exit(1) // any failed pair fails the run
+			}
 			return
 		}
 	}

@@ -76,7 +76,7 @@ func ResolveClientOption(ctx context.Context, option valkey.ClientOption, opts .
 		return valkey.ClientOption{}, errNoEndpoint
 	}
 	if field := callerAuthField(option); field != "" && cfg.iam != nil {
-		return valkey.ClientOption{}, fmt.Errorf("valkeygcp: ClientOption.%s conflicts with WithIAMOptions", field)
+		return valkey.ClientOption{}, fmt.Errorf("valkeygcp: ClientOption.%s conflicts with WithIAMOptions, which supplies the AUTH username (IAMAuthOptions.Username) and token", field)
 	}
 	opt := withDefaults(option)
 	if cfg.iam != nil {
@@ -123,12 +123,16 @@ func withDefaults(opt valkey.ClientOption) valkey.ClientOption {
 
 // callerAuthField names the ClientOption credential field the caller set, if any.
 // Caller-managed credentials are used as is; an IAM option next to them is an error.
+// Username counts too: valkey-go ignores it once AuthCredentialsFn is set, so next to an
+// IAM option it would be dropped without a word.
 func callerAuthField(o valkey.ClientOption) string {
 	switch {
 	case o.AuthCredentialsFn != nil:
 		return "AuthCredentialsFn"
 	case o.Password != "":
 		return "Password"
+	case o.Username != "":
+		return "Username"
 	}
 	return ""
 }

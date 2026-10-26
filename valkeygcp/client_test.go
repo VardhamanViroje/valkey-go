@@ -149,7 +149,8 @@ func TestResolveClientOption_CallerValuesWin(t *testing.T) {
 	}
 }
 
-// Credentials set on the ClientOption are used as is; next to an IAM option they are an error.
+// Credentials set on the ClientOption are used as is; next to an IAM option they are an
+// error. That includes Username, which valkey-go would otherwise drop without a word.
 func TestResolveClientOption_CallerCredentials(t *testing.T) {
 	ownFn := func(valkey.AuthCredentialsContext) (valkey.AuthCredentials, error) {
 		return valkey.AuthCredentials{}, nil
@@ -157,13 +158,15 @@ func TestResolveClientOption_CallerCredentials(t *testing.T) {
 	for field, option := range map[string]valkey.ClientOption{
 		"Password":          {InitAddress: []string{"10.0.0.15:6379"}, Password: "secret"},
 		"AuthCredentialsFn": {InitAddress: []string{"10.0.0.15:6379"}, AuthCredentialsFn: ownFn},
+		"Username":          {InitAddress: []string{"10.0.0.15:6379"}, Username: "alice"},
 	} {
 		_, err := ResolveClientOption(context.Background(), option, WithIAMOptions(staticTokenIAM("t")))
 		if err == nil || !strings.Contains(err.Error(), "ClientOption."+field+" conflicts with WithIAMOptions") {
 			t.Errorf("%s with WithIAMOptions: got %v", field, err)
 		}
 		opt, err := ResolveClientOption(context.Background(), option)
-		if err != nil || opt.Password != option.Password || (opt.AuthCredentialsFn != nil) != (option.AuthCredentialsFn != nil) {
+		if err != nil || opt.Username != option.Username || opt.Password != option.Password ||
+			(opt.AuthCredentialsFn != nil) != (option.AuthCredentialsFn != nil) {
 			t.Errorf("%s alone: not kept as is (%v)", field, err)
 		}
 	}
@@ -214,6 +217,13 @@ func TestResolveClientOption_SendToReplicasLogic(t *testing.T) {
 	blpopCmd := builder.Blpop().Key("k").Timeout(1).Build()
 	if capturedOpt.SendToReplicas(blpopCmd) {
 		t.Errorf("expected BLPOP NOT to route to replica, got true")
+	}
+
+	// Blocking read (XREAD ... BLOCK) -> should NOT route to replica. It is read-only, so
+	// only the blocking check keeps it on the primary.
+	xreadCmd := builder.Xread().Block(1000).Streams().Key("s").Id("$").Build()
+	if capturedOpt.SendToReplicas(xreadCmd) {
+		t.Errorf("expected XREAD BLOCK NOT to route to replica, got true")
 	}
 }
 

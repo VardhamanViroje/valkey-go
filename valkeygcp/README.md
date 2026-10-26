@@ -94,7 +94,7 @@ client, err := valkeygcp.NewClient(ctx, valkey.ClientOption{
 | `CustomTokenSource`      | ADC                                                | Where access tokens come from                                                                         |
 | `Username`               | `"default"` (`DefaultIAMUsername`)             | The AUTH username                                                                                     |
 | `Scopes`                 | `cloud-platform` (`DefaultCloudPlatformScope`) | OAuth2 scopes requested from ADC; not used with `CustomTokenSource`                                 |
-| `RefreshBuffer`          | 5m (`DefaultRefreshBuffer`)                      | How long before expiry a token is replaced; live connections re-AUTH in the first half of that window |
+| `RefreshBuffer`          | 3m45s (`DefaultRefreshBuffer`)                   | How long before expiry a token is replaced; live connections re-AUTH in the first half of that window |
 | `FetchTimeout`           | 10s (`DefaultTokenFetchTimeout`)                 | Cap on one token fetch; negative disables it                                                          |
 | `DisableProactiveReauth` | `false`                                          | When true, live connections aren't re-AUTHed; every new connection still gets a fresh token           |
 | `MaxAuthPerSecond`       | 0 (off)                                            | Limits how many AUTHs the client sends per second, for when many connections reconnect at once        |
@@ -150,7 +150,9 @@ The cluster settings are left out when `Standalone.ReplicaAddress` is set. valke
 
 ### 1.5 Token Refresh and Failures
 
-* **When tokens are refreshed.** A token is replaced `RefreshBuffer` (5m) before it expires. Live connections re-AUTH with the new token at a random time in the first half of that window, so they don't all re-AUTH in the same second. `DisableProactiveReauth` turns this off; new connections still get a fresh token.
+* **When tokens are refreshed.** A token is replaced `RefreshBuffer` (3m45s) before it expires. Live connections re-AUTH with the new token at a random time in the first half of that window, so they don't all re-AUTH in the same second. `DisableProactiveReauth` turns this off; new connections still get a fresh token.
+* **Why 3m45s.** It is the margin Google's own auth library uses: the metadata server can keep handing out the old token until 4 minutes before it expires, so asking earlier could get the same token again. valkeygcp passes the same margin to Application Default Credentials (`EarlyTokenRefresh`), so their own token cache renews at the same point. The Go OAuth2 library applies it only to metadata-server credentials.
+* **Custom token sources.** valkeygcp asks for a new token once the current one has less than `RefreshBuffer` left. A `CustomTokenSource` that caches tokens must hand out a new one by then; otherwise live connections re-AUTH with the old token.
 * **When a refresh fails.** Live connections keep the last valid token, and the refresh is retried about every 30 seconds. `OnCredentialError` receives each error. If the last token expires before a refresh succeeds, live connections stay authenticated (their re-AUTH is skipped), but new connections fail until a token can be fetched again.
 * **Token fetches are capped.** Each fetch waits at most `FetchTimeout` (10s); a fetch that times out counts as a failed one.
 * **A rejected re-AUTH closes the connection.** If Memorystore rejects the re-AUTH of a live connection (for example with `ERR_IAM_EXHAUSTED`), valkey-go closes that connection and the next command dials a new one, although Memorystore would have kept the authenticated connection working.
@@ -160,7 +162,7 @@ The cluster settings are left out when `Standalone.ReplicaAddress` is set. valke
 * **`NewClient`'s `ctx` bounds setup only.** Credential discovery stops when it is cancelled or its deadline passes, and after 15 seconds if it has no deadline; a `ctx` that has ended by then stops `NewClient` before it connects. Token refreshes never use it, because they run for the life of the client.
 * **Setup needs working credentials.** valkey-go connects and authenticates while it builds the client, so missing ADC fails `NewClient` immediately, with the underlying error. Without ADC, pass a token source in `IAMAuthOptions.CustomTokenSource`.
 * **`InitAddress` is required.** `NewClient` and `ResolveClientOption` return an error without it.
-* **Credentials on the `ClientOption`** (`Password` or `AuthCredentialsFn`) are used as is; passing them together with `WithIAMOptions` or `WithDefaultIAM` is an error.
+* **Credentials on the `ClientOption`** (`Username`, `Password` or `AuthCredentialsFn`) are used as is; passing them together with `WithIAMOptions` or `WithDefaultIAM` is an error. Set the IAM username with `IAMAuthOptions.Username`.
 
 ### 1.7 Required Roles
 
