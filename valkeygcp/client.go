@@ -40,8 +40,9 @@ const (
 	// topology. valkey-go starts each refresh after a short random delay, so many clients
 	// don't query the cluster at the same moment.
 	defaultShardsRefreshInterval = 10 * time.Second
-	// setupTimeout caps one-off setup calls (credential discovery) when the caller's context
-	// has no earlier deadline.
+	// setupTimeout caps one-off setup calls (finding credentials, impersonation, the
+	// principal-email lookup) and connecting, when the caller's context has no earlier
+	// deadline.
 	setupTimeout = 15 * time.Second
 )
 
@@ -53,40 +54,62 @@ var errNoEndpoint = errors.New("valkeygcp: no endpoint: set ClientOption.InitAdd
 // reader endpoint, if any. NewClient fills the Memorystore defaults into the fields left at
 // their zero value, adds the credentials opts ask for, and connects.
 //
-// ctx bounds credential setup; a ctx that has ended by then stops NewClient before it
-// connects. valkey-go connects and authenticates while it builds the client, so setup needs
-// working credentials. Token refreshes never use ctx.
+// ctx bounds credential setup and connecting. valkey-go connects and authenticates while it
+// builds the client, so setup needs working credentials. Memorystore IAM backend errors
+// (ERR_IAM_EXHAUSTED, ERR_IAM_OTHER) during the handshake are retried with backoff until ctx
+// ends, at most 15s when it has no earlier deadline. When an ACL rule refuses CLIENT
+// TRACKING, the error says which rule to change. Token refreshes never use ctx.
 func NewClient(ctx context.Context, option valkey.ClientOption, opts ...Option) (valkey.Client, error) {
-	opt, err := ResolveClientOption(ctx, option, opts...)
+	opt, user, err := resolveClientOption(ctx, option, opts...)
 	if err != nil {
 		return nil, err
 	}
-	if err := ctx.Err(); err != nil {
-		return nil, err // valkey.NewClient takes no context
-	}
-	return valkey.NewClient(opt)
+	return connect(ctx, opt, user)
 }
 
 // ResolveClientOption returns the valkey.ClientOption NewClient would connect with, without
 // connecting, for callers who build the client themselves (valkey.NewClient,
-// valkeyotel.NewClient) or want to inspect it.
+// valkeyotel.NewClient) or want to inspect it. The option keeps the credentials, the
+// defaults and the dial gate of WithIAMOptions. Building the client that way skips
+// NewClient's connect-time handling: the retries of Memorystore IAM backend errors during
+// the handshake, and the CLIENT TRACKING hint.
 func ResolveClientOption(ctx context.Context, option valkey.ClientOption, opts ...Option) (valkey.ClientOption, error) {
+	opt, _, err := resolveClientOption(ctx, option, opts...)
+	return opt, err
+}
+
+// resolveClientOption builds the option for NewClient and ResolveClientOption, and returns
+// the AUTH username for error messages ("" when unknown).
+func resolveClientOption(ctx context.Context, option valkey.ClientOption, opts ...Option) (valkey.ClientOption, string, error) {
 	cfg := newConfig(opts)
 	if len(option.InitAddress) == 0 {
-		return valkey.ClientOption{}, errNoEndpoint
+		return valkey.ClientOption{}, "", errNoEndpoint
 	}
 	if field := callerAuthField(option); field != "" && cfg.iam != nil {
-		return valkey.ClientOption{}, fmt.Errorf("valkeygcp: ClientOption.%s conflicts with WithIAMOptions, which supplies the AUTH username (IAMAuthOptions.Username) and token", field)
+		return valkey.ClientOption{}, "", fmt.Errorf("valkeygcp: ClientOption.%s conflicts with WithIAMOptions, which supplies the AUTH username (IAMAuthOptions.Username) and token", field)
 	}
 	opt := withDefaults(option)
+	user := callerAuthUser(option)
 	if cfg.iam != nil {
-		p, err := NewGCPTokenProvider(ctx, *cfg.iam)
+		p, err := newIAMProvider(ctx, *cfg.iam)
 		if err != nil {
-			return valkey.ClientOption{}, err
+			return valkey.ClientOption{}, "", err
 		}
 		opt.AuthCredentialsFn = p.AuthCredentialsFn()
+		installDialGate(&opt) // after an ERR_IAM_* rejection, new dials wait with backoff
+		user = p.username
 	}
-	return opt, nil
+	return opt, user, nil
+}
+
+// callerAuthUser is the AUTH user of credentials set on the ClientOption: Username, or
+// "default", which valkey-go sends when only a password is set. It is "" when unknown, for
+// example with an AuthCredentialsFn.
+func callerAuthUser(o valkey.ClientOption) string {
+	if o.Username == "" && o.Password != "" {
+		return "default"
+	}
+	return o.Username
 }
 
 // withDefaults fills the Memorystore defaults into the fields of opt left at their zero

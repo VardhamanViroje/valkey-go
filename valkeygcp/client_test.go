@@ -54,6 +54,9 @@ func TestResolveClientOption_ClusterWiring(t *testing.T) {
 	if err != nil || creds.Username != DefaultIAMUsername || creds.Password != "cluster-token" {
 		t.Fatalf("creds = %+v, %v", creds, err)
 	}
+	if opt.DialCtxFn == nil {
+		t.Error("IAM must space out re-dials after IAM backend errors: no gated dialer")
+	}
 }
 
 // With a reader endpoint, reads are routed to it and the cluster defaults are left out.

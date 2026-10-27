@@ -24,7 +24,8 @@ const (
 // It is a valkey.RetryDelayFn: negative stops retrying, 0 retries now, positive waits.
 //
 // valkey-go calls it only for errors it retries: network errors and LOADING. An ERR_IAM_*
-// reply to a connection's HELLO is not one of them: valkey-go returns that error instead.
+// reply to a connection's HELLO is not one of them; connect and the dial gate back off those
+// instead.
 func memorystoreRetryDelay(attempts int, _ valkey.Completed, err error) time.Duration {
 	if attempts >= maxRetryAttempts {
 		return -1
