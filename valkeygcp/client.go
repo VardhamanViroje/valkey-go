@@ -10,14 +10,16 @@ import (
 )
 
 // Option configures what NewClient and ResolveClientOption add to a valkey.ClientOption:
-// IAM credentials (WithIAMOptions, WithDefaultIAM). Settings valkey-go already has a field
-// for, such as addresses and timeouts, are set on the valkey.ClientOption itself.
-// Later options override earlier ones of the same kind.
+// IAM credentials (WithIAMOptions, WithDefaultIAM) or Token Auth credentials
+// (WithTokenAuth). Settings valkey-go already has a field for, such as addresses and
+// timeouts, are set on the valkey.ClientOption itself. Later options override earlier ones
+// of the same kind; IAM and Token Auth options can't be combined.
 type Option func(*config)
 
 // config collects the Options of one NewClient or ResolveClientOption call.
 type config struct {
-	iam *IAMAuthOptions // IAM settings (WithIAMOptions, WithDefaultIAM); nil when not given
+	iam   *IAMAuthOptions   // IAM settings (WithIAMOptions, WithDefaultIAM); nil when not given
+	token *TokenAuthOptions // Token Auth settings (WithTokenAuth); nil when not given
 }
 
 // newConfig applies opts in order, skipping nil ones.
@@ -75,12 +77,25 @@ func ResolveClientOption(ctx context.Context, option valkey.ClientOption, opts .
 	if len(option.InitAddress) == 0 {
 		return valkey.ClientOption{}, errNoEndpoint
 	}
+	if cfg.iam != nil && cfg.token != nil {
+		return valkey.ClientOption{}, errors.New("valkeygcp: WithTokenAuth can't be combined with WithIAMOptions or WithDefaultIAM: an instance uses either IAM or Token Auth")
+	}
 	if field := callerAuthField(option); field != "" && cfg.iam != nil {
 		return valkey.ClientOption{}, fmt.Errorf("valkeygcp: ClientOption.%s conflicts with WithIAMOptions, which supplies the AUTH username (IAMAuthOptions.Username) and token", field)
+	}
+	if field := callerAuthField(option); field != "" && cfg.token != nil {
+		return valkey.ClientOption{}, fmt.Errorf("valkeygcp: ClientOption.%s conflicts with WithTokenAuth, which supplies the AUTH username (TokenAuthOptions.Username) and token", field)
 	}
 	opt := withDefaults(option)
 	if cfg.iam != nil {
 		p, err := NewGCPTokenProvider(ctx, *cfg.iam)
+		if err != nil {
+			return valkey.ClientOption{}, err
+		}
+		opt.AuthCredentialsFn = p.AuthCredentialsFn()
+	}
+	if cfg.token != nil {
+		p, err := newTokenAuthProvider(ctx, *cfg.token)
 		if err != nil {
 			return valkey.ClientOption{}, err
 		}
@@ -122,9 +137,9 @@ func withDefaults(opt valkey.ClientOption) valkey.ClientOption {
 }
 
 // callerAuthField names the ClientOption credential field the caller set, if any.
-// Caller-managed credentials are used as is; an IAM option next to them is an error.
-// Username counts too: valkey-go ignores it once AuthCredentialsFn is set, so next to an
-// IAM option it would be dropped without a word.
+// Caller-managed credentials are used as is; an IAM or Token Auth option next to them is an
+// error. Username counts too: valkey-go ignores it once AuthCredentialsFn is set, so next to
+// one of those options it would be dropped without a word.
 func callerAuthField(o valkey.ClientOption) string {
 	switch {
 	case o.AuthCredentialsFn != nil:
