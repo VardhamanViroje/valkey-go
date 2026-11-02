@@ -18,6 +18,7 @@ A fast Golang Valkey client that does auto pipelining and supports server-assist
 - [Helpers for writing tests with valkey mock](./mock)
 - [OpenTelemetry integration](./valkeyotel)
 - [Hooks and other integrations](./valkeyhook)
+- [Google Cloud Memorystore integration with native IAM authentication](./valkeygcp)
 - [Go-redis like API adapter](./valkeycompat) by [@418Coffee](https://github.com/418Coffee)
 - [Go-redis redis_rate parity adapter](./valkeycompatrate)
 - Pub/Sub, Sharded Pub/Sub, Streams
@@ -594,6 +595,22 @@ client, err := valkey.NewClient(valkey.ClientOption{
 
 For deployments that only provide the availability zone via the INFO command (e.g. AWS ElastiCache for Valkey 7.2+), set the `AZFromInfo`
  option as well as `EnableReplicaAZInfo`.
+
+### Google Cloud Memorystore Integration for Valkey-Go
+
+The [valkeygcp](./valkeygcp) sub-module connects to [Google Cloud Memorystore for Valkey](https://cloud.google.com/memorystore/docs/valkey/product-overview) with native Google Cloud authentication:
+IAM (OAuth2 access tokens from Application Default Credentials, GKE Workload Identity, service account keys or impersonation, rotated on live connections),
+Token Auth, in-transit encryption (TLS) and ACL-policy usernames. Its Google Cloud dependencies stay inside the sub-module, so `valkey-go` itself gains none.
+
+Given the instance name, `valkeygcp.NewClient` reads the instance's auth mode, TLS mode, server CA and endpoints, and returns a ready `valkey.Client`:
+
+```golang
+client, err := valkeygcp.NewClient(ctx, valkeygcp.Config{
+    Instance: "projects/my-proj/locations/us-west4/instances/my-valkey",
+})
+```
+
+See the [valkeygcp README](./valkeygcp/README.md) for explicit configuration without the Memorystore API, Token Auth, TLS and the required IAM roles.
 
 ## Arbitrary Command
 
