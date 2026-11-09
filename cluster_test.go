@@ -11518,12 +11518,130 @@ func TestClusterRefreshStartDelayDistributesOverWindow(t *testing.T) {
 	}
 }
 
+func TestClusterRefreshStartDelayWithMaxRefreshDelay(t *testing.T) {
+	t.Run("overrides a larger auto bound", func(t *testing.T) {
+		maxDelay := 50 * time.Millisecond
+		c := clusterClientWithConnCount(1000) // the auto bound is 30s
+		c.opt.ClusterOption.MaxRefreshDelay = maxDelay
+		for i := 0; i < 1000; i++ {
+			if d := c.clusterRefreshStartDelay(); d < 0 || d >= maxDelay {
+				t.Fatalf("iteration %d: start delay %v out of [0, %v)", i, d, maxDelay)
+			}
+		}
+	})
+	t.Run("overrides a smaller auto bound", func(t *testing.T) {
+		maxDelay := 10 * time.Second
+		c := clusterClientWithConnCount(1) // the auto bound is 1s
+		c.opt.ClusterOption.MaxRefreshDelay = maxDelay
+		var longest time.Duration
+		for i := 0; i < 1000; i++ {
+			d := c.clusterRefreshStartDelay()
+			if d < 0 || d >= maxDelay {
+				t.Fatalf("iteration %d: start delay %v out of [0, %v)", i, d, maxDelay)
+			}
+			if d > longest {
+				longest = d
+			}
+		}
+		if longest < time.Second {
+			t.Fatalf("longest start delay %v, expected some above the 1s auto bound", longest)
+		}
+	})
+	t.Run("negative disables the delay", func(t *testing.T) {
+		c := clusterClientWithConnCount(1000)
+		c.opt.ClusterOption.MaxRefreshDelay = -1
+		if d := c.clusterRefreshStartDelay(); d != 0 {
+			t.Fatalf("start delay %v, want 0", d)
+		}
+	})
+	t.Run("keeps the batch delay scaled by cluster size", func(t *testing.T) {
+		c := clusterClientWithConnCount(1000)
+		c.opt.ClusterOption.MaxRefreshDelay = 50 * time.Millisecond
+		if got, want := c.clusterRefreshBatchDelay(), 100*time.Millisecond; got != want {
+			t.Fatalf("batch delay %v, want %v", got, want)
+		}
+	})
+}
+
+func TestClusterClientRetryFollowsFailoverWithMaxRefreshDelay(t *testing.T) {
+	defer ShouldNotLeak(SetupLeakDetection())
+
+	// After the failover, the old primary 127.0.0.1:0 is unreachable and
+	// its replica 127.0.1.1:1 has been promoted to own all slots.
+	promotedResp := NewResult(slicemsg('*', []ValkeyMessage{
+		slicemsg('*', []ValkeyMessage{
+			{typ: ':', intlen: 0},
+			{typ: ':', intlen: 16383},
+			slicemsg('*', []ValkeyMessage{ // master
+				strmsg('+', "127.0.1.1"),
+				{typ: ':', intlen: 1},
+				strmsg('+', ""),
+			}),
+		}),
+	}), nil)
+	var failedOver atomic.Bool
+	var oldPrimaryGets int64
+	oldPrimary := &mockConn{
+		DoFn: func(cmd Completed) ValkeyResult {
+			if strings.Join(cmd.Commands(), " ") == "CLUSTER SLOTS" {
+				if failedOver.Load() {
+					return NewErrorResult(io.EOF)
+				}
+				return slotsResp
+			}
+			atomic.AddInt64(&oldPrimaryGets, 1)
+			return NewErrorResult(io.EOF)
+		},
+	}
+	newPrimary := &mockConn{
+		DoFn: func(cmd Completed) ValkeyResult {
+			if strings.Join(cmd.Commands(), " ") == "CLUSTER SLOTS" {
+				if failedOver.Load() {
+					return promotedResp
+				}
+				return slotsResp
+			}
+			return NewResult(strmsg('+', "OK"), nil)
+		},
+	}
+	client, err := newClusterClient(
+		&ClientOption{
+			InitAddress:   []string{"127.0.0.1:0"},
+			ClusterOption: ClusterOption{MaxRefreshDelay: 10 * time.Millisecond},
+		},
+		func(dst string, opt *ClientOption) conn {
+			if dst == "127.0.1.1:1" {
+				return newPrimary
+			}
+			return oldPrimary
+		},
+		newRetryer(defaultRetryDelayFn),
+	)
+	if err != nil {
+		t.Fatalf("unexpected err %v", err)
+	}
+	defer client.Close()
+
+	failedOver.Store(true)
+
+	// The refresh triggered by the first failed attempt starts within 10ms instead of
+	// up to 1s, so the retries reach the promoted replica well before the deadline.
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	if v, err := client.Do(ctx, client.B().Get().Key("k").Build()).ToString(); err != nil || v != "OK" {
+		t.Fatalf("unexpected response %v %v", v, err)
+	}
+	if atomic.LoadInt64(&oldPrimaryGets) == 0 {
+		t.Fatalf("expected the first attempt to be sent to the old primary")
+	}
+}
+
 func clusterClientWithConnCount(n int) *clusterClient {
 	conns := make(map[string]connrole, n)
 	for i := 0; i < n; i++ {
 		conns[fmt.Sprintf("%d", i)] = connrole{}
 	}
-	return &clusterClient{conns: conns}
+	return &clusterClient{conns: conns, opt: &ClientOption{}}
 }
 
 func TestClusterClientRefreshClosesConnAddedWhileUnlocked(t *testing.T) {

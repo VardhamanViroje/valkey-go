@@ -345,6 +345,17 @@ type ClusterOption struct {
 	// Enable this ONLY if your engine's CLUSTER SHARDS is fixed: Valkey >= 7.2.6 or Redis >= 8.0.
 	// Do NOT enable it on Redis 7.x: its CLUSTER SHARDS returns wrong topology after a failover.
 	PreferClusterShards bool
+
+	// MaxRefreshDelay is the upper bound of the random delay before a background cluster topology refresh,
+	// which is triggered by MOVED/ASK redirections, CLUSTERDOWN/TRYAGAIN/LOADING and network errors,
+	// closed connections, and ShardsRefreshInterval. The random delay spreads the refreshes of many clients
+	// over time, but commands retried in the meantime are still sent according to the old topology.
+	// A smaller value lets them reach the new nodes sooner after a failover, at the cost of more
+	// CLUSTER SLOTS/CLUSTER SHARDS requests to the servers.
+	// If the value is zero (default), the bound scales with the number of known nodes:
+	// 1s for up to 100 nodes, growing linearly to 30s for 1000 nodes or more.
+	// If the value is negative, the refresh starts without delay.
+	MaxRefreshDelay time.Duration
 }
 
 // StandaloneOption is the options for the standalone client.
