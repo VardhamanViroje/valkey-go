@@ -20,6 +20,10 @@
 // NewClient also retries Memorystore's IAM backend errors (ERR_IAM_EXHAUSTED, ERR_IAM_OTHER)
 // while it connects, and after such an error makes new connections wait before dialing.
 //
+// Memorystore blocks the commands that change the server configuration, persistence or
+// lifecycle, such as CONFIG SET, BGSAVE and SHUTDOWN, and answers them with NOPERM;
+// valkey.IsValkeyNoPerm recognizes that reply.
+//
 // ResolveClientOption returns the same valkey.ClientOption without connecting, for
 // valkey.NewClient or other valkey-go modules such as valkeyotel.
 package valkeygcp
