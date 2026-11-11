@@ -184,6 +184,95 @@ func TestNewClient_ClientTrackingHint(t *testing.T) {
 	}
 }
 
+// valkey-go sends SELECT on every new connection when ClientOption.SelectDB isn't 0. When the
+// instance has no such database, NewClient says how an instance gets its databases, and keeps
+// the instance's reply: the cluster-mode reply before Valkey 9.0, or the out-of-range reply.
+// The refusal isn't retried.
+func TestNewClient_SelectDBHint(t *testing.T) {
+	const hint = "valkeygcp: the instance has no database 3 (ClientOption.SelectDB)"
+	for _, refusal := range []string{"SELECT is not allowed in cluster mode", "DB index is out of range"} {
+		srv := newScriptedValkey(t, func(conn int64, args []string) (string, bool) {
+			if strings.EqualFold(args[0], "SELECT") {
+				return "-ERR " + refusal + "\r\n", false
+			}
+			return standaloneReply(conn, args)
+		})
+		opt := initOption(srv.addr())
+		opt.SelectDB = 3
+		_, err := NewClient(context.Background(), opt, WithIAMOptions(staticIAM()))
+		var verr *valkey.ValkeyError
+		if err == nil || !strings.Contains(err.Error(), hint) || !strings.HasSuffix(err.Error(), ": "+refusal) || !errors.As(err, &verr) {
+			t.Fatalf("%q: got %v, want the hint, then the instance's reply", refusal, err)
+		}
+		if n := srv.conns.Load(); n != 1 {
+			t.Fatalf("%q: connections = %d, want 1 (not retried)", refusal, n)
+		}
+	}
+}
+
+// NewClient doesn't refuse ClientOption.SelectDB before connecting: a Cluster Mode Disabled
+// instance has 16 databases by default, and from Valkey 9.0 a Cluster Mode Enabled instance can
+// have more. ResolveClientOption keeps SelectDB, and valkey-go selects the database.
+func TestNewClient_SelectDBSent(t *testing.T) {
+	var selected atomic.Value // the last SELECT the server got
+	srv := newScriptedValkey(t, func(conn int64, args []string) (string, bool) {
+		if strings.EqualFold(args[0], "SELECT") {
+			selected.Store(strings.Join(args, " "))
+		}
+		return standaloneReply(conn, args)
+	})
+	opt := initOption(srv.addr())
+	opt.SelectDB = 3
+	resolved, err := ResolveClientOption(context.Background(), opt, WithIAMOptions(staticIAM()))
+	if err != nil || resolved.SelectDB != 3 {
+		t.Fatalf("ResolveClientOption: SelectDB = %d, %v; want 3, kept", resolved.SelectDB, err)
+	}
+	client, err := NewClient(context.Background(), opt, WithIAMOptions(staticIAM()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	if got, _ := selected.Load().(string); got != "SELECT 3" {
+		t.Fatalf("the server got %q, want SELECT 3", got)
+	}
+}
+
+// explainHandshakeError leaves other errors as they are, and a SELECT refusal too when
+// ClientOption.SelectDB is 0, as only a SelectDB set by the caller can cause one.
+func TestExplainHandshakeError_SelectDBPassThrough(t *testing.T) {
+	refusing := newScriptedValkey(t, func(conn int64, args []string) (string, bool) {
+		if strings.EqualFold(args[0], "SELECT") {
+			return "-ERR DB index is out of range\r\n", false
+		}
+		return standaloneReply(conn, args)
+	})
+	opt := initOption(refusing.addr())
+	opt.SelectDB = 3
+	_, refusal := valkey.NewClient(opt) // the instance's reply, without valkeygcp's hint
+	wrongPass := newScriptedValkey(t, func(conn int64, args []string) (string, bool) {
+		if strings.EqualFold(args[0], "HELLO") {
+			return "-WRONGPASS invalid username-password pair or user is disabled\r\n", false
+		}
+		return standaloneReply(conn, args)
+	})
+	_, wrongPassErr := valkey.NewClient(initOption(wrongPass.addr()))
+	if refusal == nil || wrongPassErr == nil {
+		t.Fatalf("valkey.NewClient errors = %v, %v; want both", refusal, wrongPassErr)
+	}
+	for _, c := range []struct {
+		err      error
+		selectDB int
+	}{
+		{refusal, 0},
+		{wrongPassErr, 3},
+		{errors.New("dial tcp 10.0.0.1:6379: i/o timeout"), 3},
+	} {
+		if got := explainHandshakeError(c.err, c.selectDB); got != c.err {
+			t.Errorf("explainHandshakeError(%v, %d) = %v, want it unchanged", c.err, c.selectDB, got)
+		}
+	}
+}
+
 func TestDialGate(t *testing.T) {
 	g := &dialGate{backoff: func(n int) time.Duration { return time.Duration(n+1) * time.Second }}
 	g.handshake(handshakeIAMError)

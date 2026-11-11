@@ -17,6 +17,7 @@
 * **Other identities:** a service account key, or a Workload Identity Federation file that impersonates a service account (`CredentialsJSON`), or service account impersonation (`ImpersonateSA`, with `Delegates` and tokens lasting up to 12 hours), for workloads that don't run as the identity with access: cross-project access and key-based setups.
 * **The principal's email as the username:** `UsernamePrincipalEmail` sends the IAM principal's email instead of `"default"`; Memorystore accepts either. A username Memorystore would refuse fails at setup when the principal is known, and an ACL rule that blocks `CLIENT TRACKING` gets an error saying so.
 * **IAM backend errors:** Memorystore answers `ERR_IAM_EXHAUSTED` when its IAM backend is over quota, and `ERR_IAM_OTHER` for an invalid username or a transient IAM backend error; Google recommends retrying them with exponential backoff. `NewClient` retries those errors while connecting, with exponential backoff, and after such an error new connections wait before dialing.
+* **Memorystore's command limits:** Memorystore blocks the commands that change the server configuration, persistence or lifecycle, and answers them with `NOPERM`, which `valkey.IsValkeyNoPerm` recognizes. A `ClientOption.SelectDB` the instance doesn't have fails `NewClient` with an error that says why.
 * **Token rotation on live connections:** connections re-AUTH with a new token before the old one expires, spread out so they don't all re-AUTH at once.
 * **Refresh failure tolerance:** if a refresh fails, live connections keep the last valid token, and `OnCredentialError` reports the error.
 * **Bounded setup and token fetches:** `ctx` bounds setup, and every token fetch is capped by `FetchTimeout`.
@@ -203,6 +204,7 @@ Each of these follows Google's [Valkey client best practices](https://docs.cloud
 * **Setup needs working credentials.** valkey-go connects and authenticates while it builds the client, so missing ADC, an invalid key file or a denied impersonation fails `NewClient` immediately, with the underlying error. Without ADC, set `CredentialsJSON` or `CustomTokenSource`.
 * **`InitAddress` is required.** `NewClient` and `ResolveClientOption` return an error without it.
 * **Credentials on the `ClientOption`** (`Password` or `AuthCredentialsFn`) are used as is; passing them together with `WithIAMOptions` or `WithDefaultIAM` is an error. With an IAM option, `ClientOption.Username` is the IAM username unless `IAMAuthOptions.Username` sets one; if both are set, they must match.
+* **`ClientOption.SelectDB` must be a database the instance has.** Otherwise `NewClient` fails with an error that says how an instance gets its databases; see 1.8.
 
 ### 1.7 IAM Username and ACL Policies
 
@@ -219,7 +221,37 @@ An explicit username, `IAMAuthOptions.Username` or `ClientOption.Username`, alwa
 
 With an ACL policy, Memorystore matches its rules to the IAM principal that authenticates; Google recommends principal emails as the rules' usernames, and a principal without a rule gets the `default` user's permissions. A rule must also allow what valkey-go sends besides the application's commands: `client|tracking` on every new connection, unless `ClientOption.DisableCache` is set, and on cluster-mode instances `cluster|shards`, to read the topology. Without `client|tracking`, `NewClient` fails with an error that says so. Without `cluster|shards`, valkey-go falls back to a single-node client when `InitAddress` has one address, and keys on other shards then fail with `MOVED`.
 
-### 1.8 Required Roles
+### 1.8 Command Compatibility
+
+Memorystore for Valkey blocks the commands that change the server configuration, persistence or lifecycle, and answers them with a `NOPERM` error ([Supported and blocked commands](https://docs.cloud.google.com/memorystore/docs/valkey/supported-commands#blocked-commands)). valkey-go and valkeygcp never send these commands themselves; they reach Memorystore only when your code sends them, for example through `client.B().ConfigSet()` or the `ConfigSet` and `BgSave` methods of `valkeycompat`. valkeygcp doesn't stop them before they are sent.
+
+| Area                      | Blocked (`NOPERM`)                                                                           | Instead                                                                                                                                                                                                                      |
+| :------------------------ | :------------------------------------------------------------------------------------------- | :--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Engine configuration      | `CONFIG GET`, `CONFIG SET`, `CONFIG REWRITE`, `CONFIG RESETSTAT`; only `CONFIG HELP` works | `gcloud memorystore instances create --engine-configs`, then `gcloud memorystore instances update --update-engine-configs` ([Configure an instance](https://docs.cloud.google.com/memorystore/docs/valkey/configure-instances)) |
+| Persistence and lifecycle | `SAVE`, `BGSAVE`, `BGREWRITEAOF`, `LASTSAVE`, `SHUTDOWN`                                     | RDB or AOF persistence ([Persistence overview](https://docs.cloud.google.com/memorystore/docs/valkey/persistence-overview)), and automated or on-demand backups ([About backups](https://docs.cloud.google.com/memorystore/docs/valkey/backups)) |
+
+Google's list also includes `MOVE` and `SWAPDB`, but Memorystore doesn't refuse them with `NOPERM`. A Cluster Mode Disabled instance runs both (checked on Valkey 9.1, maintenance version `MEMORYSTORE_20261008_00_00`). On a Cluster Mode Enabled instance with one database, the Valkey server refuses them itself, with other errors such as `MOVE is not allowed in cluster mode` and `SWAPDB is not allowed in cluster mode`, so `valkey.IsValkeyNoPerm` is false for them. `SELECT` is supported; see `SelectDB` below.
+
+`valkey.IsValkeyNoPerm` tells a `NOPERM` reply from other errors:
+
+```go
+err := client.Do(ctx, client.B().ConfigSet().ParameterValue().
+	ParameterValue("notify-keyspace-events", "Ex").Build()).Error()
+if valkey.IsValkeyNoPerm(err) {
+	// Blocked by Memorystore: set notify-keyspace-events with --update-engine-configs instead.
+}
+```
+
+`NOPERM` is also the reply when an [ACL policy](https://docs.cloud.google.com/memorystore/docs/valkey/use-acl-policies) doesn't allow a command or key, so it doesn't always mean a blocked command.
+
+**`SelectDB`.** valkey-go sends `SELECT` on every new connection when `ClientOption.SelectDB` is not 0 (a `/3` path or `?db=3` in a URL given to `valkey.ParseURL` sets it too). An instance's number of databases is set when it is created ([Supported instance configurations](https://docs.cloud.google.com/memorystore/docs/valkey/supported-instance-configurations#modifiable_configuration_parameters)):
+
+* Cluster Mode Disabled: `databases`, 16 by default, up to 100.
+* Cluster Mode Enabled: `cluster-databases`, Valkey 9.0 and later, 1 by default, up to 100. Before 9.0, only database 0.
+
+valkeygcp can't tell which kind of instance it reaches before connecting, so it leaves `SelectDB` to the instance. With a database the instance doesn't have, `NewClient` fails with `valkeygcp: the instance has no database 3 (ClientOption.SelectDB); …`, followed by the instance's reply: `SELECT is not allowed in cluster mode` (Cluster Mode Enabled before Valkey 9.0) or `DB index is out of range`. A client built from `ResolveClientOption` fails with the instance's reply alone.
+
+### 1.9 Required Roles
 
 | Mechanism | Role                                                                       |
 | :-------- | :------------------------------------------------------------------------- |
@@ -228,7 +260,7 @@ With an ACL policy, Memorystore matches its rules to the IAM principal that auth
 
 Grant `roles/memorystore.dbConnectionUser` to the identity behind the access tokens: the ADC identity, the identity in `CredentialsJSON`, or the identity of `CustomTokenSource`. With `ImpersonateSA`, grant it to the impersonated account instead, and give the identity that impersonates (ADC, or `CredentialsJSON`) `roles/iam.serviceAccountTokenCreator` on that account. With `Delegates`, each service account in the chain needs that role on the next one, and the last one on the impersonated account.
 
-### 1.9 Testing
+### 1.10 Testing
 
 Run the unit tests with Go's race detector:
 

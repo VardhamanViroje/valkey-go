@@ -57,7 +57,8 @@ var errNoEndpoint = errors.New("valkeygcp: no endpoint: set ClientOption.InitAdd
 // builds the client, so setup needs working credentials. Memorystore IAM backend errors
 // (ERR_IAM_EXHAUSTED, ERR_IAM_OTHER) during the handshake are retried with backoff until ctx
 // ends, at most 15s when it has no earlier deadline. When an ACL rule refuses CLIENT
-// TRACKING, the error says so. Token refreshes never use ctx.
+// TRACKING, or the instance has no database ClientOption.SelectDB, the error says so. Token
+// refreshes never use ctx.
 func NewClient(ctx context.Context, option valkey.ClientOption, opts ...Option) (valkey.Client, error) {
 	opt, err := ResolveClientOption(ctx, option, opts...)
 	if err != nil {
@@ -71,7 +72,7 @@ func NewClient(ctx context.Context, option valkey.ClientOption, opts ...Option) 
 // valkeyotel.NewClient) or want to inspect it. The option keeps the credentials, the
 // defaults and the dial gate of WithIAMOptions. Building the client that way skips
 // NewClient's connect-time handling: the retries of Memorystore IAM backend errors during
-// the handshake, and the CLIENT TRACKING hint.
+// the handshake, and the CLIENT TRACKING and SelectDB hints.
 func ResolveClientOption(ctx context.Context, option valkey.ClientOption, opts ...Option) (valkey.ClientOption, error) {
 	cfg := newConfig(opts)
 	if len(option.InitAddress) == 0 {
