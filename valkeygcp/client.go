@@ -60,8 +60,9 @@ var errNoEndpoint = errors.New("valkeygcp: no endpoint: set ClientOption.InitAdd
 // retried with backoff. Memorystore also answers an invalid username with ERR_IAM_OTHER, so
 // that error is retried only a few times for a username other than "default" (or none) that
 // setup couldn't check against the IAM principal, which includes any such username of
-// credentials set on the ClientOption. When an ACL rule refuses CLIENT TRACKING, the error
-// says so. Token refreshes never use ctx.
+// credentials set on the ClientOption. When an ACL rule refuses CLIENT TRACKING, or the
+// instance has no database ClientOption.SelectDB, the error says so. Token refreshes never
+// use ctx.
 func NewClient(ctx context.Context, option valkey.ClientOption, opts ...Option) (valkey.Client, error) {
 	opt, usernameValid, err := resolveClientOption(ctx, option, opts...)
 	if err != nil {
@@ -75,7 +76,7 @@ func NewClient(ctx context.Context, option valkey.ClientOption, opts ...Option) 
 // valkeyotel.NewClient) or want to inspect it. The option keeps the credentials, the
 // defaults and the dial gate of WithIAMOptions. Building the client that way skips
 // NewClient's connect-time handling: the retries of Memorystore IAM backend errors during
-// the handshake, and the CLIENT TRACKING hint.
+// the handshake, and the CLIENT TRACKING and SelectDB hints.
 func ResolveClientOption(ctx context.Context, option valkey.ClientOption, opts ...Option) (valkey.ClientOption, error) {
 	opt, _, err := resolveClientOption(ctx, option, opts...)
 	return opt, err
