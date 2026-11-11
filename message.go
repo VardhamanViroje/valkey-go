@@ -43,6 +43,14 @@ func IsValkeyBusyGroup(err error) bool {
 	return false
 }
 
+// IsValkeyNoPerm checks if it is a valkey NOPERM message.
+func IsValkeyNoPerm(err error) bool {
+	if ret, yes := IsValkeyErr(err); yes {
+		return ret.IsNoPerm()
+	}
+	return false
+}
+
 // IsValkeyErr is a handy method to check if the error is a valkey ERR response.
 func IsValkeyErr(err error) (ret *ValkeyError, ok bool) {
 	ret, ok = err.(*ValkeyError)
@@ -128,6 +136,13 @@ func (r *ValkeyError) IsNoScript() bool {
 // IsBusyGroup checks if it is a valkey BUSYGROUP message.
 func (r *ValkeyError) IsBusyGroup() bool {
 	return strings.HasPrefix(r.string(), "BUSYGROUP")
+}
+
+// IsNoPerm checks if it is a valkey NOPERM message: the ACL user may not run the command, or
+// access one of its keys or channels. Managed services such as Memorystore for Valkey also
+// reply with it to the commands they block, such as CONFIG SET or BGSAVE.
+func (r *ValkeyError) IsNoPerm() bool {
+	return strings.HasPrefix(r.string(), "NOPERM")
 }
 
 // NewResult returns a ValkeyResult with the provided ValkeyMessage and error. This is mostly useful for implementing

@@ -157,6 +157,34 @@ func TestIsValkeyBusyGroup(t *testing.T) {
 	}
 }
 
+func TestIsValkeyNoPerm(t *testing.T) {
+	for _, c := range []struct {
+		msg  string
+		want bool
+	}{
+		{msg: "NOPERM User default has no permissions to run the 'config|set' command", want: true},
+		{msg: "NOPERM this user has no permissions to run the 'bgsave' command", want: true},
+		{msg: "NOPERM No permissions to access a key", want: true},
+		{msg: "NOAUTH Authentication required.", want: false}, // shares the "NO" prefix
+		{msg: "ERR unknown command 'CONFIG', with args beginning with: 'SET'", want: false},
+		{msg: "BUSYGROUP Consumer Group name already exists", want: false},
+	} {
+		e := ValkeyError(strmsg('-', c.msg))
+		if got := e.IsNoPerm(); got != c.want {
+			t.Errorf("IsNoPerm(%q) = %v, want %v", c.msg, got, c.want)
+		}
+		if got := IsValkeyNoPerm(&e); got != c.want {
+			t.Errorf("IsValkeyNoPerm(%q) = %v, want %v", c.msg, got, c.want)
+		}
+	}
+	noPerm := ValkeyError(strmsg('-', "NOPERM User default has no permissions to run the 'save' command"))
+	for _, err := range []error{nil, Nil, errors.New("NOPERM"), wrapped{msg: "wrapped", err: &noPerm}} {
+		if IsValkeyNoPerm(err) {
+			t.Errorf("IsValkeyNoPerm(%v) = true, want false", err)
+		}
+	}
+}
+
 //gocyclo:ignore
 func TestValkeyResult(t *testing.T) {
 	//Add erroneous type
